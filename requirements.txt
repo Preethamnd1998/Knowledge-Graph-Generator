@@ -1,0 +1,3 @@
+# No third-party dependencies — the indexer uses only the Python 3.8+
+# standard library (re, os, sqlite3, json). This file is kept for the
+# Docker build and for tooling that expects a requirements.txt to exist.

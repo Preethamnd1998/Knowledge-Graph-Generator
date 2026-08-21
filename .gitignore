@@ -1,0 +1,11 @@
+# Generated knowledge graph output — rebuilt by `python indexer.py`
+output/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local-only Claude Code settings (machine-specific, not shared)
+.claude/settings.local.json

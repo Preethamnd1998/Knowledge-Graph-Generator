@@ -1,0 +1,21 @@
+services:
+  kg-indexer:
+    build: .
+    image: kg-indexer:latest
+    volumes:
+      # Mount the codebase to index (read-only — the indexer never writes
+      # into it). Change the left-hand side to point at your checkout.
+      - D:/GitLab-Workspace/UI-BE:/workspace:ro
+      # Mount kg-config.env directly so edits on the host take effect
+      # without rebuilding the image.
+      - ./kg-config.env:/app/kg-config.env:ro
+      # Where the generated .db file(s) land on the host.
+      - ./output:/app/output
+    environment:
+      # These override the matching keys in kg-config.env — convenient
+      # when the in-container path differs from the host path.
+      ROOT_PATH: /workspace
+      OUTPUT_DIR: /app/output
+      # Leave blank (default) to skip React indexing, or point it at a
+      # path under /workspace, e.g. /workspace/some-react-app
+      REACT_PROJECT_PATH: ""
