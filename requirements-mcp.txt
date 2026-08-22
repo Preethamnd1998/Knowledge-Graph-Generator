@@ -1,0 +1,14 @@
+# Dependencies for the Knowledge Graph MCP server (mcp_server/).
+# Install into its own virtual environment — do not install into a
+# shared/global Python environment; the MCP SDK's transitive
+# dependencies (starlette, httpcore, pydantic, ...) can collide with
+# versions other tools on the same machine already rely on.
+#
+#   python -m venv .venv-mcp
+#   .venv-mcp\Scripts\activate          (Windows)
+#   pip install -r requirements-mcp.txt
+#
+# The indexer itself (indexer.py, kg_indexer/) has zero dependencies and
+# is unaffected by any of this — see requirements.txt.
+
+mcp[cli]>=2.0.0,<3.0.0

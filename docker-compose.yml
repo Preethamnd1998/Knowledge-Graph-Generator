@@ -19,3 +19,26 @@ services:
       # Leave blank (default) to skip React indexing, or point it at a
       # path under /workspace, e.g. /workspace/some-react-app
       REACT_PROJECT_PATH: ""
+
+  # Serves the graph knowledge-graph produces, over MCP stdio, to an
+  # AI agent. Talks ONLY to the .db file below — never touches
+  # /workspace — and mounts it :ro so a bug here can't corrupt the
+  # knowledge-graph service's own output.
+  #
+  # stdio is not compatible with `docker compose up` (nothing would be
+  # attached to its stdin/stdout). Run it the way an MCP client would:
+  #   docker compose run --rm -T knowledge-graph-mcp
+  # See MCP.md "Running in Docker" for wiring this into an actual MCP
+  # client config.
+  knowledge-graph-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    image: kg-indexer-mcp:latest
+    volumes:
+      - ./output:/app/output:ro
+    environment:
+      KG_DB_PATH: /app/output/knowledge_graph.db
+      MCP_LOG_LEVEL: INFO
+    stdin_open: true
+    tty: false

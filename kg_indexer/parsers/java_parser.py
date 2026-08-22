@@ -54,6 +54,7 @@ HTTP_MAPPING_ANNOTATIONS = {
 
 QUOTED_STRING_RE = re.compile(r'"([^"]*)"')
 REQUEST_METHOD_RE = re.compile(r'RequestMethod\.(\w+)')
+PARAM_ANNOTATION_PREFIX_RE = re.compile(r'^(?:@\w[\w.]*(?:\((?:[^()]|\([^()]*\))*\))?\s+)+')
 
 
 def _parse_annotations(annotation_blob):
@@ -251,7 +252,9 @@ def _parse_method(db, service_name, rel_file, full_text, body_start, mm,
         param = param.strip()
         if not param:
             continue
-        pieces = param.replace("final ", "").rsplit(" ", 1)
+        param = param.replace("final ", "")
+        param = PARAM_ANNOTATION_PREFIX_RE.sub("", param)
+        pieces = param.rsplit(" ", 1)
         param_types.append(strip_type(pieces[0]) if len(pieces) > 1 else strip_type(param))
 
     line_no = line_of(full_text, body_start + mm.start())

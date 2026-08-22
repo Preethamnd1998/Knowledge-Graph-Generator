@@ -6,6 +6,12 @@ output/
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+.venv-mcp/
+.pytest_cache/
+
+# MCP server local config (may contain machine-specific paths)
+mcp-config.env
 
 # Local-only Claude Code settings (machine-specific, not shared)
 .claude/settings.local.json

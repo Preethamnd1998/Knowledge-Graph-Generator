@@ -42,16 +42,53 @@ This repo (`D:\GitLab-Workspace\Knowledge Graph Generator`) is
 intentionally separate from the code it indexes — it never writes into
 `ROOT_PATH`, only reads from it.
 
+## Prerequisites
+
+Python 3.8+ is the only requirement — the indexer itself has zero
+third-party dependencies. Check whether you already have it, from a
+Command Prompt (`cmd`):
+
+```
+python --version
+```
+
+If that fails with `'python' is not recognized...`, install it (Windows
+10/11, from `cmd`, no admin rights needed):
+
+```
+winget install --id Python.Python.3.12 -e --source winget
+```
+
+`winget` ships with modern Windows by default. Close and reopen `cmd`
+afterward so it picks up the new `PATH`, then re-check with
+`python --version`.
+
+If `winget` itself isn't recognized (older Windows, or it's disabled by
+policy), install from the official source instead: download the
+Windows installer from <https://www.python.org/downloads/>, run it, and
+**tick "Add python.exe to PATH"** on the first screen of the installer —
+that checkbox is what makes `python` work from `cmd` afterward.
+
+The MCP server (`mcp_server/`, see below) has its own, separate
+installation step — it needs the `mcp` SDK, installed into its own
+virtual environment rather than system-wide. See [`MCP.md`](./MCP.md) §2.
+
 ## Quick start
 
 1. Open `kg-config.env` in any text editor.
 2. Comment out (`#`) any service or Angular sub-project you want to
    **skip**. Remove the `#` to include one.
-3. Save, then run:
+3. Save, then run it — either:
 
    ```
    python indexer.py
    ```
+
+   or double-click **`run-knowledge-graph.bat`** (no command line
+   needed). It works as-is sitting in this folder. If you move the
+   `.bat` file somewhere else, open it in a text editor (right-click ->
+   Edit) and set the `KG_ROOT` line near the top to the full path of
+   this folder — everything else about it stays the same.
 
 No command-line flags — everything comes from `kg-config.env`. The graph
 is written to the `output/` folder (or wherever `OUTPUT_DIR` points).
@@ -138,6 +175,45 @@ conn = connect("output/knowledge_graph.db")
 print(get_dependencies(conn, "PatientController"))
 ```
 
+## Knowledge Graph MCP
+
+The generated graph can be handed to an AI agent (Claude Code, Claude
+Desktop, or any other MCP-compatible client) through the **Knowledge
+Graph MCP server** in `mcp_server/` — without ever exposing the raw
+`nodes`/`edges` schema, and without shipping the whole graph to the
+model. The agent calls semantic tools instead of writing SQL:
+
+```python
+find_service(query="appointment")
+get_service_context(service="appointment-service")
+get_business_flow(service="appointment-service", flow="cancellation")
+get_context_pack(topic="appointment cancellation", max_tokens=1200)
+```
+
+`get_service_context` returns a handful of fields (purpose, tech,
+counts, dependencies), not a dump of every class; `get_context_pack`
+returns a compressed Markdown package built specifically for an LLM to
+read in one call, budgeted to a token limit. The server is strictly
+read-only — no tool can write to, or run arbitrary SQL against, the
+graph.
+
+```
+python -m venv .venv-mcp
+.venv-mcp\Scripts\activate
+pip install -r requirements-mcp.txt
+claude mcp add knowledge-graph -s local -e KG_DB_PATH=./output/knowledge_graph.db -- "<repo>\.venv-mcp\Scripts\python.exe" "<repo>\mcp_server_main.py"
+```
+
+Use `mcp_server_main.py` (a small bootstrap script at the repo root),
+not `mcp_server/server.py` directly and not `python -m mcp_server.server`
+— the latter only works if the MCP client happens to spawn the process
+with the repo root as its working directory, which isn't true for every
+client (see `MCP.md` §4/§11 for the VS Code case this bit us on).
+
+Full architecture, all 12 tools with parameters, the confidence model
+(`verified`/`inferred`/`unknown`), Claude Code/Desktop configuration,
+security model, and troubleshooting: see **[`MCP.md`](./MCP.md)**.
+
 ## Running in Docker
 
 ```
@@ -147,6 +223,11 @@ docker compose run --rm kg-indexer
 Edit the volume mount in `docker-compose.yml` if your checkout isn't at
 `D:/GitLab-Workspace/UI-BE`. The `.db` file(s) appear in `./output` on
 the host.
+
+The MCP server has its own container (`knowledge-graph-mcp` in the same
+`docker-compose.yml`, built from `Dockerfile.mcp`), mounting `./output`
+**read-only** — see `MCP.md` "Running in Docker" for how an MCP client
+talks to a containerized stdio server.
 
 ## Project structure (for maintainers)
 
