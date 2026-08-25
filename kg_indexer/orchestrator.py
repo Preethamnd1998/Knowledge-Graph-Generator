@@ -4,7 +4,7 @@ import time
 from .config import Config
 from .db import GraphDB
 from .parsers.common import NameRegistry
-from .parsers import angular_parser, java_parser, react_parser
+from .parsers import angular_parser, java_parser, react_parser, spring_flow_parser
 from .parsers.angular_parser import ROOT_APP_SENTINEL
 
 
@@ -83,18 +83,20 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         _print(f"[java] indexing {service_name} ...")
         db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, service_name))
         stats = java_parser.parse_service(db, java_registry, service_name, service_path, progress=_progress)
+        flow_stats = spring_flow_parser.parse_service(db, java_registry, service_name, service_path)
         if not shared:
             resolved = db.resolve_exact_import_edges("java")
             resolved += db.resolve_pending_edges(java_registry.as_dict(), project_type="java",
                                                   exclude_relations=("IMPORTS",))
             db.close()
             per_target_summaries.append((service_name, _db_path_for(config.output_dir, service_name),
-                                          {**stats, "resolved_edges": resolved}))
+                                          {**stats, **flow_stats, "resolved_edges": resolved}))
         else:
-            per_target_summaries.append((service_name, None, stats))
+            per_target_summaries.append((service_name, None, {**stats, **flow_stats}))
         err_suffix = f", {stats['errors']} errors" if stats["errors"] else ""
+        flow_suffix = f", {flow_stats['flow_edges']} flow edges" if flow_stats.get("flow_edges") else ""
         _print(f"    -> {stats['files']} files, {stats['classes']} classes, "
-               f"{stats['methods']} methods, {stats['endpoints']} endpoints{err_suffix}")
+               f"{stats['methods']} methods, {stats['endpoints']} endpoints{flow_suffix}{err_suffix}")
 
     if angular_subprojects:
         project_node_id = None

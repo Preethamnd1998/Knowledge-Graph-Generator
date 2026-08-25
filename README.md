@@ -137,6 +137,22 @@ first if you want it to reflect only the current config.
 from `@*Mapping` (HTTP verb + full path), `extends`/`implements`, and
 `@Autowired`/`@Inject`/`@Resource` field dependencies.
 
+**Java runtime flows** (`kg_indexer/parsers/spring_flow_parser.py`, an
+additive second pass) — Spring Batch `@Bean Job`/`Step`/`Tasklet`
+definitions and how they chain together (`JobBuilder.start()`/`.next()`,
+`StepBuilder.tasklet()`), `jobLauncher.run(...)` call sites resolved
+back to the specific job bean via `@Qualifier`, `@Async` methods and
+`CompletableFuture.runAsync`/`supplyAsync` call sites, Kafka producers
+(`producerService.publishToKafka(...)`) and `@KafkaListener` consumers
+resolved to a shared, service-independent topic identity, and
+best-effort database table reads/writes recognized from literal
+`INSERT INTO`/`UPDATE ... SET`/`DELETE FROM`/`SELECT ... FROM` SQL
+(lowercase snake_case table names only — a JPQL/HQL entity reference
+like `select o from Order o` is deliberately excluded, not mistaken for
+a real table). See that module's docstring for the full node/edge
+vocabulary and the `verified`/`inferred`/`unknown` confidence model
+applied to every edge it creates.
+
 **Angular** — `@Component`, `@NgModule` (with `declarations`/`imports`/
 `exports`), `@Injectable`, `@Directive`, `@Pipe`, constructor-injected
 dependencies, and local (relative-path) ES module imports.
@@ -165,6 +181,15 @@ python example_queries.py dependents PatientRepository
 python example_queries.py hooks useEffect
 python example_queries.py cross-service
 python example_queries.py sql "SELECT * FROM nodes WHERE node_type='ENDPOINT' LIMIT 20"
+
+# Spring Batch / Kafka / async runtime flows
+python example_queries.py jobs
+python example_queries.py job createPriceBookFromTempJob
+python example_queries.py kafka
+python example_queries.py topic POST_FINANCE_PRICE_BOOK
+python example_queries.py async
+python example_queries.py table price_book
+python example_queries.py flow createPriceBookFromTempJob
 ```
 
 Or import it directly for agent/programmatic use:
@@ -241,6 +266,7 @@ kg_indexer/
   parsers/
     common.py                      shared regex/text helpers (bracket matching, name registry, ...)
     java_parser.py                 Java: classes, methods, REST endpoints, DI edges
+    spring_flow_parser.py          Java runtime flows: Spring Batch, Kafka, async, DB tables (additive 2nd pass)
     angular_parser.py              Angular: components/modules/services, DI edges, ROOT_APP handling
     react_parser.py                React: components, hooks, JSX composition
 ```
@@ -266,3 +292,23 @@ is best-effort, not a full AST:
   name only — if the same short name exists in multiple services, the
   edge is resolved to one candidate and the others are recorded in
   `metadata.ambiguous_candidates`.
+- Spring Batch/Kafka/async flows (`spring_flow_parser.py`): `Job`/`Step`
+  builder references (`.start()`, `.next()`, `.tasklet()`) resolve
+  immediately within the same `@Configuration` class (the common
+  convention — a job and its steps defined together); if not found
+  there, they fall back to the same project-wide simple-name registry
+  every other edge type uses, so a step defined in a different class
+  can still resolve, with the same "first match wins,
+  `metadata.ambiguous_candidates` if more than one" caveat as elsewhere.
+  `jobLauncher.run(...)` resolves its job argument through a
+  `@Qualifier("beanName")`-annotated field when present, or the bare
+  variable/method name otherwise; unresolvable references keep only
+  `target_name` (never guessed). A Kafka topic's identity is the
+  constant's simple name (e.g. `POST_FINANCE_PRICE_BOOK`), not its
+  resolved string value — two differently-named constants that happen to
+  hold the same literal topic string will not be merged. Database table
+  extraction only recognizes literal SQL keywords with a lowercase
+  snake_case table name; a table name behind a variable, a
+  `SELECT`-returning function call in a `FROM` clause (e.g. Postgres
+  `jsonb_array_elements(...)`), or a CTE alias can still produce a false
+  positive — kept deliberately simple rather than building a SQL parser.

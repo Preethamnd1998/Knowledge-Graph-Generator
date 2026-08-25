@@ -60,6 +60,10 @@ metadata (JSON text)`.
 
 `node_type` values in use:
 `SERVICE, FILE, CLASS, INTERFACE, ENUM, METHOD, ENDPOINT` (Java) ·
+`BATCH_JOB, BATCH_STEP, BATCH_TASKLET, ASYNC_OPERATION, KAFKA_TOPIC,
+DB_TABLE` (Java runtime flows — `spring_flow_parser.py`; deliberately no
+separate `SPRING_CONFIG`/`SPRING_BEAN`/`KAFKA_PRODUCER`/`KAFKA_CONSUMER`
+node types, see that module's docstring for why) ·
 `NG_SUBPROJECT, NG_COMPONENT, NG_MODULE, NG_SERVICE, NG_DIRECTIVE, NG_PIPE`
 (Angular) · `REACT_COMPONENT, REACT_HOOK` (React).
 
@@ -71,13 +75,24 @@ edges), relation, service, metadata (JSON text)`.
 
 `relation` values in use: `CONTAINS` (parent declares/holds child —
 service→file, file→class, class→method, subproject→file, ...),
-`DECLARES` (file→class/component; NgModule→its declarations[] entries),
-`EXTENDS`, `IMPLEMENTS`, `DEPENDS_ON` (`@Autowired`/`@Inject`/`@Resource`
-field, or Angular constructor injection), `EXPOSES` (method→ENDPOINT
-node), `IMPORTS` (file→imported symbol, or NgModule→imported module),
+`DECLARES` (file→class/component; NgModule→its declarations[] entries;
+also class→ASYNC_OPERATION for an `@Async` method), `EXTENDS`,
+`IMPLEMENTS`, `DEPENDS_ON` (`@Autowired`/`@Inject`/`@Resource` field, or
+Angular constructor injection), `EXPOSES` (method→ENDPOINT node),
+`IMPORTS` (file→imported symbol, or NgModule→imported module),
 `EXPORTS` (NgModule→exported symbol), `USES_HOOK` (React
 component/hook→hook name called), `RENDERS` (React component→JSX tag
-name it renders).
+name it renders) · Java runtime flows (`spring_flow_parser.py`):
+`DEFINES_BEAN` (`@Configuration` class→BATCH_JOB/BATCH_STEP/BATCH_TASKLET
+bean), `HAS_STEP` (BATCH_JOB→BATCH_STEP), `USES_TASKLET`
+(BATCH_STEP→BATCH_TASKLET), `RUNS` (caller method→BATCH_JOB, from
+`jobLauncher.run(...)`), `ASYNC_CALL` (method→ASYNC_OPERATION, from
+`CompletableFuture.runAsync`/`supplyAsync`), `PUBLISHES`
+(method/class→KAFKA_TOPIC), `CONSUMES` (method→KAFKA_TOPIC, from
+`@KafkaListener`), `WRITES`/`READS` (method→DB_TABLE, from literal SQL).
+Every edge this parser creates also carries `metadata.confidence` —
+`verified`/`inferred`/`unknown`, see the module docstring — in addition
+to the base convention below.
 
 **Resolution passes.** An edge is created with only `target_name` set
 whenever the target node might not exist yet (different file, not yet
@@ -100,6 +115,7 @@ already exists — they already join `nodes`↔`edges` correctly:
 
 ```python
 from example_queries import connect, graph_summary, list_endpoints, search_nodes, get_dependencies, get_dependents, components_using_hook, cross_service_dependencies, run_sql
+from example_queries import find_jobs, find_job_dependencies, find_kafka_topics, find_topic_producers, find_topic_consumers, get_topic_flow, find_async_operations, get_database_impact, get_runtime_flow
 
 conn = connect("output/knowledge_graph.db")
 graph_summary(conn)                              # counts by node_type / relation / service
@@ -110,6 +126,14 @@ get_dependents(conn, "PatientRepository")          # incoming, i.e. "who uses th
 components_using_hook(conn, "useEffect")           # React components calling a given hook
 cross_service_dependencies(conn)                   # resolved edges crossing a service boundary
 run_sql(conn, "SELECT ...")                        # raw SELECT, anything else is rejected
+
+find_jobs(conn, keyword="PriceBook")               # Spring Batch jobs by name
+find_job_dependencies(conn, "createPriceBookFromTempJob")  # job -> steps -> tasklets, who RUNS it
+find_kafka_topics(conn, keyword="PRICE_BOOK")       # Kafka topics by name
+get_topic_flow(conn, "POST_FINANCE_PRICE_BOOK")     # producers + consumers, cross-service
+find_async_operations(conn, service="core-service") # @Async methods / CompletableFuture call sites
+get_database_impact(conn, "price_book")             # who WRITES/READS an (inferred) DB table
+get_runtime_flow(conn, "createPriceBookFromTempJob") # generic: any flow-relation edges touching a node
 ```
 
 Direct SQL when you need something the helpers don't cover, e.g. every
@@ -137,7 +161,23 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
 - `kg_indexer/parsers/java_parser.py` — one file, one function per
   concern (`_parse_file` → `_parse_class` → `_parse_method`). To
   recognize a new annotation or a new dependency-injection style, this
-  is the file to touch.
+  is the file to touch. Does **not** capture or store a method's own
+  body text (only its signature/annotations/params/return type) — a
+  parser that needs body text (like `spring_flow_parser.py`) has to
+  re-derive it via `_find_block_end()` from the method's opening `{`.
+- `kg_indexer/parsers/spring_flow_parser.py` — additive second pass for
+  Spring Batch/Kafka/async/DB-table flows (see its own docstring for the
+  full node/edge vocabulary and confidence model). Re-runs
+  `CLASS_DECL_RE`/`METHOD_RE` from `java_parser.py` itself (imported, not
+  duplicated) purely to get at method body text; resolves against the
+  CLASS/METHOD nodes `java_parser.py` already created via
+  `db.resolve()` on the *identical* qualified_name formula — recomputing
+  that formula differently here would silently fail to attach anything.
+  Runs per-service, after `java_parser.parse_service()` and before that
+  service's `resolve_pending_edges()` call (see `orchestrator.py`), so
+  cross-file references (mainly `jobLauncher.run()` targets) resolve
+  through the *same* `NameRegistry`/pending-edge mechanism rather than a
+  bespoke one.
 - `kg_indexer/parsers/angular_parser.py` — decorator detection is
   regex-for-the-`@Decorator(` opener + `find_matching()` for the
   argument list, so nested object literals in `@NgModule({...})` don't
@@ -181,6 +221,35 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
   share a simple name with a local class in some other service; simple-
   name matching for imports specifically produced a large number of
   false "cross-service dependency" edges until this was special-cased.
+- **`METHOD_RE`'s parameter capture (`[^)]*`) silently dropped any
+  method with a nested-paren annotation on a parameter** — e.g.
+  `@Value("#{jobParameters['x']}") Long x`. Since `[^)]*` cannot contain
+  a `)` at all, the regex stopped at the `)` closing `@Value(...)`, the
+  next required token (`throws`? `{`) didn't follow, and the *whole
+  method* silently failed to match — not a partial/wrong parse, a
+  complete miss. This wasn't a hypothetical: it made every Spring Batch
+  `@Bean Tasklet` method in the real workspace (which all take a
+  `@Value("#{jobParameters[...]}")`-annotated parameter) invisible as a
+  METHOD node, which directly blocked the Step→Tasklet acceptance
+  criterion. Fixed by allowing one level of nested parens in the params
+  group (`(?:[^()]|\((?:[^()]|\([^()]*\))*\))*`), the same technique
+  already used for annotation args elsewhere in this file. Verified
+  against the real database (the method was simply absent) before
+  fixing, and confirmed present afterward — don't trust "no error" as
+  proof a regex captured everything it should have.
+- **`re.IGNORECASE` on a whole pattern defeats a case-*sensitive*
+  sub-part you specifically wrote for a reason.** The Kafka/DB-table SQL
+  regexes needed case-insensitive keywords (`INSERT`/`insert`) but a
+  strictly lowercase table-name capture (`[a-z][a-z0-9_]*`, on purpose,
+  to reject PascalCase JPQL entity references like `select o from
+  Order o`). Compiling with `re.IGNORECASE` on the whole pattern made
+  `[a-z]` match uppercase too, so JPQL entities, SQL keywords like
+  `PUBLIC`/`FINAL` used as CTE/schema names, and Postgres function calls
+  in a `FROM` clause all leaked through as fake tables (1421 "tables" for
+  one service). Fixed with scoped inline flags — `(?i:INSERT\s+INTO)`
+  around just the keyword — so the character class outside that group
+  stays case-sensitive. Caught by actually sampling the resulting
+  `DB_TABLE` node names, not by trusting the pattern read correctly.
 
 ## Porting this to a different codebase
 
