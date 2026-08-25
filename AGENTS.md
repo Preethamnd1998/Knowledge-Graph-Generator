@@ -238,6 +238,89 @@ LEFT JOIN nodes t ON t.id = e.target_id
 WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
 ```
 
+## Business flow tracing (`kg_indexer/flow_tracer.py`)
+
+A read-only traversal layer on top of the graph above — adds **no** new
+node/edge types and changes **no** parser/resolver behavior on its own
+(two real bugs it surfaced while being built *did* get fixed at the
+resolution layer — see "Gotchas" below — but the tracer itself only reads
+edges that already exist). Shared by `example_queries.py`'s `flow` CLI
+command and the MCP `trace_business_flow` tool — one traversal
+implementation, two thin callers.
+
+**Confidence taxonomy — exactly three values, uppercase:**
+`VERIFIED` (an immediate structural fact recorded at parse time — CONTAINS,
+EXPOSES, file→class/API_CONSTANT DECLARES — or an *exact*-match resolution:
+CALLS_API, FEIGN_CALL/WEBCLIENT_CALL/RESTTEMPLATE_CALL, Java IMPORTS, a
+literal-string Kafka `.send("TOPIC")`/`.sendDefault("TOPIC")` call site, or
+anything `spring_flow_parser.py` itself already marked `verified` — e.g.
+`@KafkaListener`, a `@Bean` Job/Step/Tasklet) · `INFERRED` (resolved by
+*simple-name* matching against a per-language registry — EXTENDS,
+IMPLEMENTS, DEPENDS_ON, USES_API_CONSTANT, USES_HOOK, RENDERS, EXPORTS, an
+NgModule's declarations/imports/exports array entries — or anything
+`spring_flow_parser.py` marked `inferred`: builder-pattern Job/Step wiring,
+`JobLauncher.run()` targets, `publishToKafka(...)`'s topic argument — read
+by taking a dotted reference's *simple name*, e.g. `KafkaTopics.MY_TOPIC` →
+`MY_TOPIC`, which is a naming *convention*, not a proven literal value, so
+it stays INFERRED even though a real edge exists) · `UNRESOLVED` (the edge
+exists — something in source really does reference a name — but
+`target_id` never resolved; `target_name` is kept so the gap stays
+visible, never silently dropped or upgraded to a guess). `classify_confidence()`
+is the single table-driven function that decides this per relation — see
+its docstring for the full relation→confidence mapping, and never hand-set
+a hop's confidence anywhere else.
+
+**Traversal.** `TRANSITIONS` is a flat table of `(relation, edge_end,
+modes)` — the *only* transitions ever walked; a transition simply returns
+zero rows when it doesn't apply to a node's real `node_type`, so there's no
+separate per-node_type gating table to keep in sync. Two relations mean
+more than one structural thing in this schema and are filtered in
+`_keep_transition`/`_expand` to only their business-flow-relevant sense:
+
+- `CONTAINS` also covers `SERVICE`→`FILE` and `NG_SUBPROJECT`→`FILE` (a
+  whole service's/subproject's file listing) — only the `CLASS`↔`METHOD`
+  sense is walked; the other sense would fan out to every file in a
+  service the moment a trace reached any `FILE`/`CLASS`/`SERVICE`-ish node.
+- `DECLARES` also covers `FILE`→`API_CONSTANT` (a single constants file can
+  declare 100+ fields) — only walked in the direction that matters
+  (a specific `API_CONSTANT`/class/component → the one file that declares
+  it); the forward direction (file → *every* constant it happens to also
+  declare) is dropped so tracing one constant never pulls in a hundred
+  unrelated ones that merely share its source file.
+- `CLASS`→`METHOD` (`CONTAINS` out) is additionally filtered to only
+  methods carrying at least one business-flow-relevant outgoing edge
+  (`_method_has_flow_edges`) — a controller/service class can have dozens
+  of getters/helpers with zero flow significance.
+
+Both fixes above were found by running the tracer against the real
+workspace and seeing an actual runaway/irrelevant result, not designed in
+advance — see "Gotchas".
+
+`direction="both"` (the default) runs a **forward-only** walk and a
+**reverse-only** walk independently from the same start node(s), returned
+as two separate path lists — never mixed step-by-step within one path
+(that would produce a nonsensical zigzag: "who calls me, then who do THEY
+call" is not one coherent flow). Cycle protection is per-path (a node
+already on the *current* path is never revisited on that path — the same
+node legitimately appearing in two different branches is not a cycle and
+is not deduplicated away); total work is bounded by `max_nodes`
+(expansion budget) and `max_paths` (emitted-path cap), and fan-out at any
+single node is capped by `MAX_CHILDREN_PER_NODE` (resolved neighbors
+prioritized over unresolved ones when trimming) — so traversal is always
+bounded regardless of how connected the real graph is.
+
+`resolve_target()` fuzzy-matches a CLI/MCP string to one or more start
+nodes (API constant `ClassName.FIELD` or bare field or literal path,
+`"METHOD /path"` endpoint, or a plain name for anything else — class,
+method, Kafka topic, DB table, Batch Job/Step/Tasklet, Angular/React
+component). **An exact match of any kind always wins over a fuzzy one,
+regardless of node type** — tier order matters: exact `qualified_name` →
+exact endpoint → exact node `name` (any type) → API_CONSTANT exact literal
+path → API_CONSTANT fuzzy field-name suffix → endpoint path substring →
+general fuzzy substring. A target matching more than one node traces from
+*every* match (each clearly attributed by service/qualified_name), never
+silently picking one.
+
 ## Where the parsing logic lives (if you need to extend it)
 
 - `kg_indexer/parsers/common.py` — shared helpers: directory walking
@@ -395,6 +478,49 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
   UI constant; a real tie (e.g. two HTTP methods at the identical path)
   still reports `ambiguous: true` on both surviving edges, it's just no
   longer a false one.
+- **A structurally-matching endpoint with *zero* literal segments in
+  common is not evidence, it's a coincidence of segment count.** A
+  fully-wildcard mapping like `@DeleteMapping("/{id}/{type}")` structurally
+  matches *any* 2-segment remaining UI path (every segment pairs against a
+  `{...}` wildcard), so before this was caught, an unrelated UI constant
+  with a stale/wrong value (e.g. a second copy of `BillingApiConstant` with
+  `"ipd/confirm/payment"` instead of the correct `"ipd/opd/confirm/payment"`)
+  resolved to a totally unrelated real endpoint and was marked `resolved`.
+  Found by tracing that exact constant with the (then-new) flow tracer and
+  getting a nonsensical result, not by a targeted test. Fixed in
+  `GraphDB.resolve_api_constant_edges`: a match with `path_specificity() ==
+  0` against a *non-empty* remaining path is never accepted, however
+  "structurally valid" — it falls through to `no_matching_endpoint`
+  instead, which is the honest answer.
+- **The business-flow tracer's own bridge transitions (`CONTAINS`,
+  `DECLARES`) can explode if not scoped to their business-flow-relevant
+  sense specifically** — see "Business flow tracing" above for the two
+  concrete cases (service/subproject file listings via `CONTAINS`, a
+  constants file's many sibling fields via `DECLARES`) and how they're
+  filtered. Found the same way as the item above: by actually tracing a
+  real target and watching the result balloon into hundreds of irrelevant
+  files, not by reasoning about it in advance — the schema is easy to
+  reason about relation-by-relation but its *fan-out* behavior at each
+  node is not obvious until you run a real trace against it.
+- **`resolve_target()`'s match tiers must try an exact match (any node
+  type) before a fuzzy one, never the other way around.** A bare Kafka
+  topic name that happens to also be some unrelated API_CONSTANT's field
+  name (e.g. `ADMISSION_STATUS_UPDATE`) resolved to the wrong node type
+  entirely when the API_CONSTANT fuzzy tier (`name LIKE '%.FIELD'`) ran
+  before the plain exact-name tier — an exact match on the *real* target
+  (the KAFKA_TOPIC node named exactly that) was sitting right there but
+  never reached. Fixed by moving the unconditional exact-name-any-type
+  query ahead of every fuzzy tier.
+- **A Kafka producer call-site's confidence must reflect what was actually
+  proven, not just that *some* producer call was found.** `SEND_LITERAL_RE`
+  (`producer.send("LITERAL_TOPIC", ...)`) only ever matches a quoted
+  string literal — by definition an exact fact — but was originally marked
+  `inferred` like `PUBLISH_CALL_RE`'s topic extraction (which takes a
+  dotted reference's *simple name* as a naming-convention guess, e.g.
+  `KafkaTopics.MY_TOPIC` → `MY_TOPIC`, genuinely not proven). Confirmed
+  against the real workspace that both code paths actually fire (`via`
+  metadata is `'publishToKafka'` for one, `'send'`/`'sendDefault'` for the
+  other) before promoting only the literal-string case to `verified`.
 
 ## Porting this to a different codebase
 

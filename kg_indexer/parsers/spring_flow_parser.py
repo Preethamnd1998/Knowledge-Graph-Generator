@@ -348,10 +348,16 @@ def _scan_method_body(db, registry, service_name, rel_file, m, method_node_id,
             stats["flow_edges"] = stats.get("flow_edges", 0) + 1
 
     for sm in SEND_LITERAL_RE.finditer(m.body_text):
+        # SEND_LITERAL_RE only ever matches a quoted string literal as the
+        # topic argument (see its pattern) — the topic name is read
+        # directly off the literal, not guessed from a dotted reference's
+        # simple name (that's PUBLISH_CALL_RE below, which stays
+        # "inferred"), so this is a "verified" fact per the confidence
+        # model (an exact Kafka topic string found in source).
         topic_key = sm.group(3)
         topic_id = _get_or_create_topic(db, topic_key, service_name)
         db.add_edge(source_id, "PUBLISHES", target_id=topic_id, service=service_name,
-                    metadata=_meta("inferred", via=sm.group(2)))
+                    metadata=_meta("verified", via=sm.group(2)))
         stats["KAFKA_TOPIC"] = stats.get("KAFKA_TOPIC", 0) + 1
         stats["flow_edges"] = stats.get("flow_edges", 0) + 1
 

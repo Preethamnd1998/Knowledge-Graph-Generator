@@ -203,7 +203,6 @@ python example_queries.py kafka
 python example_queries.py topic POST_FINANCE_PRICE_BOOK
 python example_queries.py async
 python example_queries.py table price_book
-python example_queries.py flow createPriceBookFromTempJob
 
 # UI <-> Backend API mapping
 python example_queries.py api-constants CONFIRM_PAYMENT
@@ -211,7 +210,25 @@ python example_queries.py ui-to-api "ipd/opd/confirm/payment"
 python example_queries.py api-callers ipd-service POST /opd/confirm/payment
 python example_queries.py service-calls --service core-service
 python example_queries.py full-flow ipd-service POST /opd/confirm/payment
+
+# Business flow tracer — multi-hop, either direction, confidence per hop
+# (kg_indexer/flow_tracer.py; see AGENTS.md "Business flow tracing")
+python example_queries.py flow BillingApiConstant.BILLING_CONFIRM_PAYMENT
+python example_queries.py flow price_book --direction reverse
+python example_queries.py flow createPriceBookFromTempJob --depth 4
+python example_queries.py flow PriceBookUploadServiceImpl --format json
 ```
+
+`flow` starts from *any* node by name — a UI API constant, an Angular/React
+component or service, a Java controller/class/method, a REST endpoint
+(`"POST /opd/confirm/payment"`), a Kafka topic, a DB table, or a Spring
+Batch Job/Step/Tasklet — and walks the graph's real edges outward
+(`--direction forward`, downstream effects), backward (`--direction
+reverse`, upstream callers), or both (default). Every hop is labeled
+`VERIFIED`, `INFERRED`, or `UNRESOLVED` — never overstated — with source
+evidence for verified facts and a stated reason otherwise. `--depth` caps
+hops per path (default 3); `--format json` gives the full structured
+result instead of the tree view.
 
 Or import it directly for agent/programmatic use:
 
@@ -235,6 +252,7 @@ get_service_context(service="appointment-service")
 get_business_flow(service="appointment-service", flow="cancellation")
 get_context_pack(topic="appointment cancellation", max_tokens=1200)
 resolve_ui_api(query="ipd/opd/confirm/payment")  # "which backend endpoint does this UI API constant call?"
+trace_business_flow(target="BillingApiConstant.BILLING_CONFIRM_PAYMENT")  # multi-hop, confidence-tagged flow from any named node
 ```
 
 `get_service_context` returns a handful of fields (purpose, tech,
@@ -284,6 +302,7 @@ example_queries.py                importable query helpers + CLI
 kg_indexer/
   config.py                       kg-config.env loader (KEY=VALUE + commentable list blocks)
   db.py                            SQLite schema + GraphDB manager (nodes/edges, resolution passes)
+  flow_tracer.py                   business flow tracer — multi-hop, confidence-tagged graph traversal
   orchestrator.py                  wires config -> parsers -> db, prints progress/summary
   parsers/
     common.py                      shared regex/text helpers (bracket matching, name registry, ...)
@@ -334,3 +353,35 @@ is best-effort, not a full AST:
   `SELECT`-returning function call in a `FROM` clause (e.g. Postgres
   `jsonb_array_elements(...)`), or a CTE alias can still produce a false
   positive — kept deliberately simple rather than building a SQL parser.
+
+Business flow tracer (`kg_indexer/flow_tracer.py`):
+
+- Only ever walks edges that already exist in the graph — it never infers
+  a relationship a parser didn't already record. If source hints at a
+  Kafka/DB/downstream-service relationship (a suggestively-named method, an
+  event-list registration, ...) but no parser created a
+  PUBLISHES/CONSUMES/WRITES/READS/FEIGN_CALL/etc. edge for it, the trace
+  simply doesn't show that hop — it is not flagged as a weak/unconfirmed
+  lead. Extending what counts as evidence is parser work
+  (`spring_flow_parser.py`/`java_parser.py`), not tracer work.
+- A `BATCH_TASKLET`/`BATCH_JOB`/`BATCH_STEP` node itself carries no direct
+  WRITES/READS/PUBLISHES — those live on the underlying `@Bean` method node
+  instead, reached from the `@Configuration` class via `CONTAINS`, a
+  separate branch from `DEFINES_BEAN`. Tracing from the bean's *class*
+  (not the bean node) surfaces them; tracing from the `BATCH_TASKLET` node
+  directly, forward, does not.
+- `CLASS`→`METHOD` fan-out is filtered to methods with at least one
+  business-flow-relevant outgoing edge (`_method_has_flow_edges`) — a
+  method whose only real business role is calling *another local method*
+  that itself has flow edges (rather than carrying one directly) won't
+  surface via this filter. Uncommon in practice (Spring conventions put
+  the annotated/flow-bearing call at the method that's actually invoked),
+  not exhaustively verified against every possible indirection pattern.
+- Fan-out at any single node is capped (`MAX_CHILDREN_PER_NODE`, currently
+  12) and total work is capped (`max_nodes`/`max_paths`) — a node with
+  more real edges than the cap allows will have some silently trimmed
+  (resolved neighbors prioritized over unresolved ones), not reported as
+  "N more not shown." Increase `--depth` or query the underlying edge
+  table directly (`example_queries.py`'s other helpers, or `get_topic_flow`
+  /`find_job_dependencies` for their specific relation types) for an
+  exhaustive listing rather than a bounded trace.

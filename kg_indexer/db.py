@@ -299,8 +299,18 @@ class GraphDB:
             ]
             if structural_matches:
                 best = max(path_specificity(remaining, esegs) for _, esegs, _ in structural_matches)
-                matches = [(eid, http_method) for eid, esegs, http_method in structural_matches
-                           if path_specificity(remaining, esegs) == best]
+                # A fully-wildcard endpoint (e.g. "/{id}/{type}") structurally
+                # matches ANY same-length UI path with zero literal evidence
+                # either is really the other — that's not a match, it's a
+                # coincidence of segment count. Require at least one literal
+                # segment in common whenever there's a non-empty path to
+                # match against, so a spurious all-wildcard endpoint is never
+                # the sole "resolution" for an unrelated UI constant.
+                if best == 0 and remaining:
+                    matches = []
+                else:
+                    matches = [(eid, http_method) for eid, esegs, http_method in structural_matches
+                               if path_specificity(remaining, esegs) == best]
             else:
                 matches = []
             if not matches:

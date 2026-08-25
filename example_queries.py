@@ -20,7 +20,10 @@ Also runnable directly as a CLI:
     python example_queries.py kafka
     python example_queries.py topic POST_FINANCE_PRICE_BOOK
     python example_queries.py async
-    python example_queries.py flow createPriceBookFromTempJob
+    python example_queries.py flow BillingApiConstant.BILLING_CONFIRM_PAYMENT
+    python example_queries.py flow price_book --depth 3
+    python example_queries.py flow POST_FINANCE_PRICE_BOOK --direction reverse
+    python example_queries.py flow PriceBookUploadServiceImpl --format json
     python example_queries.py api-constants BILLING_CONFIRM_PAYMENT
     python example_queries.py ui-to-api "ipd/opd/confirm/payment"
     python example_queries.py api-callers core-service GET /patient/list
@@ -32,6 +35,8 @@ import json
 import os
 import sqlite3
 import sys
+
+from kg_indexer import flow_tracer
 
 
 def connect(db_path):
@@ -458,6 +463,93 @@ def get_runtime_flow(conn, name):
     }
 
 
+# --- Business flow tracer (kg_indexer/flow_tracer.py) ---
+#
+# Multi-hop traversal on top of the graph's real edges, in either narrative
+# direction, with an explicit VERIFIED/INFERRED/UNRESOLVED confidence and
+# (for VERIFIED hops) source evidence on every hop — see that module's
+# docstring for the full design and AGENTS.md for the write-up. Distinct
+# from get_runtime_flow() above (a single-hop, flow-relations-only lookup,
+# kept as-is for backward compatibility) — this is the richer replacement
+# behind the `flow` CLI subcommand.
+
+def trace_business_flow(conn, target, direction="both", max_depth=None):
+    return flow_tracer.trace(conn, target, direction=direction,
+                              max_depth=max_depth or flow_tracer.DEFAULT_MAX_DEPTH)
+
+
+def _fmt_node_label(node_ref):
+    if not node_ref.get("resolved"):
+        return f"{node_ref.get('name') or '?'} [UNRESOLVED]"
+    label = node_ref.get("qualified_name") or node_ref.get("name") or "?"
+    node_type = node_ref.get("node_type") or "?"
+    svc = f" @ {node_ref['service']}" if node_ref.get("service") else ""
+    return f"{label} ({node_type}{svc})"
+
+
+def _build_flow_tree(paths):
+    root = {}
+    for path in paths:
+        node = root
+        for hop in path:
+            key = (hop["relation"], hop["target"].get("id"), hop["target"].get("name"))
+            node = node.setdefault(key, {"hop": hop, "children": {}})["children"]
+    return root
+
+
+def _print_flow_tree(tree, indent, out):
+    prefix = "  " * indent
+    for entry in tree.values():
+        hop = entry["hop"]
+        cycle = " (cycle — stops here)" if hop.get("cycle") else ""
+        out.append(f"{prefix}|-- {hop['relation']} [{hop['confidence']}] "
+                    f"({hop['path_type']}, {hop['direction']}){cycle}")
+        out.append(f"{prefix}      -> {_fmt_node_label(hop['target'])}")
+        if hop.get("reason"):
+            out.append(f"{prefix}      reason: {hop['reason']}")
+        if hop.get("evidence"):
+            ev = hop["evidence"]
+            loc = ev.get("file") or ""
+            if ev.get("line_start") is not None:
+                loc += f":{ev['line_start']}"
+            sym = ev.get("symbol") or ""
+            out.append(f"{prefix}      evidence: {loc}" + (f" ({sym})" if sym else ""))
+        _print_flow_tree(entry["children"], indent + 1, out)
+
+
+def format_flow_text(result):
+    lines = [f"Target: {result['target']}"]
+    if not result.get("resolved"):
+        lines.append(result.get("message", "Not found."))
+        return "\n".join(lines)
+
+    lines.append(f"Direction: {result['direction']}  |  Max depth: {result['max_depth']}")
+    if result.get("ambiguous"):
+        note = " (more candidates exist — refine the target to narrow this down)" \
+            if result.get("candidates_truncated") else ""
+        lines.append(f"Ambiguous target: {len(result['results'])} candidate(s) matched{note}")
+    cs = result.get("confidence_summary", {})
+    lines.append(f"Confidence summary: VERIFIED={cs.get('VERIFIED', 0)}  "
+                 f"INFERRED={cs.get('INFERRED', 0)}  UNRESOLVED={cs.get('UNRESOLVED', 0)}")
+
+    for i, root in enumerate(result["results"], 1):
+        label = _fmt_node_label(root["start_node"])
+        lines.append("")
+        lines.append(f"=== [{i}/{len(result['results'])}] {label} ===")
+        if root["forward_paths"]:
+            lines.append("-- forward (downstream effects) --")
+            lines.append(label)
+            _print_flow_tree(_build_flow_tree(root["forward_paths"]), 1, lines)
+        if root["reverse_paths"]:
+            lines.append("-- reverse (upstream callers) --")
+            lines.append(label)
+            _print_flow_tree(_build_flow_tree(root["reverse_paths"]), 1, lines)
+        if not root["forward_paths"] and not root["reverse_paths"]:
+            lines.append("(no connected flow found in the requested direction — the graph "
+                         "has no edges leaving/entering this node of the relevant kinds)")
+    return "\n".join(lines)
+
+
 def _print_json(data):
     print(json.dumps(data, indent=2, default=str))
 
@@ -512,6 +604,11 @@ def main():
 
     p_flow = sub.add_parser("flow")
     p_flow.add_argument("name")
+    p_flow.add_argument("--depth", type=int, default=flow_tracer.DEFAULT_MAX_DEPTH,
+                         help=f"max hops per path (default {flow_tracer.DEFAULT_MAX_DEPTH}, "
+                              f"capped at {flow_tracer.MAX_ALLOWED_DEPTH})")
+    p_flow.add_argument("--direction", choices=("forward", "reverse", "both"), default="both")
+    p_flow.add_argument("--format", choices=("text", "json"), default="text")
 
     p_api_constants = sub.add_parser("api-constants")
     p_api_constants.add_argument("keyword", nargs="?")
@@ -570,7 +667,11 @@ def main():
     elif args.command == "table":
         _print_json(get_database_impact(conn, args.name))
     elif args.command == "flow":
-        _print_json(get_runtime_flow(conn, args.name))
+        result = trace_business_flow(conn, args.name, direction=args.direction, max_depth=args.depth)
+        if args.format == "json":
+            _print_json(result)
+        else:
+            print(format_flow_text(result))
     elif args.command == "api-constants":
         _print_json(find_api_constants(conn, keyword=args.keyword, service=args.service))
     elif args.command == "ui-to-api":

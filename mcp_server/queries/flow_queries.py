@@ -6,6 +6,8 @@ controller method whose name/endpoint best matches the requested flow
 keyword, then reuse the same controller -> service -> repository walk
 get_api_context uses, reshaped as an ordered chain.
 """
+from kg_indexer import flow_tracer
+
 from ..db import fetch_all, row_to_dict
 from ..models.evidence import prune_empty
 from .api_queries import find_apis, find_ui_callers
@@ -13,6 +15,24 @@ from .common import (
     class_dependency_chain, find_exposing_method, get_parent_class,
     inferred_table_name, outgoing_edges, parse_metadata,
 )
+
+# Kept small for an MCP response (Rules 5/6: bounded, AI-facing output) —
+# a human/CLI user gets flow_tracer's own richer defaults via
+# example_queries.py's `flow` command instead.
+_MCP_MAX_PATHS = 10
+_MCP_ROOT_LIMIT = 3
+
+
+def trace_business_flow(conn, target, direction="both", max_depth=None):
+    """Thin wrapper around kg_indexer.flow_tracer.trace with MCP-sized
+    defaults — see that module's docstring for the traversal/confidence
+    design. Distinct from get_business_flow() below (a different, older
+    tool: service + free-text flow keyword, one entry point only)."""
+    return flow_tracer.trace(
+        conn, target, direction=direction,
+        max_depth=max_depth or flow_tracer.DEFAULT_MAX_DEPTH,
+        max_paths=_MCP_MAX_PATHS, root_limit=_MCP_ROOT_LIMIT,
+    )
 
 # Backend->backend + Kafka relations a controller method can carry directly
 # (see spring_flow_parser.py / java_parser.py) — folded into the flow chain

@@ -255,6 +255,7 @@ On macOS/Linux, `command` is `<repo>/.venv-mcp/bin/python`.
 | `get_api_context` | Full detail on one API: controller, DTOs, repos, tables, downstream services, UI callers |
 | `resolve_ui_api` | Which backend endpoint(s) a UI API constant (`Foo.FIELD` / literal path) calls |
 | `get_business_flow` | UI callers -> controller -> service -> repository -> downstream call chain for a named flow |
+| `trace_business_flow` | Multi-hop, confidence-tagged flow from ANY named node (API constant, component, class, method, endpoint, Kafka topic, DB table, Batch Job/Step/Tasklet) |
 | `get_database_impact` | Inferred tables read/written/updated/deleted for a service/entity/API/flow |
 | `find_callers` | What depends on / holds a reference to a target |
 | `find_dependencies` | Generic outgoing/incoming dependency lookup for any target |
@@ -295,6 +296,25 @@ endpoint, the result also includes `ui_callers` and `downstream_calls`
 (Feign/WebClient/RestTemplate to another backend service, Kafka
 publish/consume from the handler method) folded into `chain`.
 
+**`trace_business_flow(target, direction="both", depth=None)`** — `target`
+required: a UI API constant, Angular/React component/service, Java
+controller/class/method, REST endpoint (`"POST /opd/confirm/payment"`),
+Kafka topic, DB table, or Spring Batch Job/Step/Tasklet, matched by name
+(exact match wins over fuzzy, regardless of node type — see AGENTS.md
+"Business flow tracing"). `direction`: `forward` (downstream effects),
+`reverse` (upstream callers), or `both` (default — two separate trees,
+never mixed step-by-step into one path). `depth` clamped to
+`MCP_MAX_DEPTH`. Every hop carries `confidence` — exactly `VERIFIED`,
+`INFERRED`, or `UNRESOLVED` (uppercase) — plus `evidence` (file/line/symbol,
+for a VERIFIED fact) or `reason` (why it's INFERRED/UNRESOLVED); a hop is
+also tagged `path_type: DIRECT` (depth 1) or `TRANSITIVE` (deeper).
+`confidence_summary` gives a hop-count breakdown by confidence across the
+whole result — always check it rather than assuming a returned flow is
+fully proven. Distinct from `get_business_flow` above (fixed shape: one
+service + a free-text flow keyword, controller->service->repository only)
+— this is the general-purpose tracer, and the one to reach for whenever
+the question is "what does X actually connect to."
+
 **`get_database_impact(service=None, entity=None, api=None, flow=None)`**
 — at least one required; resolved in priority order `api > flow > entity > service`.
 
@@ -320,6 +340,9 @@ get_service_dependencies(service="appointment-service", direction="both", depth=
 find_api(query="cancel appointment")
 get_api_context(query="POST /book/appointment")
 get_business_flow(service="appointment-service", flow="cancellation")
+trace_business_flow(target="BillingApiConstant.BILLING_CONFIRM_PAYMENT")
+trace_business_flow(target="price_book", direction="reverse")
+trace_business_flow(target="POST_FINANCE_PRICE_BOOK", depth=2)
 get_database_impact(api="cancel appointment", service="appointment-service")
 find_callers(target="AppointmentService")
 find_dependencies(target="AppointmentController")
