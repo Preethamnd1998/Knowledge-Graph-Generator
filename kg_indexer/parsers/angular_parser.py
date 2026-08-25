@@ -6,8 +6,9 @@ import os
 import re
 
 from .common import (
-    NameRegistry, find_matching, line_of, read_text, split_top_level,
-    strip_type, walk_source_files,
+    API_CONSTANT_USAGE_RE, NameRegistry, PLAIN_CLASS_RE, STATIC_STRING_FIELD_RE,
+    find_matching, is_api_constant_class_name, line_of, normalize_ui_path,
+    read_text, split_top_level, strip_type, walk_source_files,
 )
 
 DECORATOR_OPEN_RE = re.compile(r'@(Component|NgModule|Injectable|Directive|Pipe)\s*\(')
@@ -116,6 +117,19 @@ def _parse_file(db, registry, project_name, subproject_name, subproject_path,
         except Exception:
             stats["errors"] += 1
 
+    for pm in PLAIN_CLASS_RE.finditer(text):
+        if not is_api_constant_class_name(pm.group("name")):
+            continue
+        try:
+            _parse_api_constant_class(db, registry, project_name, subproject_name,
+                                       rel_file, text, pm, file_node_id, stats)
+        except Exception:
+            stats["errors"] += 1
+
+    for um in API_CONSTANT_USAGE_RE.finditer(text):
+        key = f"{um.group('cls')}.{um.group('field')}"
+        db.add_edge(file_node_id, "USES_API_CONSTANT", target_name=key, service=subproject_name)
+
 
 def _parse_decorated_class(db, registry, subproject_name, project_name,
                             rel_file, text, dm, file_node_id, stats):
@@ -177,6 +191,42 @@ def _parse_decorated_class(db, registry, subproject_name, project_name,
             continue
         db.add_edge(class_node_id, "DEPENDS_ON", target_name=ptype,
                     service=subproject_name, metadata={"param_name": pname})
+
+
+def _parse_api_constant_class(db, registry, project_name, subproject_name, rel_file,
+                               text, pm, file_node_id, stats):
+    """`export class FooApiConstant { public static X = "path/segments"; }`
+    — one API_CONSTANT node per field, not one node per class: the field is
+    the actual "API identity" a UI call site references (`FooApiConstant.X`),
+    see common.py's module docs. Node identity includes rel_file (same
+    reason as every other Angular node — this class name repeats across
+    feature libraries, sometimes with the *same* field name resolving to
+    the *same* backend path, which is a legitimate duplicate, not a bug)."""
+    class_name = pm.group("name")
+    body_start = pm.end() - 1
+    body_end = find_matching(text, body_start, "{", "}")
+    body_text = text[body_start:body_end]
+
+    count = 0
+    for fm in STATIC_STRING_FIELD_RE.finditer(body_text):
+        field_name = fm.group("field")
+        raw_value = fm.group("dq") if fm.group("dq") is not None else fm.group("sq")
+        normalized_path, segments = normalize_ui_path(raw_value)
+        qname = f"ng:{project_name}:{subproject_name}:{rel_file}:{class_name}.{field_name}"
+        field_line = line_of(text, body_start + fm.start())
+        node_id = db.add_node(
+            "API_CONSTANT", f"{class_name}.{field_name}", qualified_name=qname,
+            service=subproject_name, project_type="angular", file_path=rel_file,
+            start_line=field_line,
+            metadata={
+                "class_name": class_name, "field_name": field_name, "raw_value": raw_value,
+                "normalized_path": normalized_path, "segments": segments,
+            },
+        )
+        registry.register(f"{class_name}.{field_name}", qname)
+        db.add_edge(file_node_id, "DECLARES", target_id=node_id, service=subproject_name)
+        count += 1
+    stats["API_CONSTANT"] = stats.get("API_CONSTANT", 0) + count
 
 
 def parse_project(db, project_name, project_root):

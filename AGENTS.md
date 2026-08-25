@@ -65,7 +65,15 @@ DB_TABLE` (Java runtime flows — `spring_flow_parser.py`; deliberately no
 separate `SPRING_CONFIG`/`SPRING_BEAN`/`KAFKA_PRODUCER`/`KAFKA_CONSUMER`
 node types, see that module's docstring for why) ·
 `NG_SUBPROJECT, NG_COMPONENT, NG_MODULE, NG_SERVICE, NG_DIRECTIVE, NG_PIPE`
-(Angular) · `REACT_COMPONENT, REACT_HOOK` (React).
+(Angular) · `REACT_COMPONENT, REACT_HOOK` (React) ·
+`API_CONSTANT` (Angular/React — one node per `public static FIELD =
+"path";` entry on a `*ApiConstant(s)`/`*APIConstant(s)` class; see "UI ->
+Backend API mapping" below). Deliberately no separate `API_ENDPOINT` node
+type — the existing Java `ENDPOINT` node (created by `java_parser.py`,
+unchanged) is the resolution target for API_CONSTANT and for
+Feign/WebClient/RestTemplate calls too; a parallel node would duplicate it
+with no new query value (same reasoning as the flow parser's node types
+above).
 
 `project_type` values: `java`, `angular`, `react`.
 
@@ -76,10 +84,10 @@ edges), relation, service, metadata (JSON text)`.
 `relation` values in use: `CONTAINS` (parent declares/holds child —
 service→file, file→class, class→method, subproject→file, ...),
 `DECLARES` (file→class/component; NgModule→its declarations[] entries;
-also class→ASYNC_OPERATION for an `@Async` method), `EXTENDS`,
-`IMPLEMENTS`, `DEPENDS_ON` (`@Autowired`/`@Inject`/`@Resource` field, or
-Angular constructor injection), `EXPOSES` (method→ENDPOINT node),
-`IMPORTS` (file→imported symbol, or NgModule→imported module),
+also class→ASYNC_OPERATION for an `@Async` method; file→API_CONSTANT),
+`EXTENDS`, `IMPLEMENTS`, `DEPENDS_ON` (`@Autowired`/`@Inject`/`@Resource`
+field, or Angular constructor injection), `EXPOSES` (method→ENDPOINT
+node), `IMPORTS` (file→imported symbol, or NgModule→imported module),
 `EXPORTS` (NgModule→exported symbol), `USES_HOOK` (React
 component/hook→hook name called), `RENDERS` (React component→JSX tag
 name it renders) · Java runtime flows (`spring_flow_parser.py`):
@@ -89,10 +97,14 @@ bean), `HAS_STEP` (BATCH_JOB→BATCH_STEP), `USES_TASKLET`
 `jobLauncher.run(...)`), `ASYNC_CALL` (method→ASYNC_OPERATION, from
 `CompletableFuture.runAsync`/`supplyAsync`), `PUBLISHES`
 (method/class→KAFKA_TOPIC), `CONSUMES` (method→KAFKA_TOPIC, from
-`@KafkaListener`), `WRITES`/`READS` (method→DB_TABLE, from literal SQL).
-Every edge this parser creates also carries `metadata.confidence` —
-`verified`/`inferred`/`unknown`, see the module docstring — in addition
-to the base convention below.
+`@KafkaListener`), `WRITES`/`READS` (method→DB_TABLE, from literal SQL) ·
+UI/backend call mapping (see below): `CALLS_API` (API_CONSTANT→ENDPOINT),
+`USES_API_CONSTANT` (file→API_CONSTANT), `FEIGN_CALL`
+(METHOD→ENDPOINT, from a `@FeignClient` interface method), `WEBCLIENT_CALL`
+/ `RESTTEMPLATE_CALL` (METHOD→ENDPOINT, from a WebClient/RestTemplate call
+site). Every edge the flow parser and the UI/backend mapping create also
+carries `metadata.confidence` — `verified`/`inferred`/`unknown`/`resolved`
+— in addition to the base convention below.
 
 **Resolution passes.** An edge is created with only `target_name` set
 whenever the target node might not exist yet (different file, not yet
@@ -107,6 +119,71 @@ external library type, not a bug — `target_name` is kept so it stays
 queryable. If a simple name matched more than one candidate, the edge's
 `metadata.ambiguous_candidates` lists all of them; only the first was
 used for `target_id`.
+
+**UI -> Backend API mapping** (`angular_parser.py`/`react_parser.py` +
+`java_parser.py` + `GraphDB.resolve_service_call_edges` /
+`resolve_api_constant_edges` in `db.py`) — **requires
+`SINGLE_DATABASE=true`**, since the target commonly lives in a different
+service's portion of the graph; in per-target `.db` mode these two
+resolution passes are skipped entirely (a printed `[note]` says so) and
+the CALLS_API/FEIGN_CALL/etc. edges stay `target_name`-only.
+
+- *Gateway prefix*: each backend service's own `spring.application.name`
+  (read from its `bootstrap.yml`/`application.yml`/`.properties` under
+  `src/main/resources` — `java_parser._extract_gateway_prefix`), never
+  hand-mapped. Spring Cloud Gateway's discovery-locator routes
+  `/{that-name}/**` to the service registered under it, so a UI path like
+  `ipd/opd/confirm/payment` strips `ipd` (→ ipd-service) and matches the
+  remaining `/opd/confirm/payment` against ipd-service's own `ENDPOINT`
+  paths. `orchestrator.py` builds `{prefix: service_name}` across every
+  indexed backend service and passes it to both resolvers below.
+- *UI side*: `angular_parser.py`/`react_parser.py` scan for a class whose
+  name ends in `ApiConstant(s)`/`APIConstant(s)` (case-insensitive) and
+  creates one `API_CONSTANT` node per `public static FIELD = "literal";`
+  member (qualified_name includes the file path — this class name repeats
+  across feature libraries just like any other Angular node, see the
+  gotcha below). Any `SomeApiConstant.FIELD` reference elsewhere in a
+  `.ts`/`.tsx` file becomes a `USES_API_CONSTANT` edge from that file, so
+  "who calls this backend endpoint" can walk CALLS_API backward to the
+  constant and USES_API_CONSTANT backward again to the referencing file.
+  A concatenated/dynamic suffix appended at a call site (`CONST + "/" +
+  id`) is invisible here by design — only the constant's own literal value
+  is matched, never a call-site guess.
+- *Backend side*: `java_parser.py` also recognizes a **symbolic**
+  `@GetMapping(value = SomeApiConstant.FIELD)` (vs. the common literal-
+  string form) by resolving it against
+  `java_parser._collect_java_api_constants` — a same-service pre-pass over
+  every `*ApiConstant(s)` class's own `public static final String FIELD =
+  "literal";` fields (Java compile-time constants can't be referenced
+  across service boundaries in this architecture, so this is scoped to one
+  service, never global). This turned out to matter a lot in practice —
+  see "Gotchas" below.
+- *Matching*: `GraphDB.resolve_api_constant_edges` compares path segments
+  (`path_segments_match`/`path_specificity` in `common.py`), treating a
+  `{...}` segment on *either* side as a wildcard. When more than one
+  `ENDPOINT` structurally matches, only the *most specific* one(s) (most
+  all-literal segments, mirroring Spring's own routing precedence) survive
+  — ties beyond that are genuinely ambiguous (`metadata.ambiguous: true`
+  on every surviving `CALLS_API` edge) rather than guessed down to one. No
+  gateway-prefix match at all (or a match with zero surviving candidates)
+  leaves the `API_CONSTANT` node's `metadata.resolution` set to
+  `unknown_gateway_prefix` / `no_matching_endpoint` — always explains
+  *why*, never just silently absent.
+- *Backend -> backend*: `@FeignClient(name = "x")` interface methods
+  (`java_parser.py`, a body-less counterpart of `_parse_method` — Feign
+  methods end in `;`, not `{`) and WebClient/RestTemplate call sites
+  (`spring_flow_parser.py`, pattern-matched the same way Kafka/DB-table
+  calls are) all resolve via `GraphDB.resolve_service_call_edges` — an
+  *exact* `ENDPOINT` qualified_name match (`target_prefix` looked up in the
+  gateway-prefix map, then `ENDPOINT:{service}:{http_method}:{path}`),
+  same precision philosophy as `resolve_exact_import_edges`. An explicit
+  `@FeignClient(url = ...)` override bypasses service discovery entirely
+  and is deliberately left unresolved (`metadata.external_url: true`) —
+  never resolved against the `name` anyway. RestTemplate only creates an
+  edge when the call's first argument is itself a literal
+  `"http://host/path"` string; a `@Value`-injected base URL (common in
+  this codebase for genuinely external hosts) has no literal to match, so
+  no edge is created at all rather than one pointing at nothing.
 
 ## Query cookbook
 
@@ -134,6 +211,14 @@ get_topic_flow(conn, "POST_FINANCE_PRICE_BOOK")     # producers + consumers, cro
 find_async_operations(conn, service="core-service") # @Async methods / CompletableFuture call sites
 get_database_impact(conn, "price_book")             # who WRITES/READS an (inferred) DB table
 get_runtime_flow(conn, "createPriceBookFromTempJob") # generic: any flow-relation edges touching a node
+
+from example_queries import find_api_constants, find_backend_for_ui_constant, find_ui_callers_of_endpoint, find_service_calls, get_full_flow
+
+find_api_constants(conn, keyword="CONFIRM_PAYMENT")           # UI API_CONSTANT nodes by field/class/path keyword
+find_backend_for_ui_constant(conn, "ipd/opd/confirm/payment") # "which backend endpoint does this UI constant call?"
+find_ui_callers_of_endpoint(conn, "ipd-service", "POST", "/opd/confirm/payment")  # "which UI screens call this?"
+find_service_calls(conn, service="core-service")               # this service's Feign/WebClient/RestTemplate calls out
+get_full_flow(conn, "ipd-service", "POST", "/opd/confirm/payment")  # UI -> gateway -> backend -> Kafka/HTTP -> backend
 ```
 
 Direct SQL when you need something the helpers don't cover, e.g. every
@@ -157,7 +242,11 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
 
 - `kg_indexer/parsers/common.py` — shared helpers: directory walking
   with ignore rules, `find_matching()` (bracket/paren matcher that
-  respects string literals), `split_top_level()`, `NameRegistry`.
+  respects string literals), `split_top_level()`, `NameRegistry`. Also
+  the API_CONSTANT regex trio (`PLAIN_CLASS_RE`, `STATIC_STRING_FIELD_RE`,
+  `API_CONSTANT_USAGE_RE`) and `normalize_ui_path`/`path_segments_match`/
+  `path_specificity`, shared by `angular_parser.py`/`react_parser.py` and
+  (the matching side) `db.py`.
 - `kg_indexer/parsers/java_parser.py` — one file, one function per
   concern (`_parse_file` → `_parse_class` → `_parse_method`). To
   recognize a new annotation or a new dependency-injection style, this
@@ -165,6 +254,13 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
   body text (only its signature/annotations/params/return type) — a
   parser that needs body text (like `spring_flow_parser.py`) has to
   re-derive it via `_find_block_end()` from the method's opening `{`.
+  Also: `_extract_gateway_prefix` (reads `spring.application.name`),
+  `_collect_java_api_constants` (pre-pass for symbolic `@Mapping(value =
+  SomeApiConstant.FIELD)`), and `_parse_feign_method`/`FEIGN_METHOD_RE`
+  (body-less interface method declarations — deliberately a separate
+  regex from `METHOD_RE`, not a variant of it, since interface methods
+  end in `;` and rarely carry an access modifier) — see "UI -> Backend
+  API mapping" above.
 - `kg_indexer/parsers/spring_flow_parser.py` — additive second pass for
   Spring Batch/Kafka/async/DB-table flows (see its own docstring for the
   full node/edge vocabulary and confidence model). Re-runs
@@ -177,18 +273,27 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
   service's `resolve_pending_edges()` call (see `orchestrator.py`), so
   cross-file references (mainly `jobLauncher.run()` targets) resolve
   through the *same* `NameRegistry`/pending-edge mechanism rather than a
-  bespoke one.
+  bespoke one. WEBCLIENT_CALL/RESTTEMPLATE_CALL detection lives here too
+  (imperative call-site pattern matching, same style as the Kafka/DB-table
+  regexes) rather than in `java_parser.py`, which only handles
+  *declarative* annotation-driven parsing (hence FEIGN_CALL lives there
+  instead, next to EXPOSES/ENDPOINT which it mirrors).
 - `kg_indexer/parsers/angular_parser.py` — decorator detection is
   regex-for-the-`@Decorator(` opener + `find_matching()` for the
   argument list, so nested object literals in `@NgModule({...})` don't
   break it. `ROOT_APP_SENTINEL` is how the workspace's own shell app
   (outside `projects/`) gets indexed — see `orchestrator.py` for how the
-  sentinel is resolved to a real path.
+  sentinel is resolved to a real path. API_CONSTANT classes are plain
+  (never decorated) so they're found by a separate `PLAIN_CLASS_RE` scan,
+  not the decorator loop — see `_parse_api_constant_class`.
 - `kg_indexer/parsers/react_parser.py` — component/hook detection
   requires a block body (`=> { ... }` or `function ... { ... }`);
   expression-bodied arrows are intentionally not matched (see README
   limitations) to avoid false positives on non-component helper
-  functions.
+  functions. Has the same API_CONSTANT detection as `angular_parser.py`
+  (kept as a near-duplicate, not shared, since the qualified_name scheme
+  differs — no sub-project segment) but nothing in the real workspace
+  exercises it yet (`REACT_PROJECT_PATH` is unset in `kg-config.env`).
 - `kg_indexer/db.py` — `GraphDB.add_node` dedupes purely by
   `qualified_name`; if you add a new node type, make sure its
   `qualified_name` scheme is unique per actual declaration (include the
@@ -196,14 +301,24 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
   uniqueness, e.g. Java's `package.ClassName`). Getting this wrong
   silently merges two distinct declarations into one node — this
   actually happened once with early Angular support (class name only,
-  no file path) and was fixed; don't reintroduce it.
+  no file path) and was fixed; don't reintroduce it. `resolve_service_call_edges`
+  (Feign/WebClient/RestTemplate — exact qualified_name match) and
+  `resolve_api_constant_edges` (UI API_CONSTANT — path-segment structural
+  match, see above) both take the `gateway_prefix_map` `orchestrator.py`
+  builds; neither is called at all when `SINGLE_DATABASE=false`.
 - `kg_indexer/orchestrator.py` — the only place that turns config
   values into filesystem paths and decides single-vs-per-target `.db`
   output. Both `resolve_exact_import_edges` and `resolve_pending_edges`
   are called here per language, scoped by `project_type` — do not call
   `resolve_pending_edges` without a `project_type` when multiple
   languages share one `GraphDB` (that reintroduces the cross-language
-  false-resolution bug described below).
+  false-resolution bug described below). Also assembles
+  `gateway_prefix_map` from each backend service's own
+  `stats["gateway_prefix"]` (never hand-mapped) and calls
+  `resolve_service_call_edges`/`resolve_api_constant_edges` once, after
+  every backend/Angular/React target has been indexed — same ordering
+  reason as the cross-reference `resolve_pending_edges` calls right above
+  it: every candidate `ENDPOINT`/`API_CONSTANT` must exist first.
 
 ## Gotchas already found the hard way
 
@@ -250,6 +365,36 @@ WHERE e.relation = 'DECLARES' AND m.node_type = 'NG_MODULE';
   around just the keyword — so the character class outside that group
   stays case-sensitive. Caught by actually sampling the resulting
   `DB_TABLE` node names, not by trusting the pattern read correctly.
+- **`@*Mapping(value = SomeApiConstant.FIELD)` — a symbolic reference, not
+  a string literal — is common in this codebase**, not a rare edge case.
+  The two examples the acceptance criteria named (`ipd/opd/confirm/
+  service/order`, `ipd/opd/confirm/payment`) both hit this: their real
+  controller methods are written as `@PostMapping(value =
+  BillingApiConstant.CONFIRM_SERVICE_ORDER)`, so the original
+  `_annotation_path()` (which only looks for a quoted string) returned
+  `None` for `sub_path`, silently truncating both `ENDPOINT` paths down to
+  just the class-level `@RequestMapping` (or `""` when there wasn't one) —
+  not an error, a quietly wrong path that would never match the UI side.
+  Found by checking these two named examples end-to-end against the real
+  workspace (not just trusting the regex compiled), which is what
+  `_collect_java_api_constants`/the `java_api_constants` fallback in
+  `_annotation_path()` exists to fix — grep for
+  `@(Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(value\s*=\s*)?\w+
+  (Api|API)Constants?\.\w+` in the real workspace before assuming this is
+  rare in a codebase you're porting this to; it hit 40+ files on the first
+  page of results here.
+- **A UI path can structurally match more than one `ENDPOINT` even when
+  only one is "really" the target** — e.g. `core/patient/list` matches
+  both a literal `/patient/list` mapping and an unrelated `/patient/{id}`
+  mapping (the `{id}` wildcard matches the literal segment `"list"` too).
+  Initially every such pair was reported as `ambiguous`, which is wrong:
+  Spring's own routing always prefers the all-literal match. Caught by a
+  test asserting `len(edges) == 1` for an unambiguous UI constant, which
+  failed with 2. Fixed by `path_specificity()` — count of exact-literal
+  segment matches — with only the *highest*-scoring candidate(s) kept per
+  UI constant; a real tie (e.g. two HTTP methods at the identical path)
+  still reports `ambiguous: true` on both surviving edges, it's just no
+  longer a false one.
 
 ## Porting this to a different codebase
 

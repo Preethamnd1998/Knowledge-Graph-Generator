@@ -8,10 +8,17 @@ get_api_context uses, reshaped as an ordered chain.
 """
 from ..db import fetch_all, row_to_dict
 from ..models.evidence import prune_empty
-from .api_queries import find_apis
+from .api_queries import find_apis, find_ui_callers
 from .common import (
     class_dependency_chain, find_exposing_method, get_parent_class,
-    inferred_table_name, parse_metadata,
+    inferred_table_name, outgoing_edges, parse_metadata,
+)
+
+# Backend->backend + Kafka relations a controller method can carry directly
+# (see spring_flow_parser.py / java_parser.py) — folded into the flow chain
+# so "UI -> gateway -> backend -> Kafka/HTTP -> backend" is one call.
+_DOWNSTREAM_CALL_RELATIONS = (
+    "FEIGN_CALL", "WEBCLIENT_CALL", "RESTTEMPLATE_CALL", "PUBLISHES", "CONSUMES",
 )
 
 
@@ -65,7 +72,22 @@ def get_business_flow(conn, service, flow_keyword):
         (service,),
     )]
 
-    chain = [{"step": controller_row["name"], "role": "controller"}]
+    ui_callers = find_ui_callers(conn, entry_endpoint["id"], limit=5) if entry_endpoint else []
+
+    downstream_calls = [
+        {
+            "relation": e["relation"],
+            "target": e.get("resolved_name") or e.get("target_name"),
+            "target_service": e.get("resolved_service"),
+            "confidence": "resolved" if e["target_id"] is not None else "unresolved",
+        }
+        for e in outgoing_edges(conn, method_row["id"], relations=_DOWNSTREAM_CALL_RELATIONS)
+    ]
+
+    chain = []
+    for uc in ui_callers:
+        chain.append({"step": uc["constant"], "role": "ui_caller", "detail": uc["ui_project"]})
+    chain.append({"step": controller_row["name"], "role": "controller"})
     chain.append({"step": method_row["name"], "role": "method"})
     for svc_class in sorted(set(services_seen)):
         chain.append({"step": svc_class, "role": "service"})
@@ -73,6 +95,8 @@ def get_business_flow(conn, service, flow_keyword):
         chain.append({"step": repo, "role": "repository"})
     for other in sorted(downstream):
         chain.append({"step": other, "role": "downstream_service"})
+    for dc in downstream_calls:
+        chain.append({"step": dc["target"], "role": dc["relation"].lower(), "detail": dc["target_service"]})
     if events:
         chain.append({"step": events[0], "role": "event"})
 
@@ -84,10 +108,12 @@ def get_business_flow(conn, service, flow_keyword):
              "path": parse_metadata(entry_endpoint).get("path")}
             if entry_endpoint else None
         ),
+        "ui_callers": ui_callers,
         "chain": chain,
-        "involved_services": sorted({service, *downstream}),
+        "involved_services": sorted({service, *downstream, *(dc["target_service"] for dc in downstream_calls if dc["target_service"])}),
         "classes": sorted({controller_row["name"], *services_seen, *repo_names}),
         "database_tables": tables,
         "events": events,
         "external_calls": sorted(downstream),
+        "downstream_calls": downstream_calls,
     })

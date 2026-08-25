@@ -29,7 +29,14 @@ REPOSITORY_BASE_INTERFACES = {
 
 # Dependency-shaped relations — the structural ones (CONTAINS/DECLARES) are
 # "X holds Y", not "X depends on Y", so traversal tools exclude them by default.
-DEPENDENCY_RELATIONS = ("DEPENDS_ON", "EXTENDS", "IMPLEMENTS", "IMPORTS")
+# CALLS_API (UI API_CONSTANT -> backend ENDPOINT) and FEIGN_CALL/WEBCLIENT_CALL/
+# RESTTEMPLATE_CALL (backend METHOD -> backend ENDPOINT) are included so
+# get_service_context/get_service_dependencies pick up UI->backend and
+# backend->backend calls for free — see kg_indexer/db.py's resolve_* methods.
+DEPENDENCY_RELATIONS = (
+    "DEPENDS_ON", "EXTENDS", "IMPLEMENTS", "IMPORTS",
+    "CALLS_API", "FEIGN_CALL", "WEBCLIENT_CALL", "RESTTEMPLATE_CALL",
+)
 
 
 def parse_metadata(row):

@@ -5,7 +5,9 @@ import os
 import re
 
 from .common import (
-    NameRegistry, find_matching, line_of, read_text, walk_source_files,
+    API_CONSTANT_USAGE_RE, NameRegistry, PLAIN_CLASS_RE, STATIC_STRING_FIELD_RE,
+    find_matching, is_api_constant_class_name, line_of, normalize_ui_path,
+    read_text, walk_source_files,
 )
 
 COMPONENT_FUNC_RE = re.compile(r'\bfunction\s+(?P<name>[A-Z]\w*)\s*\([^)]*\)\s*(?::\s*[\w.<>\[\], |]+?)?\s*\{')
@@ -116,6 +118,19 @@ def _parse_file(db, registry, project_name, project_root, file_path, service_nod
         except Exception:
             stats["errors"] += 1
 
+    for pm in PLAIN_CLASS_RE.finditer(text):
+        if not is_api_constant_class_name(pm.group("name")):
+            continue
+        try:
+            _parse_api_constant_class(db, registry, project_name, rel_file, text, pm,
+                                       file_node_id, stats)
+        except Exception:
+            stats["errors"] += 1
+
+    for um in API_CONSTANT_USAGE_RE.finditer(text):
+        key = f"{um.group('cls')}.{um.group('field')}"
+        db.add_edge(file_node_id, "USES_API_CONSTANT", target_name=key, service=project_name)
+
 
 def _emit(db, registry, project_name, rel_file, text, name, start, brace_index, kind,
           node_type, exported_names, file_node_id, stats, jsx_scan):
@@ -142,6 +157,41 @@ def _emit(db, registry, project_name, rel_file, text, name, start, brace_index, 
     if jsx_scan:
         for tag in sorted(set(JSX_TAG_RE.findall(body_text)) - {name}):
             db.add_edge(node_id, "RENDERS", target_name=tag, service=project_name)
+
+
+def _parse_api_constant_class(db, registry, project_name, rel_file, text, pm,
+                               file_node_id, stats):
+    """Same `FooApiConstant` field-level detection as angular_parser.py's
+    _parse_api_constant_class — kept as a near-duplicate here rather than a
+    shared function because the two languages' qualified_name schemes
+    differ (no subproject segment for React) and this parser has no real
+    workspace target to exercise it against yet (REACT_PROJECT_PATH is
+    unset in kg-config.env); see common.py for the actually-shared regexes."""
+    class_name = pm.group("name")
+    body_start = pm.end() - 1
+    body_end = find_matching(text, body_start, "{", "}")
+    body_text = text[body_start:body_end]
+
+    count = 0
+    for fm in STATIC_STRING_FIELD_RE.finditer(body_text):
+        field_name = fm.group("field")
+        raw_value = fm.group("dq") if fm.group("dq") is not None else fm.group("sq")
+        normalized_path, segments = normalize_ui_path(raw_value)
+        qname = f"react:{project_name}:{rel_file}:{class_name}.{field_name}"
+        field_line = line_of(text, body_start + fm.start())
+        node_id = db.add_node(
+            "API_CONSTANT", f"{class_name}.{field_name}", qualified_name=qname,
+            service=project_name, project_type="react", file_path=rel_file,
+            start_line=field_line,
+            metadata={
+                "class_name": class_name, "field_name": field_name, "raw_value": raw_value,
+                "normalized_path": normalized_path, "segments": segments,
+            },
+        )
+        registry.register(f"{class_name}.{field_name}", qname)
+        db.add_edge(file_node_id, "DECLARES", target_id=node_id, service=project_name)
+        count += 1
+    stats["API_CONSTANT"] = stats.get("API_CONSTANT", 0) + count
 
 
 def parse_project(db, registry: NameRegistry, project_root, progress=None):

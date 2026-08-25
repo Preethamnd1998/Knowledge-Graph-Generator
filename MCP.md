@@ -75,9 +75,14 @@ Two tables:
 - **`nodes`**: `id, node_type, name, qualified_name, service, project_type, file_path, start_line, end_line, signature, metadata (JSON)`
   `node_type` values: `SERVICE, FILE, CLASS, INTERFACE, ENUM, METHOD, ENDPOINT` (Java) ·
   `NG_SUBPROJECT, NG_COMPONENT, NG_MODULE, NG_SERVICE, NG_DIRECTIVE, NG_PIPE` (Angular) ·
-  `REACT_COMPONENT, REACT_HOOK` (React).
+  `REACT_COMPONENT, REACT_HOOK` (React) · `API_CONSTANT` (Angular/React UI
+  API constant field — see AGENTS.md "UI -> Backend API mapping").
 - **`edges`**: `id, source_id, target_id (NULL if unresolved), target_name, relation, service, metadata (JSON)`
-  `relation` values: `CONTAINS, DECLARES, EXTENDS, IMPLEMENTS, DEPENDS_ON, EXPOSES, IMPORTS, EXPORTS, USES_HOOK, RENDERS`.
+  `relation` values: `CONTAINS, DECLARES, EXTENDS, IMPLEMENTS, DEPENDS_ON, EXPOSES, IMPORTS, EXPORTS, USES_HOOK, RENDERS`,
+  plus `CALLS_API` (UI API_CONSTANT -> backend ENDPOINT), `USES_API_CONSTANT`
+  (UI file -> API_CONSTANT), `FEIGN_CALL`/`WEBCLIENT_CALL`/`RESTTEMPLATE_CALL`
+  (backend METHOD -> another backend service's ENDPOINT) — all four require
+  the graph to have been built with `SINGLE_DATABASE=true`.
 
 There is **no** `CALLS` relation (no method-body call-site tracking) and
 **no** `DATABASE_TABLE`/`BUSINESS_FLOW` node type. Several tools
@@ -247,8 +252,9 @@ On macOS/Linux, `command` is `<repo>/.venv-mcp/bin/python`.
 | `get_service_context` | Compact overview: purpose, tech, counts, cross-service deps, events |
 | `get_service_dependencies` | Service-level dependency tree, bounded depth |
 | `find_api` | Find REST APIs by keyword/path/method/service |
-| `get_api_context` | Full detail on one API: controller, DTOs, repos, tables, downstream services |
-| `get_business_flow` | Controller -> service -> repository chain for a named flow |
+| `get_api_context` | Full detail on one API: controller, DTOs, repos, tables, downstream services, UI callers |
+| `resolve_ui_api` | Which backend endpoint(s) a UI API constant (`Foo.FIELD` / literal path) calls |
+| `get_business_flow` | UI callers -> controller -> service -> repository -> downstream call chain for a named flow |
 | `get_database_impact` | Inferred tables read/written/updated/deleted for a service/entity/API/flow |
 | `find_callers` | What depends on / holds a reference to a target |
 | `find_dependencies` | Generic outgoing/incoming dependency lookup for any target |
@@ -269,11 +275,25 @@ On macOS/Linux, `command` is `<repo>/.venv-mcp/bin/python`.
 — at least one filter required.
 
 **`get_api_context(query, service=None)`** — `query` can be an exact
-`METHOD /path` or a keyword; best match is used.
+`METHOD /path` or a keyword; best match is used. Includes `ui_callers`
+(UI API_CONSTANT nodes that CALLS_API to this endpoint, plus which file
+references each one) when the graph has resolved any — requires the
+indexed graph to have been built with `SINGLE_DATABASE=true`.
+
+**`resolve_ui_api(query, limit=None)`** — `query` required: a
+`ClassName.FIELD` (e.g. `BillingApiConstant.BILLING_CONFIRM_PAYMENT`), a
+bare field/class name, or the literal path (`ipd/opd/confirm/payment`).
+Returns every matching UI API_CONSTANT with its resolution status —
+`resolved`, `unknown_gateway_prefix` (path's first segment isn't a known
+backend service), or `no_matching_endpoint` — and the endpoint(s) it
+resolves to, if any. Never silently omits an unresolved match.
 
 **`get_business_flow(service, flow)`** — both required; `flow` is a free-text
 keyword matched against endpoint paths/handler names first, then method
-names if no endpoint matches.
+names if no endpoint matches. When the matched entry point is a REST
+endpoint, the result also includes `ui_callers` and `downstream_calls`
+(Feign/WebClient/RestTemplate to another backend service, Kafka
+publish/consume from the handler method) folded into `chain`.
 
 **`get_database_impact(service=None, entity=None, api=None, flow=None)`**
 — at least one required; resolved in priority order `api > flow > entity > service`.

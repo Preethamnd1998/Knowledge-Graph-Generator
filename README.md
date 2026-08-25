@@ -134,8 +134,22 @@ first if you want it to reflect only the current config.
 
 **Java** — classes/interfaces/enums, class annotations
 (`@RestController`, `@Service`, `@Entity`, ...), methods, REST endpoints
-from `@*Mapping` (HTTP verb + full path), `extends`/`implements`, and
-`@Autowired`/`@Inject`/`@Resource` field dependencies.
+from `@*Mapping` (HTTP verb + full path, including a path given as a
+symbolic `SomeApiConstant.FIELD` reference rather than a string literal),
+`extends`/`implements`, `@Autowired`/`@Inject`/`@Resource` field
+dependencies, and `@FeignClient` interface methods (as outgoing calls to
+another service, not endpoints of their own).
+
+**UI ↔ Backend API mapping** — an Angular/React `FooApiConstant.FIELD =
+"path"` constant is matched to the real Java controller endpoint it calls,
+via each backend service's own registered API Gateway prefix
+(`spring.application.name`) plus its controller's `@RequestMapping` +
+method `@*Mapping` path; a `@FeignClient`/WebClient/RestTemplate call in
+one backend service is matched to another service's endpoint the same
+way. Every match states its confidence and, when it can't resolve, *why*
+(unknown gateway prefix, no matching endpoint, ambiguous multiple
+matches, ...) rather than guessing — see AGENTS.md's "UI -> Backend API
+mapping" section for the full mechanism. Requires `SINGLE_DATABASE=true`.
 
 **Java runtime flows** (`kg_indexer/parsers/spring_flow_parser.py`, an
 additive second pass) — Spring Batch `@Bean Job`/`Step`/`Tasklet`
@@ -190,6 +204,13 @@ python example_queries.py topic POST_FINANCE_PRICE_BOOK
 python example_queries.py async
 python example_queries.py table price_book
 python example_queries.py flow createPriceBookFromTempJob
+
+# UI <-> Backend API mapping
+python example_queries.py api-constants CONFIRM_PAYMENT
+python example_queries.py ui-to-api "ipd/opd/confirm/payment"
+python example_queries.py api-callers ipd-service POST /opd/confirm/payment
+python example_queries.py service-calls --service core-service
+python example_queries.py full-flow ipd-service POST /opd/confirm/payment
 ```
 
 Or import it directly for agent/programmatic use:
@@ -213,6 +234,7 @@ find_service(query="appointment")
 get_service_context(service="appointment-service")
 get_business_flow(service="appointment-service", flow="cancellation")
 get_context_pack(topic="appointment cancellation", max_tokens=1200)
+resolve_ui_api(query="ipd/opd/confirm/payment")  # "which backend endpoint does this UI API constant call?"
 ```
 
 `get_service_context` returns a handful of fields (purpose, tech,

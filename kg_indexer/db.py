@@ -10,6 +10,8 @@ import json
 import os
 import sqlite3
 
+from .parsers.common import path_segments_match, path_specificity
+
 SCHEMA = """
 CREATE TABLE nodes (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,6 +192,138 @@ class GraphDB:
             )
             resolved += 1
         return resolved
+
+    def resolve_service_call_edges(self, gateway_prefix_map,
+                                    relations=("FEIGN_CALL", "WEBCLIENT_CALL", "RESTTEMPLATE_CALL")):
+        """Resolve backend->backend call edges (Feign/WebClient/RestTemplate)
+        by EXACT match against a target ENDPOINT's qualified_name — same
+        precision philosophy as resolve_exact_import_edges, never a fuzzy
+        guess. `gateway_prefix_map` is {registered-service-name -> our
+        service_name}, built by the orchestrator from every backend
+        service's own spring.application.name (see java_parser
+        ._extract_gateway_prefix) — never hand-mapped in this file.
+
+        Requires SINGLE_DATABASE=true (the caller only invokes this in
+        shared mode) since the target ENDPOINT commonly lives in a
+        different service's portion of the same graph.
+        """
+        placeholders = ",".join("?" for _ in relations)
+        cur = self.conn.execute(
+            f"SELECT id, metadata FROM edges WHERE relation IN ({placeholders}) AND target_id IS NULL",
+            relations,
+        )
+        rows = cur.fetchall()
+        resolved = 0
+        for edge_id, metadata_json in rows:
+            metadata = json.loads(metadata_json) if metadata_json else {}
+            if metadata.get("external_url"):
+                continue
+            target_prefix = metadata.get("target_prefix")
+            http_method = metadata.get("http_method")
+            path = metadata.get("path")
+            if not target_prefix or not http_method or path is None:
+                continue
+            service_name = gateway_prefix_map.get(target_prefix.lower())
+            if not service_name:
+                metadata["resolution"] = "unknown_target_prefix"
+                self.conn.execute("UPDATE edges SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), edge_id))
+                continue
+            qname = f"ENDPOINT:{service_name}:{http_method}:{path}"
+            target_id = self._qname_cache.get(qname)
+            if target_id is None:
+                metadata["resolved_service"] = service_name
+                metadata["resolution"] = "no_matching_endpoint"
+                self.conn.execute("UPDATE edges SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), edge_id))
+                continue
+            metadata["confidence"] = "resolved"
+            metadata["resolved_service"] = service_name
+            self.conn.execute("UPDATE edges SET target_id = ?, metadata = ? WHERE id = ?",
+                               (target_id, json.dumps(metadata), edge_id))
+            resolved += 1
+        return resolved
+
+    def resolve_api_constant_edges(self, gateway_prefix_map):
+        """Resolve UI API_CONSTANT nodes (see angular_parser.py /
+        react_parser.py) to the backend ENDPOINT(s) they identify, creating
+        a CALLS_API edge per match. Path-only matching (the constant itself
+        carries no HTTP verb — see module docs), so a path shared by more
+        than one HTTP method within the resolved service produces one
+        CALLS_API edge per verb (precise, not ambiguous: each edge points at
+        a genuinely different real endpoint). `metadata.resolution` on the
+        API_CONSTANT node itself records *why* when nothing resolved, so an
+        unresolved constant stays distinguishable from one never attempted.
+        """
+        cur = self.conn.execute(
+            "SELECT id, service, metadata FROM nodes WHERE node_type = 'API_CONSTANT'"
+        )
+        constants = cur.fetchall()
+
+        endpoint_cache = {}
+
+        def _endpoints_for(service_name):
+            if service_name not in endpoint_cache:
+                rows = self.conn.execute(
+                    "SELECT id, metadata FROM nodes WHERE node_type = 'ENDPOINT' AND service = ?",
+                    (service_name,),
+                ).fetchall()
+                parsed = []
+                for eid, emeta_json in rows:
+                    emeta = json.loads(emeta_json) if emeta_json else {}
+                    path = emeta.get("path") or ""
+                    esegs = [s for s in path.strip("/").split("/") if s]
+                    parsed.append((eid, esegs, emeta.get("http_method")))
+                endpoint_cache[service_name] = parsed
+            return endpoint_cache[service_name]
+
+        resolved = ambiguous = unresolved = 0
+        for node_id, ui_service, metadata_json in constants:
+            metadata = json.loads(metadata_json) if metadata_json else {}
+            segments = metadata.get("segments") or []
+            if not segments:
+                unresolved += 1
+                continue
+            prefix = segments[0].lower()
+            service_name = gateway_prefix_map.get(prefix)
+            if not service_name:
+                metadata["resolution"] = "unknown_gateway_prefix"
+                self.conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), node_id))
+                unresolved += 1
+                continue
+            remaining = segments[1:]
+            structural_matches = [
+                (eid, esegs, http_method) for eid, esegs, http_method in _endpoints_for(service_name)
+                if path_segments_match(remaining, esegs)
+            ]
+            if structural_matches:
+                best = max(path_specificity(remaining, esegs) for _, esegs, _ in structural_matches)
+                matches = [(eid, http_method) for eid, esegs, http_method in structural_matches
+                           if path_specificity(remaining, esegs) == best]
+            else:
+                matches = []
+            if not matches:
+                metadata["resolution"] = "no_matching_endpoint"
+                metadata["resolved_service"] = service_name
+                self.conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
+                                   (json.dumps(metadata), node_id))
+                unresolved += 1
+                continue
+            metadata["resolution"] = "resolved"
+            metadata["resolved_service"] = service_name
+            self.conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
+                               (json.dumps(metadata), node_id))
+            if len(matches) > 1:
+                ambiguous += 1
+            for eid, http_method in matches:
+                self.add_edge(
+                    node_id, "CALLS_API", target_id=eid, service=service_name,
+                    metadata={"confidence": "resolved", "resolved_service": service_name,
+                              "http_method": http_method, "ambiguous": len(matches) > 1},
+                )
+            resolved += 1
+        return {"resolved": resolved, "ambiguous": ambiguous, "unresolved": unresolved}
 
     def summary(self):
         node_counts = dict(self.conn.execute(

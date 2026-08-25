@@ -74,6 +74,12 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
     ng_registry = NameRegistry()
     react_registry = NameRegistry()
     per_target_summaries = []
+    # {registered spring.application.name -> our service_name} — the API
+    # Gateway prefix map used to resolve UI API_CONSTANT paths and backend
+    # Feign/WebClient/RestTemplate calls to a real ENDPOINT (see
+    # java_parser._extract_gateway_prefix and db.py's resolve_* methods).
+    # Read from each service's own config, never hand-mapped here.
+    gateway_prefix_map = {}
 
     for service_name in backend_services:
         service_path = os.path.join(config.root_path, service_name)
@@ -84,6 +90,9 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, service_name))
         stats = java_parser.parse_service(db, java_registry, service_name, service_path, progress=_progress)
         flow_stats = spring_flow_parser.parse_service(db, java_registry, service_name, service_path)
+        gateway_prefix = stats.get("gateway_prefix")
+        if gateway_prefix:
+            gateway_prefix_map[gateway_prefix] = service_name
         if not shared:
             resolved = db.resolve_exact_import_edges("java")
             resolved += db.resolve_pending_edges(java_registry.as_dict(), project_type="java",
@@ -95,8 +104,11 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
             per_target_summaries.append((service_name, None, {**stats, **flow_stats}))
         err_suffix = f", {stats['errors']} errors" if stats["errors"] else ""
         flow_suffix = f", {flow_stats['flow_edges']} flow edges" if flow_stats.get("flow_edges") else ""
+        feign_suffix = f", {stats['feign_calls']} feign calls" if stats.get("feign_calls") else ""
+        gw_suffix = f", gateway_prefix={gateway_prefix!r}" if gateway_prefix else ""
         _print(f"    -> {stats['files']} files, {stats['classes']} classes, "
-               f"{stats['methods']} methods, {stats['endpoints']} endpoints{flow_suffix}{err_suffix}")
+               f"{stats['methods']} methods, {stats['endpoints']} endpoints{feign_suffix}"
+               f"{flow_suffix}{err_suffix}{gw_suffix}")
 
     if angular_subprojects:
         project_node_id = None
@@ -129,7 +141,8 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
             else:
                 per_target_summaries.append((subproject_name, None, stats))
             err_suffix = f", {stats['errors']} errors" if stats["errors"] else ""
-            _print(f"    -> {stats['files']} files, {stats['classes']} classes{err_suffix}")
+            api_const_suffix = f", {stats['API_CONSTANT']} API constants" if stats.get("API_CONSTANT") else ""
+            _print(f"    -> {stats['files']} files, {stats['classes']} classes{api_const_suffix}{err_suffix}")
 
     if react_enabled:
         react_path = config.react_project_path
@@ -157,6 +170,18 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         resolved_ng = shared_db.resolve_pending_edges(ng_registry.as_dict(), project_type="angular")
         resolved_react = shared_db.resolve_pending_edges(react_registry.as_dict(), project_type="react")
         _print(f"\nResolved cross-reference edges: java={resolved_java} angular={resolved_ng} react={resolved_react}")
+
+        _print(f"Gateway prefixes discovered: {gateway_prefix_map}")
+        resolved_calls = shared_db.resolve_service_call_edges(gateway_prefix_map)
+        api_result = shared_db.resolve_api_constant_edges(gateway_prefix_map)
+        _print(f"Resolved backend->backend calls (Feign/WebClient/RestTemplate): {resolved_calls}")
+        _print(f"Resolved UI API constants -> backend endpoints: {api_result['resolved']} "
+               f"({api_result['ambiguous']} ambiguous, {api_result['unresolved']} unresolved)")
+    elif backend_services and (angular_subprojects or react_enabled):
+        _print("\n[note] SINGLE_DATABASE=false — UI API constant -> backend endpoint and "
+               "backend->backend (Feign/WebClient/RestTemplate) resolution are skipped: "
+               "they require a shared graph to see nodes across service/subproject "
+               "boundaries. Set SINGLE_DATABASE=true to enable them.")
 
     return per_target_summaries
 

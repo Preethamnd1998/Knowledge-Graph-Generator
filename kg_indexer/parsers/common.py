@@ -6,6 +6,7 @@ dependencies and works anywhere Python 3.8+ runs. This trades perfect AST
 accuracy for zero install friction; see README.md "Known limitations".
 """
 import os
+import re
 
 IGNORED_DIR_NAMES = {
     ".git", ".idea", ".vscode", "node_modules", "target", "build", "bin",
@@ -141,3 +142,95 @@ class NameRegistry:
 
     def as_dict(self):
         return self._map
+
+
+# --- UI "API constant" support (Angular/React) -----------------------------
+#
+# Shared by angular_parser.py and react_parser.py so both languages detect
+# `export class FooApiConstant(s) { public static X = "path/segments"; }`
+# identically (see kg_indexer/db.py GraphDB.resolve_api_constant_edges for
+# how the extracted path is matched against a backend ENDPOINT node).
+
+_API_CONSTANT_SUFFIXES = ("apiconstant", "apiconstants")
+
+
+def is_api_constant_class_name(name):
+    lname = name.lower()
+    return lname.endswith(_API_CONSTANT_SUFFIXES)
+
+
+# Any top-level TS class (no decorator required — these are plain constant
+# holders, not @Component/@Injectable), captured generically so the caller
+# can filter by is_api_constant_class_name() before doing anything with it.
+PLAIN_CLASS_RE = re.compile(
+    r'(?:export\s+)?(?:abstract\s+)?class\s+(?P<name>\w+)'
+    r'(?:\s+extends\s+[\w.]+)?(?:\s+implements\s+[^{]+)?\s*\{'
+)
+
+# `public static FIELD = "value";` / `private static FIELD: string = 'value';`
+# — value must be a plain quoted string literal (no concatenation) to be
+# treated as a resolvable API identity; see AGENTS.md for why concatenated
+# definitions are intentionally out of scope (none exist in the real
+# workspace as of writing this).
+STATIC_STRING_FIELD_RE = re.compile(
+    r'(?:public\s+|private\s+|protected\s+)?static\s+(?:readonly\s+)?'
+    r'(?P<field>[A-Za-z_][A-Za-z0-9_]*)'
+    r'(?:\s*:\s*\w+)?\s*=\s*'
+    r'(?:"(?P<dq>[^"]*)"|\'(?P<sq>[^\']*)\')\s*;'
+)
+
+# `SomeApiConstant.SOME_FIELD` referenced anywhere in a .ts/.tsx file — this
+# is how a component/service *uses* an API constant, regardless of whether
+# its defining class lives in this file, another file, or another
+# sub-project/library (cross-file resolution happens the same way every
+# other target_name-only edge in this codebase resolves — see
+# GraphDB.resolve_pending_edges).
+API_CONSTANT_USAGE_RE = re.compile(
+    r'\b(?P<cls>[A-Za-z_]\w*(?:ApiConstants?|APIConstants?))\.(?P<field>[A-Z][A-Z0-9_]*)\b'
+)
+
+
+def normalize_ui_path(raw):
+    """Strip a query string and leading/trailing slashes from a UI-side API
+    constant's literal value, returning (normalized_path, segments). Never
+    guesses at a runtime-appended suffix (e.g. `+ "/" + id`) — only the
+    literal, statically-known portion is normalized."""
+    if raw is None:
+        return None, []
+    value = raw.split("?", 1)[0].strip().strip("/")
+    if not value:
+        return "", []
+    segments = [s for s in value.split("/") if s]
+    return "/".join(segments), segments
+
+
+def path_segments_match(a_segments, b_segments):
+    """True if two '/'-split paths match, treating a `{...}` segment on
+    EITHER side as a wildcard (path-variable) that matches anything at that
+    position — used to compare a UI API constant's path against a Java
+    @*Mapping path, or a Feign/WebClient/RestTemplate call's path against
+    the controller endpoint it's meant to reach. Segment *counts* must match
+    exactly — no guessing at a variable-length wildcard."""
+    if len(a_segments) != len(b_segments):
+        return False
+    for a, b in zip(a_segments, b_segments):
+        if a == b:
+            continue
+        a_is_var = a.startswith("{") and a.endswith("}")
+        b_is_var = b.startswith("{") and b.endswith("}")
+        if not (a_is_var or b_is_var):
+            return False
+    return True
+
+
+def path_specificity(a_segments, b_segments):
+    """Count of segments that matched as an exact literal (neither side a
+    `{...}` wildcard) between two already-matching paths (see
+    path_segments_match). Used to prefer a more specific route when a UI
+    path structurally matches more than one endpoint — e.g. "core/patient/
+    list" structurally matches both a literal "/patient/list" mapping and a
+    "/patient/{id}" mapping (the wildcard side matches any literal). Spring's
+    own routing always prefers the all-literal match; ties are broken the
+    same way here rather than reporting a false ambiguity between a real
+    match and a coincidental wildcard one."""
+    return sum(1 for a, b in zip(a_segments, b_segments) if a == b)

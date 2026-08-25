@@ -22,7 +22,21 @@ class/method that calls publishToKafka(...) or carries @KafkaListener;
 the edge (PUBLISHES/CONSUMES) captures the role, not a synthetic node.
 
 New edge relations: DEFINES_BEAN, HAS_STEP, USES_TASKLET, RUNS,
-ASYNC_CALL, PUBLISHES, CONSUMES, WRITES, READS.
+ASYNC_CALL, PUBLISHES, CONSUMES, WRITES, READS, WEBCLIENT_CALL,
+RESTTEMPLATE_CALL.
+
+WEBCLIENT_CALL / RESTTEMPLATE_CALL (backend -> backend, imperative call
+sites — the counterpart of java_parser.py's declarative FEIGN_CALL):
+recognized only where the target is statically known from source —
+WebClient via a `.baseUrl("literal")` builder call found anywhere in the
+same class (best-effort: a class with more than one WebClient field with
+different base URLs isn't disambiguated, hence "inferred" not "verified"),
+RestTemplate only where the call's first argument is itself a literal
+`"http://host/path"` string (a `@Value`-injected base URL, common in this
+codebase for genuinely external hosts like a license server, is
+deliberately left unresolved rather than guessed at). Both resolve against
+the same gateway-prefix map as FEIGN_CALL, via
+GraphDB.resolve_service_call_edges().
 
 Confidence model (kept in metadata["confidence"] on every edge this
 module creates, on top of — not instead of — the base graph's existing
@@ -74,6 +88,26 @@ SQL_TABLE_PATTERNS = (
 )
 
 _TOPIC_TOKEN_RE = re.compile(r'"([^"]+)"|([A-Za-z_][\w.]*)')
+
+WEBCLIENT_BASEURL_RE = re.compile(r'\.baseUrl\(\s*"([^"]+)"\s*\)')
+WEBCLIENT_CALL_RE = re.compile(
+    r'\bwebClient\w*\s*\.\s*(get|post|put|patch|delete)\s*\(\s*\)'
+    r'(?P<between>.{0,400}?)'
+    r'\.path\(\s*"([^"]+)"',
+    re.DOTALL,
+)
+_HOST_STRIP_RE = re.compile(r'^https?://')
+
+RESTTEMPLATE_METHOD_TO_HTTP = {
+    "getForEntity": "GET", "getForObject": "GET",
+    "postForEntity": "POST", "postForObject": "POST",
+    "put": "PUT", "delete": "DELETE", "patchForObject": "PATCH",
+}
+RESTTEMPLATE_CALL_RE = re.compile(
+    r'\brestTemplate\w*\s*\.\s*(getForEntity|postForEntity|getForObject|postForObject|'
+    r'exchange|put|delete|patchForObject)\s*\(\s*"(https?://[^"/]+)(/[^"]*)?"'
+)
+RESTTEMPLATE_EXCHANGE_METHOD_RE = re.compile(r'HttpMethod\.(\w+)')
 
 
 def _meta(confidence, **extra):
@@ -203,6 +237,16 @@ def _parse_class_flows(db, registry, service_name, rel_file, full_text, cm, stat
     field_qualifiers = _qualifier_field_map(class_body_text)
     methods = _collect_methods(full_text, class_body_start, class_body_text, class_qname)
 
+    # Best-effort: the WebClient base URL, if this class builds one via
+    # `builder.baseUrl("...")` — attributed to the whole class rather than a
+    # specific field, so a class with >1 differently-based WebClient isn't
+    # disambiguated (rare; see module docstring).
+    webclient_base_url_match = WEBCLIENT_BASEURL_RE.search(class_body_text)
+    webclient_prefix = (
+        _HOST_STRIP_RE.sub("", webclient_base_url_match.group(1)).split(":", 1)[0].strip("/")
+        if webclient_base_url_match else None
+    )
+
     # Pass A: create every bean-shaped node first, so Pass B can resolve
     # forward references within the same class (a Job bean commonly
     # references a Step bean defined *later* in the same config class).
@@ -252,7 +296,7 @@ def _parse_class_flows(db, registry, service_name, rel_file, full_text, cm, stat
 
         method_node_id = db.resolve(m.qname)
         _scan_method_body(db, registry, service_name, rel_file, m, method_node_id,
-                           class_node_id, field_qualifiers, stats)
+                           class_node_id, field_qualifiers, webclient_prefix, stats)
 
 
 def _link_bean_ref(db, source_id, relation, ref_name, bean_nodes, service_name, stats):
@@ -267,7 +311,7 @@ def _link_bean_ref(db, source_id, relation, ref_name, bean_nodes, service_name, 
 
 
 def _scan_method_body(db, registry, service_name, rel_file, m, method_node_id,
-                       class_node_id, field_qualifiers, stats):
+                       class_node_id, field_qualifiers, webclient_prefix, stats):
     source_id = method_node_id if method_node_id is not None else class_node_id
     if source_id is None:
         return
@@ -327,6 +371,36 @@ def _scan_method_body(db, registry, service_name, rel_file, m, method_node_id,
                         metadata=_meta("inferred", operation=op))
             stats["DB_TABLE"] = stats.get("DB_TABLE", 0) + 1
             stats["flow_edges"] = stats.get("flow_edges", 0) + 1
+
+    if webclient_prefix:
+        for wm in WEBCLIENT_CALL_RE.finditer(m.body_text):
+            http_method = wm.group(1).upper()
+            path = "/" + wm.group(3).lstrip("/")
+            db.add_edge(
+                source_id, "WEBCLIENT_CALL", target_name=f"webclient:{webclient_prefix}:{http_method}:{path}",
+                service=service_name,
+                metadata=_meta("unknown", target_prefix=webclient_prefix, http_method=http_method, path=path),
+            )
+            stats["flow_edges"] = stats.get("flow_edges", 0) + 1
+            stats["WEBCLIENT_CALL"] = stats.get("WEBCLIENT_CALL", 0) + 1
+
+    for rm in RESTTEMPLATE_CALL_RE.finditer(m.body_text):
+        call_method = rm.group(1)
+        host = rm.group(2)
+        path = "/" + (rm.group(3) or "").lstrip("/")
+        http_method = RESTTEMPLATE_METHOD_TO_HTTP.get(call_method)
+        if http_method is None and call_method == "exchange":
+            hm = RESTTEMPLATE_EXCHANGE_METHOD_RE.search(m.body_text[rm.end():rm.end() + 200])
+            http_method = hm.group(1) if hm else None
+        target_prefix = host.split(":", 1)[0].strip("/")
+        db.add_edge(
+            source_id, "RESTTEMPLATE_CALL",
+            target_name=f"resttemplate:{target_prefix}:{http_method or '?'}:{path}",
+            service=service_name,
+            metadata=_meta("unknown", target_prefix=target_prefix, http_method=http_method, path=path),
+        )
+        stats["flow_edges"] = stats.get("flow_edges", 0) + 1
+        stats["RESTTEMPLATE_CALL"] = stats.get("RESTTEMPLATE_CALL", 0) + 1
 
 
 def parse_service(db, registry, service_name, service_path, progress=None):

@@ -10,8 +10,8 @@ always marked ``inferred``, never presented as verified.
 """
 import re
 
-from ..db import fetch_all, row_to_dict
-from ..models.evidence import prune_empty
+from ..db import fetch_all, fetch_one, row_to_dict
+from ..models.evidence import dedupe_by_key, prune_empty
 from .common import (
     class_dependency_chain, find_exposing_method, get_parent_class,
     inferred_table_name, parse_metadata,
@@ -78,6 +78,72 @@ def find_apis(conn, query=None, path=None, method=None, service=None, limit=10):
     return rows[:limit]
 
 
+def find_ui_callers(conn, endpoint_id, limit=10):
+    """UI API_CONSTANT nodes whose CALLS_API edge resolves to this ENDPOINT,
+    each with the UI file(s) that reference it (USES_API_CONSTANT) — answers
+    "which UI screens/services call this backend endpoint?". Bounded (Rules
+    5/6): at most `limit` constants, at most 5 deduped files each."""
+    constants = fetch_all(
+        conn,
+        "SELECT s.id, s.name, s.service FROM edges e JOIN nodes s ON s.id = e.source_id "
+        "WHERE e.target_id = ? AND e.relation = 'CALLS_API' LIMIT ?",
+        (endpoint_id, limit),
+    )
+    callers = []
+    for c in constants:
+        c = row_to_dict(c)
+        files = fetch_all(
+            conn,
+            "SELECT DISTINCT n.service, n.file_path FROM edges e JOIN nodes n ON n.id = e.source_id "
+            "WHERE e.target_id = ? AND e.relation = 'USES_API_CONSTANT' LIMIT 5",
+            (c["id"],),
+        )
+        callers.append({
+            "constant": c["name"],
+            "ui_project": c["service"],
+            "referenced_from": dedupe_by_key(
+                [row_to_dict(f) for f in files], lambda f: (f["service"], f["file_path"])
+            ),
+        })
+    return callers
+
+
+def find_backend_for_ui_constant(conn, query, limit=5):
+    """UI API_CONSTANT(s) matching `query` (a `ClassName.FIELD`, a bare
+    field/class name, or the literal path) and the backend ENDPOINT(s) each
+    one's CALLS_API edge resolves to — answers "which backend endpoint does
+    this UI API constant call?". An unresolved constant is still returned,
+    with `resolution` explaining why (see kg_indexer/db.py
+    resolve_api_constant_edges) — never silently omitted."""
+    rows = fetch_all(
+        conn,
+        "SELECT * FROM nodes WHERE node_type = 'API_CONSTANT' AND (qualified_name LIKE ? "
+        "OR name = ? OR name LIKE ? OR json_extract(metadata, '$.normalized_path') = ?) LIMIT ?",
+        (f"%{query}", query, f"%{query}%", query.strip("/"), limit),
+    )
+    results = []
+    for row in rows:
+        row = row_to_dict(row)
+        meta = parse_metadata(row)
+        endpoints = fetch_all(
+            conn,
+            "SELECT t.service, t.name, json_extract(e.metadata, '$.http_method') AS http_method, "
+            "json_extract(t.metadata, '$.path') AS path FROM edges e JOIN nodes t ON t.id = e.target_id "
+            "WHERE e.source_id = ? AND e.relation = 'CALLS_API'",
+            (row["id"],),
+        )
+        results.append(prune_empty({
+            "constant": row["name"],
+            "ui_project": row["service"],
+            "file": row["file_path"],
+            "raw_value": meta.get("raw_value"),
+            "resolution": meta.get("resolution"),
+            "resolved_service": meta.get("resolved_service"),
+            "endpoints": [row_to_dict(e) for e in endpoints],
+        }))
+    return results
+
+
 def get_api_context(conn, endpoint_row):
     """endpoint_row: a dict row from the `nodes` table (node_type='ENDPOINT')."""
     endpoint_meta = parse_metadata(endpoint_row)
@@ -112,4 +178,5 @@ def get_api_context(conn, endpoint_row):
         "repositories": repo_names,
         "tables": tables,
         "downstream_services": sorted(downstream_services),
+        "ui_callers": find_ui_callers(conn, endpoint_row["id"]),
     })

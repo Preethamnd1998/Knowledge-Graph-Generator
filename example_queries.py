@@ -21,6 +21,11 @@ Also runnable directly as a CLI:
     python example_queries.py topic POST_FINANCE_PRICE_BOOK
     python example_queries.py async
     python example_queries.py flow createPriceBookFromTempJob
+    python example_queries.py api-constants BILLING_CONFIRM_PAYMENT
+    python example_queries.py ui-to-api "ipd/opd/confirm/payment"
+    python example_queries.py api-callers core-service GET /patient/list
+    python example_queries.py service-calls --service core-service
+    python example_queries.py full-flow ipd-service POST /opd/confirm/payment
 """
 import argparse
 import json
@@ -301,6 +306,139 @@ def get_database_impact(conn, table_name):
     }
 
 
+# --- UI <-> Backend API mapping (kg_indexer/db.py resolve_api_constant_edges
+# / resolve_service_call_edges) ---
+#
+# API_CONSTANT (Angular/React `FooApiConstant.FIELD = "path"`) --CALLS_API-->
+# ENDPOINT (Java @*Mapping) is the UI->backend edge; FILE --USES_API_CONSTANT-->
+# API_CONSTANT is "who in the UI references this constant"; FEIGN_CALL /
+# WEBCLIENT_CALL / RESTTEMPLATE_CALL (METHOD -> ENDPOINT) are backend->backend.
+# All four resolve only within SINGLE_DATABASE=true (see AGENTS.md).
+
+SERVICE_CALL_RELATIONS = ("FEIGN_CALL", "WEBCLIENT_CALL", "RESTTEMPLATE_CALL")
+
+
+def find_api_constants(conn, keyword=None, service=None):
+    """UI API_CONSTANT nodes (class.FIELD = "path"), optionally filtered by
+    a keyword against the field/class name or the literal path, and/or the
+    Angular sub-project/React app that declares them."""
+    sql = "SELECT id, name, service, file_path, start_line, metadata FROM nodes WHERE node_type = 'API_CONSTANT'"
+    params = []
+    if keyword:
+        sql += " AND (name LIKE ? OR json_extract(metadata, '$.raw_value') LIKE ?)"
+        params.extend([f"%{keyword}%", f"%{keyword}%"])
+    if service:
+        sql += " AND service = ?"
+        params.append(service)
+    sql += " ORDER BY service, name"
+    return _rows_to_dicts(conn.execute(sql, params))
+
+
+def find_backend_for_ui_constant(conn, name_or_path):
+    """Answers "which backend endpoint does this UI API constant call?".
+    `name_or_path` may be a `ClassName.FIELD` qualified/simple name, or the
+    raw path string itself (e.g. "ipd/opd/confirm/payment"). Returns every
+    matching API_CONSTANT (there can be more than one — the same class/field
+    pair is sometimes duplicated across Angular libraries, see AGENTS.md)
+    with its resolution status and the ENDPOINT(s) it CALLS_API to, if any.
+    """
+    rows = conn.execute(
+        "SELECT id, qualified_name, name, service, file_path, metadata FROM nodes "
+        "WHERE node_type = 'API_CONSTANT' AND (qualified_name LIKE ? OR name = ? OR "
+        "json_extract(metadata, '$.normalized_path') = ?)",
+        (f"%{name_or_path}", name_or_path, name_or_path.strip("/")),
+    ).fetchall()
+    results = []
+    for row in rows:
+        node = dict(row)
+        edges = conn.execute(
+            "SELECT e.metadata AS edge_metadata, n.service, n.name, n.qualified_name, n.metadata AS endpoint_metadata "
+            "FROM edges e JOIN nodes n ON n.id = e.target_id "
+            "WHERE e.source_id = ? AND e.relation = 'CALLS_API'",
+            (node["id"],),
+        ).fetchall()
+        results.append({"constant": node, "endpoints": _rows_to_dicts(edges)})
+    return results
+
+
+def find_ui_callers_of_endpoint(conn, service, http_method, path):
+    """Answers "which UI screens/services call this backend endpoint?".
+    `service`/`http_method`/`path` identify the ENDPOINT exactly as stored
+    (see list_endpoints) — path normalized the same way java_parser.py
+    stores it (leading '/', no trailing slash unless the mapping itself
+    has one). Returns each calling API_CONSTANT plus the UI file(s) that
+    reference it via USES_API_CONSTANT."""
+    endpoint = conn.execute(
+        "SELECT id FROM nodes WHERE node_type = 'ENDPOINT' AND service = ? AND "
+        "json_extract(metadata, '$.http_method') = ? AND json_extract(metadata, '$.path') = ?",
+        (service, http_method.upper(), path),
+    ).fetchone()
+    if not endpoint:
+        return {"endpoint": None, "callers": []}
+    constants = conn.execute(
+        "SELECT s.id, s.name, s.service, s.qualified_name FROM edges e "
+        "JOIN nodes s ON s.id = e.source_id WHERE e.target_id = ? AND e.relation = 'CALLS_API'",
+        (endpoint["id"],),
+    ).fetchall()
+    callers = []
+    for c in constants:
+        files = conn.execute(
+            "SELECT n.service, n.file_path FROM edges e JOIN nodes n ON n.id = e.source_id "
+            "WHERE e.target_id = ? AND e.relation = 'USES_API_CONSTANT'",
+            (c["id"],),
+        ).fetchall()
+        callers.append({"constant": dict(c), "referenced_from": _rows_to_dicts(files)})
+    return {"endpoint": {"service": service, "http_method": http_method, "path": path}, "callers": callers}
+
+
+def find_service_calls(conn, service=None, relations=SERVICE_CALL_RELATIONS):
+    """Backend->backend calls (Feign/WebClient/RestTemplate), optionally
+    filtered to those originating in one service. Each row carries its own
+    confidence/resolution — see spring_flow_parser.py / java_parser.py
+    module docs for what 'inferred' vs 'unknown' means here."""
+    placeholders = ",".join("?" for _ in relations)
+    sql = (
+        f"SELECT s.service AS from_service, s.name AS from_method, e.relation, "
+        f"e.metadata, t.service AS to_service, t.name AS to_endpoint FROM edges e "
+        f"JOIN nodes s ON s.id = e.source_id LEFT JOIN nodes t ON t.id = e.target_id "
+        f"WHERE e.relation IN ({placeholders})"
+    )
+    params = list(relations)
+    if service:
+        sql += " AND s.service = ?"
+        params.append(service)
+    sql += " ORDER BY from_service, from_method"
+    return _rows_to_dicts(conn.execute(sql, params))
+
+
+def get_full_flow(conn, service, http_method, path):
+    """UI -> gateway -> backend -> Kafka/HTTP -> backend, assembled around
+    one ENDPOINT: its UI callers (find_ui_callers_of_endpoint), the handler
+    method's outgoing backend->backend calls, and Kafka publish/consume —
+    everything this graph can resolve about one entry point in one call."""
+    result = find_ui_callers_of_endpoint(conn, service, http_method, path)
+    endpoint_row = conn.execute(
+        "SELECT id FROM nodes WHERE node_type = 'ENDPOINT' AND service = ? AND "
+        "json_extract(metadata, '$.http_method') = ? AND json_extract(metadata, '$.path') = ?",
+        (service, http_method.upper(), path),
+    ).fetchone()
+    if not endpoint_row:
+        return {"endpoint": None}
+    method_row = conn.execute(
+        "SELECT s.id, s.name FROM edges e JOIN nodes s ON s.id = e.source_id "
+        "WHERE e.target_id = ? AND e.relation = 'EXPOSES'", (endpoint_row["id"],),
+    ).fetchone()
+    downstream = []
+    if method_row:
+        downstream = _outgoing(conn, method_row["id"], SERVICE_CALL_RELATIONS + ("PUBLISHES", "CONSUMES"))
+    return {
+        "ui_callers": result["callers"],
+        "endpoint": {"service": service, "http_method": http_method, "path": path},
+        "handler": dict(method_row) if method_row else None,
+        "downstream": downstream,
+    }
+
+
 def get_runtime_flow(conn, name):
     """General entry point for Phase 12: given a job/topic/class/method
     name, resolve it to whatever node type it actually is and return
@@ -375,6 +513,26 @@ def main():
     p_flow = sub.add_parser("flow")
     p_flow.add_argument("name")
 
+    p_api_constants = sub.add_parser("api-constants")
+    p_api_constants.add_argument("keyword", nargs="?")
+    p_api_constants.add_argument("--service")
+
+    p_ui_to_api = sub.add_parser("ui-to-api")
+    p_ui_to_api.add_argument("name_or_path")
+
+    p_api_callers = sub.add_parser("api-callers")
+    p_api_callers.add_argument("service")
+    p_api_callers.add_argument("http_method")
+    p_api_callers.add_argument("path")
+
+    p_service_calls = sub.add_parser("service-calls")
+    p_service_calls.add_argument("--service")
+
+    p_full_flow = sub.add_parser("full-flow")
+    p_full_flow.add_argument("service")
+    p_full_flow.add_argument("http_method")
+    p_full_flow.add_argument("path")
+
     args = parser.parse_args()
 
     try:
@@ -413,6 +571,16 @@ def main():
         _print_json(get_database_impact(conn, args.name))
     elif args.command == "flow":
         _print_json(get_runtime_flow(conn, args.name))
+    elif args.command == "api-constants":
+        _print_json(find_api_constants(conn, keyword=args.keyword, service=args.service))
+    elif args.command == "ui-to-api":
+        _print_json(find_backend_for_ui_constant(conn, args.name_or_path))
+    elif args.command == "api-callers":
+        _print_json(find_ui_callers_of_endpoint(conn, args.service, args.http_method, args.path))
+    elif args.command == "service-calls":
+        _print_json(find_service_calls(conn, service=args.service))
+    elif args.command == "full-flow":
+        _print_json(get_full_flow(conn, args.service, args.http_method, args.path))
 
 
 if __name__ == "__main__":

@@ -9,11 +9,13 @@ from ..queries import flow_queries
 @tool_boundary("get_business_flow")
 def get_business_flow(service: str, flow: str) -> dict:
     """Compact end-to-end execution flow for a business operation (e.g.
-    flow="cancellation"): the controller -> service -> repository chain,
-    involved services, classes, inferred database tables, naming-
-    convention-detected events, and downstream/external calls. Derived
-    from real DEPENDS_ON edges — there's no dedicated 'flow' node type,
-    this is assembled on demand from the closest matching entry point."""
+    flow="cancellation"): UI callers of the entry API (if any), the
+    controller -> service -> repository chain, involved services, classes,
+    inferred database tables, naming-convention-detected events, and
+    downstream calls (Feign/WebClient/RestTemplate to another backend
+    service, Kafka publish/consume). Derived from real edges — there's no
+    dedicated 'flow' node type, this is assembled on demand from the
+    closest matching entry point."""
     service = require_non_empty(service, "service")
     flow = require_non_empty(flow, "flow")
     with db.connect() as conn:

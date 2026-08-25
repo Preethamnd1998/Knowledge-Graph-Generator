@@ -1,7 +1,7 @@
-"""find_api, get_api_context."""
+"""find_api, get_api_context, resolve_ui_api."""
 from .. import db
 from ..errors import InvalidInputError, NotFoundError
-from ..limits import clamp_limit
+from ..limits import clamp_limit, require_non_empty
 from ..logging_setup import tool_boundary
 from ..queries import api_queries
 from ..queries.common import parse_metadata
@@ -54,6 +54,25 @@ def get_api_context(query: str, service: str = None) -> dict:
     return context
 
 
+@tool_boundary("resolve_ui_api")
+def resolve_ui_api(query: str, limit: int = None) -> dict:
+    """Resolve a UI API constant (e.g. 'BillingApiConstant.BILLING_CONFIRM_PAYMENT',
+    a bare field name, or the literal path like 'ipd/opd/confirm/payment') to
+    the backend REST endpoint(s) it calls. Matches are returned even when
+    unresolved — check `resolution` for why (e.g. the path's gateway prefix
+    doesn't match any indexed backend service, or no endpoint at that path
+    was found) rather than assuming a missing endpoints list means no match."""
+    query = require_non_empty(query, "query")
+    config = db.get_config()
+    limit = clamp_limit(limit, config, default=5)
+    with db.connect() as conn:
+        results = api_queries.find_backend_for_ui_constant(conn, query, limit=limit)
+    if not results:
+        raise NotFoundError(f"No UI API constant matching '{query}' found in the knowledge graph.")
+    return {"results": results}
+
+
 def register(server):
     server.tool()(find_api)
     server.tool()(get_api_context)
+    server.tool()(resolve_ui_api)
