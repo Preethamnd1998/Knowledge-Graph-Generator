@@ -1,0 +1,21 @@
+# cppcheck suppressions file
+# Only universally-supported suppression IDs here.
+# Version-specific IDs go in scripts/lint.sh as --suppress flags.
+
+# Vendored code
+*:internal/cbm/vendored/*
+*:vendored/*
+
+# Test framework patterns
+unusedFunction:tests/*
+
+# Intentional patterns
+constVariablePointer
+constParameterPointer
+constVariable
+
+# Hash-table iteration callbacks must match cbm_ht_iter_fn exactly
+# (void (*)(const char *, void *, void *)). Constifying `value` or
+# `userdata` changes the function type, so every cbm_ht_foreach call
+# site would need a cast — see src/foundation/hash_table.h.
+constParameterCallback

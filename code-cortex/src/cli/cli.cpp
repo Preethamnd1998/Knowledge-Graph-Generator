@@ -1,0 +1,5311 @@
+/*
+ * cli.c — CLI subcommand handlers for install, uninstall, update, version.
+ *
+ * Port of Go cmd/code-cortex-mcp/ install/update logic.
+ * All functions accept explicit paths for testability.
+ */
+#include "cli/cli.h"
+#include "foundation/compat.h"
+#include "foundation/subprocess.h" /* cbm_subprocess_run (cbm_warm_binary) */
+#include "foundation/platform.h"
+#include "foundation/constants.h"
+#include "foundation/sha256.h"
+#include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
+
+/* CLI buffer size constants. */
+enum {
+    CLI_BUF_1K = 1024,
+    CLI_BUF_512 = 512,
+    CLI_BUF_256 = 256,
+    CLI_BUF_128 = 128,
+    CLI_BUF_4K = 4096,
+    CLI_BUF_16 = 16,
+    CLI_BUF_8 = 8,
+    CLI_BUF_24 = 24,
+    CLI_SKIP_ONE = 1,
+    CLI_PAIR_LEN = 2,
+    CLI_OCTAL_PERM = 0755,
+    CLI_JSON_INDENT = 3,
+    CLI_MAX_SCAN = 10,
+    CLI_ERR = -1,
+    CLI_OK = 0,
+    CLI_TRUE = 1,
+    CLI_ELEM_SIZE = 1,    /* fread/fwrite element size */
+    CLI_IDX_1 = 1,        /* array index 1 */
+    CLI_IDX_2 = 2,        /* array index 2 */
+    CLI_STRTOL_BASE = 10, /* decimal base for strtol */
+    CLI_STRTOL_HEX = 16,  /* hex base for strtol */
+    CLI_BUF_2K = 2048,
+    CLI_BUF_8K = 8192,
+    CLI_BUF_32 = 32,
+    CLI_INDENT_24 = 24,
+    CLI_FIELD_1040 = 1040,
+    CLI_MB_10 = 10,
+    BYTE_SHIFT = 8,    /* bits per byte for multi-byte reads */
+    SQL_NUL_TERM = -1, /* sqlite3 length = -1 means NUL-terminated */
+    SQL_PARAM_1 = 1,   /* sqlite3_bind parameter index 1 */
+    SQL_PARAM_2 = 2,
+    SEMVER_PARTS = 3, /* major.minor.patch */
+    DB_EXT_LEN = 3,   /* strlen(".db") */
+    MIN_ARGC_CMD = 3,
+    /* minimum argc for subcommand with arg */ /* sqlite3_bind parameter index 2 */ /* 10 MB cap
+                                                                                       factor */
+    CLI_MB_FACTOR = CLI_BUF_1K * CLI_BUF_1K,
+    NUM_RETRIES = 5,
+    NUM_DIRS = 4,
+    DECOMP_FACTOR = 10,
+    GROWTH_FACTOR = 2,
+    MIN_ARGC_GET = 2,
+    AUTO_YES = 1,
+    AUTO_NO = -1,
+    OCTAL_BASE = 8,
+};
+
+/* String length helper for strncmp. */
+#define SLEN(s) (sizeof(s) - SKIP_ONE)
+
+// the correct standard headers are included below but clang-tidy doesn't map them.
+#include <ctype.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <unistd.h>
+#endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+#include "foundation/compat_fs.h"
+
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
+#include <errno.h>  // EEXIST
+#include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
+#include <limits.h> // UINT_MAX
+#include <stdint.h> // uintptr_t
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>   // strtok_r
+#include <sys/stat.h> // mode_t, S_IXUSR
+#include <zlib.h>     // MAX_WBITS
+
+/* yyjson for JSON read-modify-write */
+#include "yyjson/yyjson.h"
+
+/* SQLITE_TRANSIENT equivalent as a typed function pointer (avoids int-to-ptr cast).
+ * sqlite3.h defines SQLITE_TRANSIENT as ((sqlite3_destructor_type)-1).
+ * We replicate the same bit pattern via memcpy to satisfy performance-no-int-to-ptr. */
+static void (*cbm_sqlite_transient_fn(void))(void *) {
+    uintptr_t bits = (uintptr_t)CLI_ERR;
+    void (*fp)(void *) = NULL;
+    memcpy(&fp, &bits, sizeof(fp));
+    return fp;
+}
+#define cbm_sqlite_transient (cbm_sqlite_transient_fn())
+
+/* ── Constants ────────────────────────────────────────────────── */
+
+/* Directory permissions: rwxr-x--- */
+#define DIR_PERMS 0750
+
+/* Decompression buffer cap (500 MB) */
+#define DECOMPRESS_MAX_BYTES ((size_t)500 * CLI_BUF_1K * CBM_SZ_1K)
+
+/* Tar header field offsets */
+#define TAR_NAME_LEN 101    /* filename field: bytes 0-99 + NUL */
+#define TAR_SIZE_OFFSET 124 /* octal size field offset */
+#define TAR_SIZE_LEN 13     /* octal size field: bytes 124-135 + NUL */
+#define TAR_TYPE_OFFSET 156 /* type flag byte */
+#define TAR_BINARY_NAME "code-cortex-mcp"
+#define TAR_BINARY_NAME_LEN (sizeof(TAR_BINARY_NAME) - 1)
+#define TAR_BLOCK_SIZE CBM_SZ_512 /* tar record alignment */
+#define TAR_BLOCK_MASK 511        /* TAR_BLOCK_SIZE - 1 */
+
+/* ── Version ──────────────────────────────────────────────────── */
+
+static const char *cli_version = "dev";
+
+void cbm_cli_set_version(const char *ver) {
+    if (ver) {
+        cli_version = ver;
+    }
+}
+
+const char *cbm_cli_get_version(void) {
+    return cli_version;
+}
+
+/* ── Version comparison ───────────────────────────────────────── */
+
+/* Parse semver major.minor.patch into array. Returns number of parts parsed. */
+static int parse_semver(const char *v, int out[SEMVER_PARTS]) {
+    out[0] = out[CLI_IDX_1] = out[CLI_IDX_2] = 0;
+    /* Skip v prefix */
+    if (*v == 'v' || *v == 'V') {
+        v++;
+    }
+
+    int count = 0;
+    while (*v && count < SEMVER_PARTS) {
+        if (*v == '-') {
+            break; /* stop at pre-release suffix */
+        }
+        char *endptr;
+        long val = strtol(v, &endptr, CLI_STRTOL_BASE);
+        out[count++] = (int)val;
+        if (*endptr == '.') {
+            v = endptr + CLI_SKIP_ONE;
+        } else {
+            break;
+        }
+    }
+    return count;
+}
+
+static bool has_prerelease(const char *v) {
+    if (*v == 'v' || *v == 'V') {
+        v++;
+    }
+    return strchr(v, '-') != NULL;
+}
+
+int cbm_compare_versions(const char *a, const char *b) {
+    int pa[SEMVER_PARTS];
+    int pb[SEMVER_PARTS];
+    parse_semver(a, pa);
+    parse_semver(b, pb);
+
+    for (int i = 0; i < SEMVER_PARTS; i++) {
+        if (pa[i] != pb[i]) {
+            return pa[i] - pb[i];
+        }
+    }
+
+    /* Same base version — non-dev beats dev */
+    bool a_pre = has_prerelease(a);
+    bool b_pre = has_prerelease(b);
+    if (a_pre && !b_pre) {
+        return CLI_ERR;
+    }
+    if (!a_pre && b_pre) {
+        return CLI_TRUE;
+    }
+    return 0;
+}
+
+/* ── Shell RC detection ───────────────────────────────────────── */
+
+const char *cbm_detect_shell_rc(const char *home_dir) {
+    static char buf[CLI_BUF_512];
+    if (!home_dir || !home_dir[0]) {
+        return "";
+    }
+
+    char shell_buf[CLI_BUF_256];
+    const char *shell = cbm_safe_getenv("SHELL", shell_buf, sizeof(shell_buf), "");
+    if (!shell) {
+        shell = "";
+    }
+
+    if (strstr(shell, "/zsh")) {
+        snprintf(buf, sizeof(buf), "%s/.zshrc", home_dir);
+        return buf;
+    }
+    if (strstr(shell, "/bash")) {
+        /* Prefer .bashrc, fall back to .bash_profile */
+        snprintf(buf, sizeof(buf), "%s/.bashrc", home_dir);
+        struct stat st;
+        if (stat(buf, &st) == 0) {
+            return buf;
+        }
+        snprintf(buf, sizeof(buf), "%s/.bash_profile", home_dir);
+        return buf;
+    }
+    if (strstr(shell, "/fish")) {
+        snprintf(buf, sizeof(buf), "%s/.config/fish/config.fish", home_dir);
+        return buf;
+    }
+
+    /* Default to .profile */
+    snprintf(buf, sizeof(buf), "%s/.profile", home_dir);
+    return buf;
+}
+
+/* ── CLI binary detection ─────────────────────────────────────── */
+
+/* PATH delimiter: `;` on Windows, `:` on POSIX. */
+#ifdef _WIN32
+#define PATH_DELIM ";"
+#else
+#define PATH_DELIM ":"
+#endif
+
+/* Check if a path exists and is executable.
+ * On Windows, stat() doesn't set S_IXUSR — just check existence. */
+static bool is_executable(const char *path) {
+    struct stat st;
+#ifdef _WIN32
+    return stat(path, &st) == 0;
+#else
+    return stat(path, &st) == 0 && (st.st_mode & S_IXUSR);
+#endif
+}
+
+/* Search for an executable named `name` in the PATH environment variable.
+ * Returns the full path in `out` (max out_sz) if found, else empty string. */
+static bool find_in_path(const char *name, char *out, size_t out_sz) {
+    char path_copy[CLI_BUF_4K];
+    if (!cbm_safe_getenv("PATH", path_copy, sizeof(path_copy), NULL)) {
+        return false;
+    }
+    char *saveptr;
+    char *dir = strtok_r(path_copy, PATH_DELIM, &saveptr);
+    while (dir) {
+        snprintf(out, out_sz, "%s/%s", dir, name);
+        if (is_executable(out)) {
+            return true;
+        }
+#ifdef _WIN32
+        /* On Windows executables carry an extension (PATHEXT). A CLI like
+         * opencode is often installed as a .cmd / .ps1 / .exe shim (e.g. via
+         * mise or npm), so the bare-name probe above misses it (#221). Try the
+         * common executable extensions before moving to the next PATH entry. */
+        static const char *const win_exts[] = {".exe", ".cmd", ".bat", ".ps1", NULL};
+        for (int i = 0; win_exts[i]; i++) {
+            snprintf(out, out_sz, "%s/%s%s", dir, name, win_exts[i]);
+            if (is_executable(out)) {
+                return true;
+            }
+        }
+#endif
+        dir = strtok_r(NULL, PATH_DELIM, &saveptr);
+    }
+    return false;
+}
+
+const char *cbm_find_cli(const char *name, const char *home_dir) {
+    static char buf[CLI_BUF_512];
+    if (!name || !name[0]) {
+        return "";
+    }
+    if (find_in_path(name, buf, sizeof(buf))) {
+        return buf;
+    }
+    if (!home_dir || !home_dir[0]) {
+        return "";
+    }
+    enum { NUM_PATHS = 5 };
+    char paths[NUM_PATHS][CLI_BUF_512];
+    snprintf(paths[0], sizeof(paths[0]), "/usr/local/bin/%s", name);
+    snprintf(paths[1], sizeof(paths[1]), "%s/.npm/bin/%s", home_dir, name);
+    snprintf(paths[2], sizeof(paths[2]), "%s/.local/bin/%s", home_dir, name);
+    snprintf(paths[3], sizeof(paths[3]), "%s/.cargo/bin/%s", home_dir, name);
+#ifdef __APPLE__
+    snprintf(paths[4], sizeof(paths[4]), "/opt/homebrew/bin/%s", name);
+#else
+    paths[4][0] = '\0';
+#endif
+    for (int i = 0; i < NUM_RETRIES; i++) {
+        if (paths[i][0] && is_executable(paths[i])) {
+            snprintf(buf, sizeof(buf), "%s", paths[i]);
+            return buf;
+        }
+    }
+    return "";
+}
+
+/* ── File utilities ───────────────────────────────────────────── */
+
+int cbm_copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) {
+        return CLI_ERR;
+    }
+
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        (void)fclose(in);
+        return CLI_ERR;
+    }
+
+    char buf[CLI_BUF_8K];
+    int err = 0;
+    while (!feof(in) && !ferror(in)) {
+        size_t n = fread(buf, CLI_ELEM_SIZE, sizeof(buf), in);
+        if (n == 0) {
+            break;
+        }
+        if (fwrite(buf, CLI_ELEM_SIZE, n, out) != n) {
+            err = CLI_TRUE;
+            break;
+        }
+    }
+
+    if (err || ferror(in)) {
+        (void)fclose(in);
+        (void)fclose(out);
+        return CLI_ERR;
+    }
+
+    (void)fclose(in);
+    int rc = fclose(out);
+    return rc == 0 ? 0 : CLI_ERR;
+}
+
+/* Return true if two paths refer to the same on-disk file. Used to avoid
+ * copying the running binary onto itself during install (cbm_copy_file would
+ * truncate it, since it opens the destination "wb" before reading the source). */
+static bool cbm_same_file(const char *a, const char *b) {
+    struct stat sa;
+    struct stat sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) {
+        return false;
+    }
+#ifdef _WIN32
+    /* st_ino is unreliable on Windows; compare normalized path strings. */
+    char na[CLI_BUF_1K];
+    char nb[CLI_BUF_1K];
+    snprintf(na, sizeof(na), "%s", a);
+    snprintf(nb, sizeof(nb), "%s", b);
+    cbm_normalize_path_sep(na);
+    cbm_normalize_path_sep(nb);
+    return strcmp(na, nb) == 0;
+#else
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+#endif
+}
+
+/* Run a freshly written binary once so the OS pays its first-exec cost now.
+ * macOS validates the ad-hoc code signature of a new file on its first exec —
+ * 2-3s for this 230-290MB binary — and that used to land on the next MCP
+ * session start (or the next hook invocation) right after `install`/`update`.
+ * Output goes to the bit bucket; any failure is ignored because the binary
+ * was already installed correctly and the cost merely moves back to the next
+ * exec. Bounded so a wedged binary cannot hang the installer. */
+enum { CLI_WARM_BINARY_TIMEOUT_MS = 60000 };
+static void cbm_warm_binary(const char *path) {
+    const char *argv[] = {path, "--version", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = path;
+    opts.argv = argv;
+    opts.total_timeout_ms = CLI_WARM_BINARY_TIMEOUT_MS;
+    cbm_proc_result_t result;
+    (void)cbm_subprocess_run(&opts, &result);
+}
+
+/* Copy the running binary into the canonical install target, preserving the
+ * executable bit. When src and dst are the same on-disk file the copy is
+ * skipped: cbm_copy_file opens dst "wb" before reading src, so copying a file
+ * onto itself would truncate it to zero. Returns 0 on success or skip,
+ * CLI_ERR on failure. Exposed (non-static) as the regression surface for the
+ * `install --force` binary-swap bug (#472). */
+int cbm_copy_binary_to_target(const char *src, const char *dst) {
+    if (cbm_same_file(src, dst)) {
+        return 0; /* already in place — nothing to copy */
+    }
+    if (cbm_copy_file(src, dst) != 0) {
+        return CLI_ERR;
+    }
+#ifndef _WIN32
+    (void)chmod(dst, CLI_OCTAL_PERM);
+#endif
+    cbm_warm_binary(dst);
+    return 0;
+}
+
+/* Replace a binary file. Unlinks the old file first (handles read-only and
+ * running binaries on Unix where unlink succeeds on open files). On all
+ * platforms, the caller should tell the user to restart after update. */
+int cbm_replace_binary(const char *path, const unsigned char *data, int len, int mode) {
+    if (!path || !data || len <= 0) {
+        return CLI_ERR;
+    }
+
+    /* Remove existing file if it exists. On Unix, unlink works even if the
+     * binary is running (inode stays alive until the process exits). On Windows,
+     * unlink fails on running .exe — rename it aside as fallback. */
+    struct stat st_check;
+    if (stat(path, &st_check) == 0) {
+        /* File exists — remove or rename it */
+        if (cbm_unlink(path) != 0) {
+#ifdef _WIN32
+            /* Windows: can't unlink running .exe — rename aside */
+            char old_path[CLI_BUF_1K];
+            snprintf(old_path, sizeof(old_path), "%s.old", path);
+            (void)cbm_unlink(old_path);
+            if (rename(path, old_path) != 0) {
+                return CLI_ERR;
+            }
+#else
+            return CLI_ERR;
+#endif
+        }
+    }
+
+#ifndef _WIN32
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (mode_t)mode);
+    if (fd < 0) {
+        return CLI_ERR;
+    }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) {
+        close(fd);
+        return CLI_ERR;
+    }
+#else
+    (void)mode;
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return CLI_ERR;
+    }
+#endif
+
+    size_t written = fwrite(data, CLI_ELEM_SIZE, (size_t)len, f);
+    (void)fclose(f);
+    if (written != (size_t)len) {
+        return CLI_ERR;
+    }
+    cbm_warm_binary(path);
+    return 0;
+}
+
+/* ── Skill file content (embedded) ────────────────────────────── */
+
+/* Consolidated from 4 separate skills into 1 with progressive disclosure.
+ * This embedded version is the single source of truth for the CLI installer.
+ * Based on PR #81 by @gdilla — factual corrections applied. */
+static const char skill_content[] =
+    "---\n"
+    "name: code-cortex\n"
+    "description: >-\n"
+    "  Use Code Cortex when one focused graph query can resolve a missing code\n"
+    "  relationship at lower total cost than repeated source searches. Default to\n"
+    "  shell search for simple lookups and routine edits. Also use for explicit\n"
+    "  graph requests and graph-tool help.\n"
+    "---\n"
+    "\n"
+    "# Code Cortex — when the graph beats grep\n"
+    "\n"
+    "Default to shell search and direct source reads.\n"
+    "Use one bounded graph query when it can resolve a required relationship more efficiently than "
+    "repeated source searches.\n"
+    "Include discovery, indexing, retrieval, and verification costs.\n"
+    "Task labels and repository size alone do not justify graph use.\n"
+    "An explicit graph request remains a reason to use the relevant tool.\n"
+    "Use sufficient current-source excerpts directly; inspect files only where evidence leaves a "
+    "gap.\n"
+    "Routine edits do not require inspect_symbol, detect_changes, or automatic graph context.\n"
+    "\n"
+    "## Choose a query after applying the decision above\n"
+    "\n"
+    "| Question | Call |\n"
+    "|----------|------|\n"
+    "| Who calls `X`? With file:line, tests separated, cross-language callers | "
+    "`inspect_symbol(symbol=\"X\")` |\n"
+    "| Which indirect callers remain unresolved before an edit? | `inspect_symbol(symbol=\"X\")` → "
+    "`caller_files` (graph matches, never paged) |\n"
+    "| Which tests exercise `X`? | `inspect_symbol(symbol=\"X\")` → `related_tests` |\n"
+    "| Known call chain from `A` to `B` | `trace_path(function_name=\"B\", from_function=\"A\", "
+    "direction=\"inbound\", depth=3, max_work=10000)` |\n"
+    "| Caller or callee neighborhood of `X` | `trace_path(function_name=\"X\", "
+    "direction=\"inbound\"\\|\"outbound\"\\|\"both\", depth=3)` |\n"
+    "| Blast radius of my uncommitted edits | `detect_changes()` |\n"
+    "| Direct subclasses / implementations of a class | `inspect_symbol(symbol=\"Base\")` → "
+    "`subclasses` |\n"
+    "| Most-called functions, module sizes, languages | `get_architecture()` |\n"
+    "| Candidates for unused-code source review | `search_graph(max_degree=0, "
+    "exclude_entry_points=true, label=\"Function\")` |\n"
+    "| Anything else structural | `query_graph(query=\"MATCH ... RETURN ...\")` |\n"
+    "\n"
+    "## Leave to grep / Read\n"
+    "\n"
+    "- Exact identifier or string literal lookups, config values, error messages.\n"
+    "- Non-code files. Reading a file before editing it.\n"
+    "- Anything in a file the reply marks `coverage_note` (partially parsed): the\n"
+    "  graph is a lower bound there.\n"
+    "\n"
+    "## Reading a reply\n"
+    "\n"
+    "- `callers[].call_lines` are call-site lines in `callers[].file`; open that\n"
+    "  line to verify. `confidence` + `strategy` say how the edge was resolved;\n"
+    "  `heuristic: true` marks a pattern-only match.\n"
+    "- `callers_total`, `related_tests_total`, `subclasses_total` are exact even\n"
+    "  when the list is paged. These totals and `caller_files` describe graph matches, not "
+    "complete source coverage.\n"
+    "  A missing edge does not prove that code is unused or unaffected.\n"
+    "- `index.file_modified_after_index` / `freshness_note`: the file changed since\n"
+    "  indexing — re-run `index_repository` if it matters.\n"
+    "- `truncated` + `continuation`: the reply hit its byte budget; page with\n"
+    "  `callers_offset` or raise `max_bytes`.\n"
+    "- For a known endpoint chain, check `path_found` and `traversal_truncated`.\n"
+    "  Increase `max_work` only when the reply reports truncation.\n"
+    "- If `trace_path` lacks `from_function` or `max_work`, use a bounded\n"
+    "  `query_graph` path query. Require one path and verify it in current source.\n"
+    "\n"
+    "## Names\n"
+    "\n"
+    "`project` is optional inside an indexed repository (it is inferred from the\n"
+    "working directory; a wrong name is answered for the cwd project with a\n"
+    "`project_note`). `inspect_symbol`, `trace_path` and `get_code_snippet` accept\n"
+    "a bare name, `Class::method`, or a qualified name; an ambiguous name returns\n"
+    "`suggestions`.\n"
+    "\n"
+    "## Tools\n"
+    "\n"
+    "`inspect_symbol`, `trace_path`, `detect_changes`, `search_graph`,\n"
+    "`get_code_snippet`, `get_architecture`, `query_graph`, `search_code`,\n"
+    "`get_graph_schema`, `index_repository`, `index_status`, `list_projects`,\n"
+    "`delete_project`, `manage_adr`, `ingest_traces`\n"
+    "\n"
+    "## Cypher examples (query_graph)\n"
+    "\n"
+    "```\n"
+    "MATCH (c)-[:INHERITS]->(p) WHERE p.name = 'Layer' RETURN c.name, c.file_path\n"
+    "MATCH (a)-[r:CALLS]->(b) WHERE b.name = 'fnvHash' RETURN a.name, a.file_path, r.line\n"
+    "MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path LIMIT 20\n"
+    "```\n"
+    "\n"
+    "## Gotchas\n"
+    "\n"
+    "1. `query_graph` caps at 200 rows; use `inspect_symbol` totals or\n"
+    "   `search_graph` degree filters for counts.\n"
+    "2. Graph coverage can omit declarations, macros, or unresolved receiver calls. A signature "
+    "change\n"
+    "   needs current declarations and relevant call expressions; use supplied source when "
+    "sufficient.\n"
+    "3. Coverage can be incomplete even without a coverage_note flag.\n"
+    "   Treat class sets as graph matches; confirm required relationships from current source.\n"
+    "4. `trace_path` follows CALLS only by default; pass `edge_types` for others.\n"
+    "5. In the controlled warm-index synthetic C++ comparison, Code Cortex reduced\n"
+    "   geometric complete-task time by 57.9% against shell (22/24 eligible pairs)\n"
+    "   and 37.4% against pinned upstream (14/16). Two 1M chain answers were\n"
+    "   incorrect and excluded without retry; upstream had no 100M timing.\n"
+    "   This does not establish a benefit for edits, cold indexing, every language,\n"
+    "   or every task shape.\n";
+
+static const char codex_instructions_content[] =
+    "# Codebase Knowledge Graph (code-cortex-mcp)\n"
+    "\n"
+    "Default to shell search and direct source reads.\n"
+    "Use the graph when one bounded query can resolve a required relationship more efficiently "
+    "than repeated source searches.\n"
+    "Include discovery, indexing, retrieval, and verification costs. Repository size and task "
+    "labels alone do not justify graph use.\n"
+    "An explicit graph request remains a reason to use the relevant tool.\n"
+    "\n"
+    "For a known chain from A to B, use `trace_path(function_name=\"B\", from_function=\"A\", "
+    "direction=\"inbound\", max_work=10000)` when supported.\n"
+    "If those fields are unavailable, consider one bounded `query_graph` path query.\n"
+    "Consider `inspect_symbol` for unresolved callers, bindings, or indirect tests.\n"
+    "Use structural queries when they address a specific missing relationship.\n"
+    "Routine edits do not require inspect_symbol, detect_changes, or automatic graph context.\n"
+    "\n"
+    "Use supplied current-source excerpts when sufficient; read files only for missing, stale, "
+    "ambiguous, or incomplete evidence.\n"
+    "`caller_files` and graph totals describe indexed relationships, not complete source "
+    "coverage.\n"
+    "Coverage can be incomplete even without a coverage_note flag.\n"
+    "An absent edge does not prove that code is unused or unaffected.\n"
+    "Bound the query and continue with shell search if it adds no useful evidence.\n"
+    "\n"
+    "In Codex, graph tool names start with `mcp__code_cortex_mcp__`.\n";
+
+/* Old skill names — cleaned up during install to remove stale directories. */
+static const char *old_skill_names[] = {
+    "code-cortex-exploring",
+    "code-cortex-tracing",
+    "code-cortex-quality",
+    "code-cortex-reference",
+};
+enum { OLD_SKILL_COUNT = 4 };
+
+static const cbm_skill_t skills[CBM_SKILL_COUNT] = {
+    {"code-cortex", skill_content},
+};
+
+const cbm_skill_t *cbm_get_skills(void) {
+    return skills;
+}
+
+const char *cbm_get_codex_instructions(void) {
+    return codex_instructions_content;
+}
+
+/* ── Recursive mkdir (via compat_fs) ──────────────────────────── */
+
+static int mkdirp(const char *path, int mode) {
+    return (int)cbm_mkdir_p(path, mode) ? 0 : CLI_ERR;
+}
+
+/* ── Recursive rmdir ──────────────────────────────────────────── */
+
+enum { RMDIR_STACK_CAP = CBM_SZ_256 };
+
+/* Scan one directory: push subdirs onto stack, unlink files. */
+static void rmdir_scan_dir(const char *cur, char stack[][CLI_BUF_1K], int *top) {
+    cbm_dir_t *d = cbm_opendir(cur);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        char child[CLI_BUF_1K];
+        snprintf(child, sizeof(child), "%s/%s", cur, ent->name);
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (*top < RMDIR_STACK_CAP) {
+                snprintf(stack[(*top)++], CLI_BUF_1K, "%s", child);
+            }
+        } else {
+            cbm_unlink(child);
+        }
+    }
+    cbm_closedir(d);
+}
+
+static int rmdir_recursive(const char *path) {
+    char stack[RMDIR_STACK_CAP][CLI_BUF_1K];
+    int top = 0;
+    snprintf(stack[top++], CLI_BUF_1K, "%s", path);
+
+    /* Post-order: collect all dirs depth-first, then rmdir in reverse. */
+    char dirs[RMDIR_STACK_CAP][CLI_BUF_1K];
+    int dir_count = 0;
+
+    while (top > 0) {
+        char *cur = stack[--top];
+        if (dir_count < RMDIR_STACK_CAP) {
+            snprintf(dirs[dir_count++], CLI_BUF_1K, "%s", cur);
+        }
+        rmdir_scan_dir(cur, stack, &top);
+    }
+    /* Remove dirs in reverse (deepest first). */
+    int rc = 0;
+    for (int i = dir_count - CLI_SKIP_ONE; i >= 0; i--) {
+        if (cbm_rmdir(dirs[i]) != 0) {
+            rc = CBM_NOT_FOUND;
+        }
+    }
+    return rc;
+}
+
+/* ── Skill management ─────────────────────────────────────────── */
+
+int cbm_install_skills(const char *skills_dir, bool force, bool dry_run) {
+    if (!skills_dir) {
+        return 0;
+    }
+    int count = 0;
+
+    /* Clean up old 4-skill directories (consolidated into 1). */
+    for (int i = 0; i < OLD_SKILL_COUNT; i++) {
+        char old_path[CLI_BUF_1K];
+        snprintf(old_path, sizeof(old_path), "%s/%s", skills_dir, old_skill_names[i]);
+        struct stat st;
+        if (stat(old_path, &st) == 0 && S_ISDIR(st.st_mode) && !dry_run) {
+            rmdir_recursive(old_path);
+        }
+    }
+
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        char skill_path[CLI_BUF_1K];
+        snprintf(skill_path, sizeof(skill_path), "%s/%s", skills_dir, skills[i].name);
+        char file_path[CLI_BUF_1K];
+        snprintf(file_path, sizeof(file_path), "%s/SKILL.md", skill_path);
+
+        /* Check if already exists */
+        if (!force) {
+            struct stat st;
+            if (stat(file_path, &st) == 0) {
+                continue;
+            }
+        }
+
+        if (dry_run) {
+            count++;
+            continue;
+        }
+
+        if (mkdirp(skill_path, DIR_PERMS) != 0) {
+            continue;
+        }
+
+        FILE *f = fopen(file_path, "w");
+        if (!f) {
+            continue;
+        }
+        (void)fwrite(skills[i].content, CLI_ELEM_SIZE, strlen(skills[i].content), f);
+        (void)fclose(f);
+        count++;
+    }
+    return count;
+}
+
+int cbm_remove_skills(const char *skills_dir, bool dry_run) {
+    if (!skills_dir) {
+        return 0;
+    }
+    int count = 0;
+
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        char skill_path[CLI_BUF_1K];
+        snprintf(skill_path, sizeof(skill_path), "%s/%s", skills_dir, skills[i].name);
+        struct stat st;
+        if (stat(skill_path, &st) != 0) {
+            continue;
+        }
+
+        if (dry_run) {
+            count++;
+            continue;
+        }
+
+        if (rmdir_recursive(skill_path) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+bool cbm_remove_old_monolithic_skill(const char *skills_dir, bool dry_run) {
+    if (!skills_dir) {
+        return false;
+    }
+
+    char old_path[CLI_BUF_1K];
+    snprintf(old_path, sizeof(old_path), "%s/code-cortex-mcp", skills_dir);
+    struct stat st;
+    if (stat(old_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+
+    if (dry_run) {
+        return true;
+    }
+    return rmdir_recursive(old_path) == 0;
+}
+
+/* ── JSON config helpers (using yyjson) ───────────────────────── */
+
+/* Read a JSON file into a yyjson document. Returns NULL on error. */
+static yyjson_doc *read_json_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return NULL;
+    }
+
+    (void)fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    (void)fseek(f, 0, SEEK_SET);
+
+    if (size <= 0 || size > (long)CLI_MB_10 * CLI_MB_FACTOR) {
+        (void)fclose(f);
+        return NULL;
+    }
+
+    char *buf = (char *)malloc((size_t)size + CLI_SKIP_ONE);
+    if (!buf) {
+        (void)fclose(f);
+        return NULL;
+    }
+
+    size_t nread = fread(buf, CLI_ELEM_SIZE, (size_t)size, f);
+    (void)fclose(f);
+    if (nread > (size_t)size) {
+        nread = (size_t)size;
+    }
+    buf[nread] = '\0';
+
+    /* Allow JSONC (comments + trailing commas) — Zed settings.json uses this format */
+    yyjson_read_flag flags = YYJSON_READ_ALLOW_COMMENTS | YYJSON_READ_ALLOW_TRAILING_COMMAS;
+    yyjson_doc *doc = yyjson_read(buf, nread, flags);
+    free(buf);
+    return doc;
+}
+
+/* Write a mutable yyjson document to a file with pretty printing. */
+static int write_json_file(const char *path, yyjson_mut_doc *doc) {
+    /* Ensure parent directory exists */
+    char dir[CLI_BUF_1K];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        mkdirp(dir, DIR_PERMS);
+    }
+
+    yyjson_write_flag flags = YYJSON_WRITE_PRETTY | YYJSON_WRITE_ESCAPE_UNICODE;
+    size_t len;
+    char *json = yyjson_mut_write(doc, flags, &len);
+    if (!json) {
+        return CLI_ERR;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        free(json);
+        return CLI_ERR;
+    }
+
+    size_t written = fwrite(json, CLI_ELEM_SIZE, len, f);
+    /* Add trailing newline */
+    (void)fputc('\n', f);
+    (void)fclose(f);
+    free(json);
+
+    return written == len ? 0 : CLI_ERR;
+}
+
+/* ── Editor MCP: Cursor/Windsurf/Gemini (mcpServers key) ──────── */
+
+int cbm_install_editor_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+
+    /* Read existing or start fresh */
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    yyjson_mut_val *root;
+    if (doc) {
+        root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+        yyjson_doc_free(doc);
+    } else {
+        root = yyjson_mut_obj(mdoc);
+    }
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    /* Get or create mcpServers object */
+    yyjson_mut_val *servers = yyjson_mut_obj_get(root, "mcpServers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        servers = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, root, "mcpServers", servers);
+    }
+
+    /* Remove existing entry if present */
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    /* Add our entry */
+    yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_str(mdoc, entry, "command", binary_path);
+    yyjson_mut_obj_add_val(mdoc, servers, "code-cortex-mcp", entry);
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+int cbm_remove_editor_mcp(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    if (!doc) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(root, "mcpServers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+/* ── OpenClaw MCP (nested mcp.servers with command + args) ────── */
+
+int cbm_install_openclaw_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    yyjson_mut_val *root;
+    if (doc) {
+        root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+        yyjson_doc_free(doc);
+    } else {
+        root = yyjson_mut_obj(mdoc);
+    }
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *mcp = yyjson_mut_obj_get(root, "mcp");
+    if (!mcp || !yyjson_mut_is_obj(mcp)) {
+        mcp = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, root, "mcp", mcp);
+    }
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(mcp, "servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        servers = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, mcp, "servers", servers);
+    }
+
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_bool(mdoc, entry, "enabled", true);
+    yyjson_mut_obj_add_str(mdoc, entry, "command", binary_path);
+    yyjson_mut_val *args = yyjson_mut_arr(mdoc);
+    yyjson_mut_obj_add_val(mdoc, entry, "args", args);
+    yyjson_mut_obj_add_val(mdoc, servers, "code-cortex-mcp", entry);
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+int cbm_remove_openclaw_mcp(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    if (!doc) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *mcp = yyjson_mut_obj_get(root, "mcp");
+    if (!mcp || !yyjson_mut_is_obj(mcp)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(mcp, "servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+/* ── VS Code MCP (servers key with type:stdio) ────────────────── */
+
+int cbm_install_vscode_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    yyjson_mut_val *root;
+    if (doc) {
+        root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+        yyjson_doc_free(doc);
+    } else {
+        root = yyjson_mut_obj(mdoc);
+    }
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(root, "servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        servers = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, root, "servers", servers);
+    }
+
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_str(mdoc, entry, "type", "stdio");
+    yyjson_mut_obj_add_str(mdoc, entry, "command", binary_path);
+    yyjson_mut_obj_add_val(mdoc, servers, "code-cortex-mcp", entry);
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+int cbm_remove_vscode_mcp(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    if (!doc) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(root, "servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+/* ── Zed MCP (context_servers with command + args) ────────────── */
+
+int cbm_install_zed_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    yyjson_mut_val *root;
+    if (doc) {
+        root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+        yyjson_doc_free(doc);
+    } else {
+        root = yyjson_mut_obj(mdoc);
+    }
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(root, "context_servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        servers = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, root, "context_servers", servers);
+    }
+
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_str(mdoc, entry, "command", binary_path);
+    yyjson_mut_val *args = yyjson_mut_arr(mdoc);
+    yyjson_mut_arr_add_str(mdoc, args, "");
+    yyjson_mut_obj_add_val(mdoc, entry, "args", args);
+    yyjson_mut_obj_add_val(mdoc, servers, "code-cortex-mcp", entry);
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+int cbm_remove_zed_mcp(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    if (!doc) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *servers = yyjson_mut_obj_get(root, "context_servers");
+    if (!servers || !yyjson_mut_is_obj(servers)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_obj_remove_key(servers, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(servers, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+/* ── Agent detection ──────────────────────────────────────────── */
+
+static bool dir_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Resolve the Claude Code config dir.
+ * Honors $CLAUDE_CONFIG_DIR; falls back to "$home_dir/.claude". */
+static void cbm_claude_config_dir(const char *home_dir, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        snprintf(out, out_sz, "%s", env);
+    } else if (home_dir && home_dir[0]) {
+        snprintf(out, out_sz, "%s/.claude", home_dir);
+    }
+}
+
+/* Resolve the parent dir containing `.claude.json` (Claude Code's user config file).
+ * Honors $CLAUDE_CONFIG_DIR; falls back to "$home_dir". */
+static void cbm_claude_user_root(const char *home_dir, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        snprintf(out, out_sz, "%s", env);
+    } else if (home_dir && home_dir[0]) {
+        snprintf(out, out_sz, "%s", home_dir);
+    }
+}
+
+/* Build the hook command string written into Claude Code's settings.json.
+ * Honors $CLAUDE_CONFIG_DIR. When CLAUDE_CONFIG_DIR is unset, preserves the
+ * legacy tilde-expanded form so settings.json stays portable across HOME values. */
+static void cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        snprintf(out, out_sz, "%s/hooks/%s", env, script_name);
+    } else {
+        snprintf(out, out_sz, "~/.claude/hooks/%s", script_name);
+    }
+}
+
+cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
+    cbm_detected_agents_t agents;
+    memset(&agents, 0, sizeof(agents));
+    if (!home_dir || !home_dir[0]) {
+        return agents;
+    }
+
+    char path[CLI_BUF_1K];
+
+    cbm_claude_config_dir(home_dir, path, sizeof(path));
+    agents.claude_code = path[0] != '\0' && dir_exists(path);
+
+    snprintf(path, sizeof(path), "%s/.codex", home_dir);
+    agents.codex = dir_exists(path);
+
+    snprintf(path, sizeof(path), "%s/.gemini", home_dir);
+    agents.gemini = dir_exists(path);
+
+#ifdef __APPLE__
+    snprintf(path, sizeof(path), "%s/Library/Application Support/Zed", home_dir);
+#elif defined(_WIN32)
+    snprintf(path, sizeof(path), "%s/AppData/Local/Zed", home_dir);
+#else
+    snprintf(path, sizeof(path), "%s/.config/zed", home_dir);
+#endif
+    agents.zed = dir_exists(path);
+
+    agents.opencode = cbm_find_cli("opencode", home_dir)[0] != '\0';
+
+    /* Antigravity CLI (2026 unification) installs under ~/.gemini/antigravity-cli/
+     * (brain/, mcp/, settings.json), with MCP config in the shared
+     * ~/.gemini/config/mcp_config.json. */
+    snprintf(path, sizeof(path), "%s/.gemini/antigravity-cli", home_dir);
+    if (dir_exists(path)) {
+        agents.antigravity = true;
+    }
+
+    agents.aider = cbm_find_cli("aider", home_dir)[0] != '\0';
+
+#ifdef __APPLE__
+    snprintf(path, sizeof(path),
+             "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", home_dir);
+#elif defined(_WIN32)
+    snprintf(path, sizeof(path), "%s/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code",
+             home_dir);
+#else
+    snprintf(path, sizeof(path), "%s/.config/Code/User/globalStorage/kilocode.kilo-code", home_dir);
+#endif
+    agents.kilocode = dir_exists(path);
+
+#ifdef __APPLE__
+    snprintf(path, sizeof(path), "%s/Library/Application Support/Code/User", home_dir);
+#elif defined(_WIN32)
+    snprintf(path, sizeof(path), "%s/AppData/Roaming/Code/User", home_dir);
+#else
+    snprintf(path, sizeof(path), "%s/.config/Code/User", home_dir);
+#endif
+    agents.vscode = dir_exists(path);
+
+    /* Cursor stores its user MCP config in ~/.cursor/mcp.json on all platforms. */
+    snprintf(path, sizeof(path), "%s/.cursor", home_dir);
+    agents.cursor = dir_exists(path);
+
+    snprintf(path, sizeof(path), "%s/.openclaw", home_dir);
+    agents.openclaw = dir_exists(path);
+
+    /* Kiro: ~/.kiro/ */
+    snprintf(path, sizeof(path), "%s/.kiro", home_dir);
+    agents.kiro = dir_exists(path);
+
+    /* Junie (JetBrains): ~/.junie/ */
+    snprintf(path, sizeof(path), "%s/.junie", home_dir);
+    agents.junie = dir_exists(path);
+
+    return agents;
+}
+
+/* ── Shared agent instructions content ────────────────────────── */
+
+static const char agent_instructions_content[] =
+    "# Codebase Knowledge Graph (code-cortex-mcp)\n"
+    "\n"
+    "Default to shell search and direct source reads.\n"
+    "Use the graph when one bounded query can resolve a required relationship more efficiently "
+    "than repeated source searches.\n"
+    "Include discovery, indexing, retrieval, and verification costs. Repository size and task "
+    "labels alone do not justify graph use.\n"
+    "An explicit graph request remains a reason to use the relevant tool.\n"
+    "\n"
+    "For a known chain from A to B, use `trace_path(function_name=\"B\", from_function=\"A\", "
+    "direction=\"inbound\", max_work=10000)` when supported.\n"
+    "If those fields are unavailable, consider one bounded `query_graph` path query.\n"
+    "Consider `inspect_symbol` for unresolved callers, bindings, or indirect tests.\n"
+    "Use structural queries when they address a specific missing relationship.\n"
+    "Routine edits do not require inspect_symbol, detect_changes, or automatic graph context.\n"
+    "\n"
+    "Use supplied current-source excerpts when sufficient; read files only for missing, stale, "
+    "ambiguous, or incomplete evidence.\n"
+    "`caller_files` and graph totals describe indexed relationships, not complete source "
+    "coverage.\n"
+    "Coverage can be incomplete even without a coverage_note flag.\n"
+    "An absent edge does not prove that code is unused or unaffected.\n"
+    "Bound the query and continue with shell search if it adds no useful evidence.\n";
+
+const char *cbm_get_agent_instructions(void) {
+    return agent_instructions_content;
+}
+
+/* ── Instructions file upsert ─────────────────────────────────── */
+
+#define CMM_MARKER_START "<!-- code-cortex-mcp:start -->"
+#define CMM_MARKER_END "<!-- code-cortex-mcp:end -->"
+
+/* Read entire file into malloc'd buffer. Returns NULL on error. */
+static char *read_file_str(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        if (out_len) {
+            *out_len = 0;
+        }
+        return NULL;
+    }
+    (void)fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    (void)fseek(f, 0, SEEK_SET);
+    if (size < 0 || size > (long)CLI_MB_10 * CLI_MB_FACTOR) { /* cap at 10 MB */
+        (void)fclose(f);
+        return NULL;
+    }
+
+    char *buf = (char *)malloc((size_t)size + CLI_SKIP_ONE);
+    if (!buf) {
+        (void)fclose(f);
+        return NULL;
+    }
+    size_t nread = fread(buf, CLI_ELEM_SIZE, (size_t)size, f);
+    (void)fclose(f);
+    if (nread > (size_t)size) {
+        nread = (size_t)size;
+    }
+    buf[nread] = '\0';
+    if (out_len) {
+        *out_len = nread;
+    }
+    return buf;
+}
+
+/* Write string to file, creating parent dirs if needed. */
+static int write_file_str(const char *path, const char *content) {
+    /* Ensure parent directory */
+    char dir[CLI_BUF_1K];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        mkdirp(dir, DIR_PERMS);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return CLI_ERR;
+    }
+    size_t len = strlen(content);
+    size_t written = fwrite(content, CLI_ELEM_SIZE, len, f);
+    (void)fclose(f);
+    return written == len ? 0 : CLI_ERR;
+}
+
+int cbm_upsert_instructions(const char *path, const char *content) {
+    if (!path || !content) {
+        return CLI_ERR;
+    }
+
+    size_t existing_len = 0;
+    char *existing = read_file_str(path, &existing_len);
+
+    /* Build the marker-wrapped section */
+    size_t section_len = strlen(CMM_MARKER_START) + CLI_SKIP_ONE + strlen(content) +
+                         strlen(CMM_MARKER_END) + CLI_SKIP_ONE;
+    char *section = (char *)malloc(section_len + CLI_SKIP_ONE);
+    if (!section) {
+        free(existing);
+        return CLI_ERR;
+    }
+    snprintf(section, section_len + SKIP_ONE, "%s\n%s%s\n", CMM_MARKER_START, content,
+             CMM_MARKER_END);
+
+    if (!existing) {
+        /* File doesn't exist — create with just the section */
+        int rc = write_file_str(path, section);
+        free(section);
+        return rc;
+    }
+
+    /* Check if markers already exist */
+    char *start = strstr(existing, CMM_MARKER_START);
+    char *end = start ? strstr(start, CMM_MARKER_END) : NULL;
+
+    char *result;
+    if (start && end) {
+        /* Replace between markers (including markers themselves) */
+        end += strlen(CMM_MARKER_END);
+        /* Skip trailing newline after end marker */
+        if (*end == '\n') {
+            end++;
+        }
+
+        size_t prefix_len = (size_t)(start - existing);
+        size_t suffix_len = strlen(end);
+        size_t new_len = prefix_len + strlen(section) + suffix_len;
+        result = (__typeof__(result))malloc(new_len + CLI_SKIP_ONE);
+        if (!result) {
+            free(existing);
+            free(section);
+            return CLI_ERR;
+        }
+        memcpy(result, existing, prefix_len);
+        memcpy(result + prefix_len, section, strlen(section));
+        memcpy(result + prefix_len + strlen(section), end, suffix_len);
+        result[new_len] = '\0';
+    } else {
+        /* Append section */
+        size_t new_len = existing_len + CLI_SKIP_ONE + strlen(section);
+        if (new_len > (size_t)CLI_MB_10 * CLI_MB_FACTOR) { /* 10 MB safety cap */
+            free(existing);
+            free(section);
+            return CLI_ERR;
+        }
+        result = (__typeof__(result))malloc(new_len + CLI_SKIP_ONE);
+        if (!result) {
+            free(existing);
+            free(section);
+            return CLI_ERR;
+        }
+        memcpy(result, existing, existing_len);
+        result[existing_len] = '\n';
+        memcpy(result + existing_len + SKIP_ONE, section, strlen(section));
+        result[new_len] = '\0';
+    }
+
+    int rc = write_file_str(path, result);
+    free(existing);
+    free(section);
+    free(result);
+    return rc;
+}
+
+int cbm_remove_instructions(const char *path) {
+    if (!path) {
+        return CLI_ERR;
+    }
+
+    size_t len = 0;
+    char *content = read_file_str(path, &len);
+    if (!content) {
+        return CLI_TRUE;
+    }
+
+    char *start = strstr(content, CMM_MARKER_START);
+    char *end = start ? strstr(start, CMM_MARKER_END) : NULL;
+
+    if (!start || !end) {
+        free(content);
+        return CLI_TRUE; /* not found */
+    }
+
+    end += strlen(CMM_MARKER_END);
+    if (*end == '\n') {
+        end++;
+    }
+
+    /* Also remove a leading newline before the start marker if present */
+    if (start > content && *(start - CLI_SKIP_ONE) == '\n') {
+        start--;
+    }
+
+    size_t prefix_len = (size_t)(start - content);
+    size_t suffix_len = strlen(end);
+    size_t new_len = prefix_len + suffix_len;
+    char *result = (char *)malloc(new_len + CLI_SKIP_ONE);
+    if (!result) {
+        free(content);
+        return CLI_ERR;
+    }
+    memcpy(result, content, prefix_len);
+    memcpy(result + prefix_len, end, suffix_len);
+    result[new_len] = '\0';
+
+    int rc = write_file_str(path, result);
+    free(content);
+    free(result);
+    return rc;
+}
+
+/* ── Codex MCP config (TOML) ─────────────────────────────────── */
+
+/* Table-name prefixes, deliberately WITHOUT the closing bracket: a Codex server
+ * owns both its own table ("[mcp_servers.<name>]") and any subtables Codex
+ * itself writes underneath it — "[mcp_servers.<name>.tools.<tool>]" appears as
+ * soon as the user picks an approval mode for a tool. Removal has to take the
+ * whole family: an orphaned subtable implicitly re-declares the server with no
+ * command and no url, which Codex rejects at startup with "invalid transport". */
+#define CODEX_CMM_PREFIX "[mcp_servers.code-cortex-mcp"
+#define CODEX_LEGACY_PREFIX "[mcp_servers.codebase-memory-mcp" /* pre-rename */
+#define CODEX_CMM_SECTION CODEX_CMM_PREFIX "]"
+
+/* Length of the line at `p`, including its trailing newline (if any). */
+static size_t toml_line_len(const char *p) {
+    const char *nl = strchr(p, '\n');
+    return nl ? (size_t)(nl - p) + CLI_SKIP_ONE : strlen(p);
+}
+
+/* First non-indent character of a line. */
+static const char *toml_line_body(const char *p) {
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return p;
+}
+
+/* CLI_TRUE when `body` opens a table named by `prefix` — either the table
+ * itself (next char ']') or, with `include_sub`, one of its subtables ('.'). */
+static int toml_table_matches(const char *body, const char *prefix, int include_sub) {
+    size_t n = strlen(prefix);
+    if (strncmp(body, prefix, n) != 0) {
+        return 0;
+    }
+    if (body[n] == ']') {
+        return CLI_TRUE;
+    }
+    return include_sub && body[n] == '.';
+}
+
+/* Rewrite `content` with every table matching (prefix, include_sub) dropped.
+ * When `replacement` is non-NULL it is emitted once at the position of the
+ * first match, so ordering and neighbouring content are preserved.
+ *
+ * A run of blank/comment lines at the tail of a dropped table is kept: those
+ * lines almost always introduce whatever comes next (our own SessionStart
+ * sentinel comment among them), not the table being removed.
+ *
+ * Returns a malloc'd string the caller frees, or NULL on allocation failure;
+ * *out_changed reports whether anything matched. */
+static char *toml_rewrite_tables(const char *content, const char *prefix, int include_sub,
+                                 const char *replacement, int *out_changed) {
+    size_t cap = strlen(content) + (replacement ? strlen(replacement) : 0) + CLI_SKIP_ONE;
+    char *out = (char *)malloc(cap);
+    if (!out) {
+        return NULL;
+    }
+
+    size_t w = 0;
+    int dropping = 0;
+    int changed = 0;
+    int emitted = 0;
+    const char *pending = NULL; /* blank/comment run seen while dropping */
+    size_t pending_len = 0;
+
+    for (const char *p = content; *p;) {
+        size_t n = toml_line_len(p);
+        const char *body = toml_line_body(p);
+
+        if (*body == '[') {
+            if (toml_table_matches(body, prefix, include_sub)) {
+                if (!emitted && replacement) {
+                    memcpy(out + w, replacement, strlen(replacement));
+                    w += strlen(replacement);
+                    emitted = CLI_TRUE;
+                }
+                pending = NULL; /* interior to the family — goes with it */
+                pending_len = 0;
+                dropping = CLI_TRUE;
+                changed = CLI_TRUE;
+                p += n;
+                continue;
+            }
+            if (pending_len) { /* belongs to this table, not the dropped one */
+                memcpy(out + w, pending, pending_len);
+                w += pending_len;
+            }
+            pending = NULL;
+            pending_len = 0;
+            dropping = 0;
+        }
+
+        if (dropping) {
+            if (*body == '\n' || *body == '\r' || *body == '#' || *body == '\0') {
+                if (!pending) {
+                    pending = p;
+                }
+                pending_len += n;
+            } else {
+                pending = NULL; /* a key line — squarely inside the table */
+                pending_len = 0;
+            }
+            p += n;
+            continue;
+        }
+
+        memcpy(out + w, p, n);
+        w += n;
+        p += n;
+    }
+
+    if (pending_len) { /* trailing run at EOF still belongs to the file */
+        memcpy(out + w, pending, pending_len);
+        w += pending_len;
+    }
+    out[w] = '\0';
+    if (out_changed) {
+        *out_changed = changed;
+    }
+    return out;
+}
+
+/* Remove a server table and every subtable under it. Returns 0 on write,
+ * CLI_TRUE when nothing matched. */
+static int codex_remove_family(const char *config_path, const char *prefix) {
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+    if (!content) {
+        return CLI_TRUE;
+    }
+    int changed = 0;
+    char *out = toml_rewrite_tables(content, prefix, CLI_TRUE, NULL, &changed);
+    if (!out) {
+        free(content);
+        return CLI_ERR;
+    }
+    int rc = changed ? write_file_str(config_path, out) : CLI_TRUE;
+    free(content);
+    free(out);
+    return rc;
+}
+
+int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+
+    /* Migration: the pre-rename server and all of its subtables. */
+    codex_remove_family(config_path, CODEX_LEGACY_PREFIX);
+
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+
+    /* Build our TOML section */
+    char section[CLI_BUF_1K];
+    snprintf(section, sizeof(section), "%s\ncommand = \"%s\"\n", CODEX_CMM_SECTION, binary_path);
+
+    if (!content) {
+        /* No file — create fresh */
+        return write_file_str(config_path, section);
+    }
+
+    /* Replace our own table in place. Subtables under it are left alone on
+     * purpose: they hold per-tool approval modes the user set in Codex, and
+     * a reinstall or version bump has no business discarding those. */
+    int changed = 0;
+    char *result = toml_rewrite_tables(content, CODEX_CMM_PREFIX, 0, section, &changed);
+    if (!result) {
+        free(content);
+        return CLI_ERR;
+    }
+    if (changed) {
+        int rc = write_file_str(config_path, result);
+        free(content);
+        free(result);
+        return rc;
+    }
+    free(result);
+
+    /* Append our section */
+    size_t new_len = len + CLI_SKIP_ONE + strlen(section);
+    result = (char *)malloc(new_len + CLI_SKIP_ONE);
+    if (!result) {
+        free(content);
+        return CLI_ERR;
+    }
+    memcpy(result, content, len);
+    result[len] = '\n';
+    memcpy(result + len + SKIP_ONE, section, strlen(section));
+    result[new_len] = '\0';
+
+    int rc = write_file_str(config_path, result);
+    free(content);
+    free(result);
+    return rc;
+}
+
+int cbm_remove_codex_mcp(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+    codex_remove_family(config_path, CODEX_LEGACY_PREFIX);
+    return codex_remove_family(config_path, CODEX_CMM_PREFIX);
+}
+
+/* ── SessionStart reminder hook (Codex / Gemini / Antigravity) ──────
+ * Same methodology as the Claude Code SessionStart hook: a non-blocking
+ * lifecycle hook whose stdout is injected as session context, reminding the
+ * agent to use code-cortex-mcp graph tools first. The command is written
+ * so it is valid both inside a TOML single-quoted literal (Codex config.toml)
+ * and a JSON string (Gemini settings.json) — i.e. it contains NO single quotes
+ * and NO newlines. (issues #330 + Gemini/Antigravity parity) */
+#define CMM_SESSION_REMINDER_CMD                                                       \
+    "echo \"code-cortex-mcp: use inspect_symbol(<name>) for direct callers with "      \
+    "call-site lines, related tests and cross-language callers; trace_path for "       \
+    "multi-hop call chains; detect_changes for the blast radius of edits. Plain grep " \
+    "is fine for text and exact identifiers. The project argument is optional inside " \
+    "an indexed repository; run index_repository once if it is not indexed.\""
+
+/* Sentinel-delimited block so upsert/remove are robust to the nested TOML
+ * array-of-tables (which both start with '['). */
+#define CODEX_HOOK_BEGIN "# >>> code-cortex-mcp SessionStart >>>"
+#define CODEX_HOOK_END "# <<< code-cortex-mcp SessionStart <<<"
+#define CODEX_LEGACY_HOOK_BEGIN "# >>> codebase-memory-mcp SessionStart >>>" /* pre-rename */
+#define CODEX_LEGACY_HOOK_END "# <<< codebase-memory-mcp SessionStart <<<"
+
+/* The tables we write between the sentinels; anything else found in there was
+ * put there by Codex and has to survive removal. */
+#define CODEX_HOOK_TABLE "[[hooks.SessionStart]]"
+#define CODEX_HOOK_SUBTABLE "[[hooks.SessionStart.hooks]]"
+
+/* Splice out an existing [begin .. end] block (inclusive, plus a leading
+ * newline). Returns a newly-malloc'd string the caller frees, or NULL if no
+ * block was present (content is left untouched).
+ *
+ * Codex rewrites config.toml wholesale and appends its own tables ahead of a
+ * trailing comment, so [hooks.state] and friends drift *inside* our sentinels.
+ * Those are hook-trust hashes for every project on the machine — splicing the
+ * region blindly would delete them, so any table we did not author is carried
+ * back out. */
+static char *codex_hook_strip_one(const char *content, const char *begin_marker,
+                                  const char *end_marker) {
+    const char *begin = strstr(content, begin_marker);
+    if (!begin) {
+        return NULL;
+    }
+    const char *end = strstr(begin, end_marker);
+    if (!end) {
+        return NULL;
+    }
+    const char *region_end = end;
+    end += strlen(end_marker);
+    if (*end == '\n') {
+        end++;
+    }
+    /* Drop one leading newline before the block, if any. */
+    const char *cut = begin;
+    if (cut > content && *(cut - CLI_SKIP_ONE) == '\n') {
+        cut--;
+    }
+    size_t prefix_len = (size_t)(cut - content);
+    size_t suffix_len = strlen(end);
+    size_t region_len = (size_t)(region_end - begin);
+    char *out = (char *)malloc(prefix_len + region_len + suffix_len + CLI_PAIR_LEN);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, content, prefix_len);
+    size_t w = prefix_len;
+
+    /* Salvage foreign tables from inside the region. Lines ahead of the first
+     * table header are ours (the marker itself). */
+    int owned = CLI_TRUE;
+    int salvaged = 0;
+    for (const char *p = begin; p < region_end;) {
+        size_t n = toml_line_len(p);
+        if (p + n > region_end) {
+            n = (size_t)(region_end - p);
+        }
+        const char *body = toml_line_body(p);
+        if (*body == '[') {
+            owned = strncmp(body, CODEX_HOOK_TABLE, strlen(CODEX_HOOK_TABLE)) == 0 ||
+                    strncmp(body, CODEX_HOOK_SUBTABLE, strlen(CODEX_HOOK_SUBTABLE)) == 0;
+        }
+        if (!owned) {
+            if (!salvaged) {
+                out[w++] = '\n';
+                salvaged = CLI_TRUE;
+            }
+            memcpy(out + w, p, n);
+            w += n;
+        }
+        p += n;
+    }
+
+    memcpy(out + w, end, suffix_len);
+    out[w + suffix_len] = '\0';
+    return out;
+}
+
+/* Strip our SessionStart block under either the current or the pre-rename
+ * name. NULL when neither was present. */
+static char *codex_hook_strip(const char *content) {
+    char *legacy = codex_hook_strip_one(content, CODEX_LEGACY_HOOK_BEGIN, CODEX_LEGACY_HOOK_END);
+    char *current =
+        codex_hook_strip_one(legacy ? legacy : content, CODEX_HOOK_BEGIN, CODEX_HOOK_END);
+    if (current) {
+        free(legacy);
+        return current;
+    }
+    return legacy;
+}
+
+/* Install/update the Codex SessionStart reminder hook in config.toml. */
+int cbm_upsert_codex_hooks(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+    char block[CLI_BUF_2K];
+    snprintf(block, sizeof(block),
+             "\n" CODEX_HOOK_BEGIN "\n"
+             "[[hooks.SessionStart]]\n"
+             "matcher = \"startup|resume|clear|compact\"\n\n"
+             "[[hooks.SessionStart.hooks]]\n"
+             "type = \"command\"\n"
+             "command = '%s'\n" CODEX_HOOK_END "\n",
+             CMM_SESSION_REMINDER_CMD);
+
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+    if (!content) {
+        return write_file_str(config_path, block + CLI_SKIP_ONE); /* skip leading newline */
+    }
+    char *stripped = codex_hook_strip(content);
+    const char *base = stripped ? stripped : content;
+    size_t base_len = strlen(base);
+    char *result = (char *)malloc(base_len + strlen(block) + CLI_SKIP_ONE);
+    if (!result) {
+        free(content);
+        free(stripped);
+        return CLI_ERR;
+    }
+    memcpy(result, base, base_len);
+    memcpy(result + base_len, block, strlen(block));
+    result[base_len + strlen(block)] = '\0';
+    int rc = write_file_str(config_path, result);
+    free(content);
+    free(stripped);
+    free(result);
+    return rc;
+}
+
+int cbm_remove_codex_hooks(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+    if (!content) {
+        return CLI_TRUE;
+    }
+    char *stripped = codex_hook_strip(content);
+    if (!stripped) {
+        free(content);
+        return CLI_TRUE; /* nothing to remove */
+    }
+    int rc = write_file_str(config_path, stripped);
+    free(content);
+    free(stripped);
+    return rc;
+}
+
+/* ── OpenCode MCP config (JSON with "mcp" key) ───────────────── */
+
+int cbm_upsert_opencode_mcp(const char *binary_path, const char *config_path) {
+    if (!binary_path || !config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    yyjson_mut_val *root;
+    if (doc) {
+        root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+        yyjson_doc_free(doc);
+    } else {
+        root = yyjson_mut_obj(mdoc);
+    }
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    /* Get or create "mcp" object */
+    yyjson_mut_val *mcp = yyjson_mut_obj_get(root, "mcp");
+    if (!mcp || !yyjson_mut_is_obj(mcp)) {
+        mcp = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, root, "mcp", mcp);
+    }
+
+    yyjson_mut_obj_remove_key(mcp, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(mcp, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_bool(mdoc, entry, "enabled", true);
+    yyjson_mut_obj_add_str(mdoc, entry, "type", "local");
+    yyjson_mut_val *cmd_arr = yyjson_mut_arr(mdoc);
+    yyjson_mut_arr_add_str(mdoc, cmd_arr, binary_path);
+    yyjson_mut_obj_add_val(mdoc, entry, "command", cmd_arr);
+    yyjson_mut_obj_add_val(mdoc, mcp, "code-cortex-mcp", entry);
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+int cbm_remove_opencode_mcp(const char *config_path) {
+    if (!config_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(config_path);
+    if (!doc) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *mcp = yyjson_mut_obj_get(root, "mcp");
+    if (!mcp || !yyjson_mut_is_obj(mcp)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_obj_remove_key(mcp, "code-cortex-mcp");
+    yyjson_mut_obj_remove_key(mcp, "codebase-memory-mcp"); /* legacy pre-rename key */
+
+    int rc = write_json_file(config_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+/* ── Antigravity MCP config (JSON, same mcpServers format) ────── */
+
+int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path) {
+    /* Antigravity uses same mcpServers format as Cursor/Gemini */
+    return cbm_install_editor_mcp(binary_path, config_path);
+}
+
+int cbm_remove_antigravity_mcp(const char *config_path) {
+    return cbm_remove_editor_mcp(config_path);
+}
+
+/* ── Junie MCP config (JSON, same mcpServers format) ──────────── */
+
+int cbm_upsert_junie_mcp(const char *binary_path, const char *config_path) {
+    /* Junie (JetBrains) uses same mcpServers format as Cursor/Antigravity */
+    return cbm_install_editor_mcp(binary_path, config_path);
+}
+
+int cbm_remove_junie_mcp(const char *config_path) {
+    return cbm_remove_editor_mcp(config_path);
+}
+
+/* ── Claude Code pre-tool hooks ───────────────────────────────── */
+
+/* Matcher includes Read for the indexing-coverage note (#963): when the agent
+ * reads a file the indexer could not fully cover, the hook injects a warning
+ * as additionalContext. Bash is included because agents run far more searches
+ * through `rg`/`grep`/`git grep` than through the Grep tool (#1082); the
+ * augmenter reads the pattern out of the command and stays pass-through for
+ * every Bash call that is not an unambiguous search.
+ *
+ * The issue-#362 hazard (a GATING hook denying Read and
+ * breaking the read-before-edit invariant) cannot recur: the augmenter is
+ * structurally non-blocking — it always exits 0 and only ever ADDS context —
+ * mirroring the Gemini matcher, which already includes read_file. */
+#define CMM_HOOK_MATCHER "Grep|Glob|Bash|Read"
+/* Basename only; the full command path is resolved at install time via
+ * cbm_resolve_hook_command so $CLAUDE_CONFIG_DIR is honored. */
+#define CMM_HOOK_GATE_SCRIPT "cbm-code-discovery-gate"
+/* Hard backstop in settings.json; the binary also self-bounds with an
+ * in-process deadline well under this. */
+#define CMM_HOOK_TIMEOUT_SEC 5
+
+/* Old matcher values from previous versions — recognized during upgrade so
+ * upsert/remove can clean them up before inserting the current matcher.
+ * Per-agent lists (no shared global): each caller passes its own. */
+static const char *const cmm_claude_old_matchers[] = {
+    "Grep|Glob|Read|Search",
+    "Grep|Glob|Read", /* pre-Bash matcher — Bash added for command searches */
+    "Grep|Glob",      /* pre-#963 matcher — Read re-added for the coverage note */
+    NULL,
+};
+static const char *const cmm_gemini_old_matchers[] = {
+    "google_search|read_file|grep_search",
+    NULL,
+};
+
+/* Check if a hook array entry is ours (current matcher or a known old one).
+ * When require_command_substr is non-NULL, the matcher match is not sufficient:
+ * the entry must ALSO carry a hooks[].command containing that substring. This
+ * disambiguates our entry from a user's own hook that happens to share the same
+ * matcher (notably "*", which a user is likely to pick for a catch-all hook), so
+ * upsert/remove never clobber a foreign entry. NULL preserves matcher-only
+ * matching for callers whose matcher is already CMM-specific (e.g. "startup"). */
+static bool is_cmm_hook_entry(yyjson_mut_val *entry, const char *matcher_str,
+                              const char *const *old_matchers, const char *require_command_substr) {
+    yyjson_mut_val *matcher = yyjson_mut_obj_get(entry, "matcher");
+    if (!matcher || !yyjson_mut_is_str(matcher)) {
+        return false;
+    }
+    const char *val = yyjson_mut_get_str(matcher);
+    if (!val) {
+        return false;
+    }
+    bool matcher_ok = strcmp(val, matcher_str) == 0;
+    /* Also match old versions for backwards-compatible upgrade */
+    for (int i = 0; !matcher_ok && old_matchers && old_matchers[i]; i++) {
+        if (strcmp(val, old_matchers[i]) == 0) {
+            matcher_ok = true;
+        }
+    }
+    if (!matcher_ok) {
+        return false;
+    }
+    if (require_command_substr) {
+        yyjson_mut_val *hooks = yyjson_mut_obj_get(entry, "hooks");
+        if (!hooks || !yyjson_mut_is_arr(hooks)) {
+            return false;
+        }
+        size_t idx;
+        size_t max;
+        yyjson_mut_val *h;
+        yyjson_mut_arr_foreach(hooks, idx, max, h) {
+            yyjson_mut_val *cmd = yyjson_mut_obj_get(h, "command");
+            if (cmd && yyjson_mut_is_str(cmd)) {
+                const char *cs = yyjson_mut_get_str(cmd);
+                if (cs && strstr(cs, require_command_substr)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return true;
+}
+
+/* Generic hook upsert for both Claude Code and Gemini CLI */
+
+typedef struct {
+    const char *settings_path;
+    const char *hook_event;
+    const char *matcher_str;
+    const char *command_str;
+    const char *const *old_matchers;  /* NULL-terminated; may be NULL */
+    int timeout_sec;                  /* >0 adds "timeout" to the hook entry */
+    const char *match_command_substr; /* non-NULL: also require this in the
+                                       * entry command to claim ownership */
+} hooks_upsert_args_t;
+static int upsert_hooks_json(hooks_upsert_args_t args) {
+    const char *settings_path = args.settings_path;
+    const char *hook_event = args.hook_event;
+    const char *matcher_str = args.matcher_str;
+    const char *command_str = args.command_str;
+    const char *const *old_matchers = args.old_matchers;
+    if (!settings_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(settings_path);
+    yyjson_mut_val *root;
+    if (doc) {
+        root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+        yyjson_doc_free(doc);
+    } else {
+        root = yyjson_mut_obj(mdoc);
+    }
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    /* Get or create hooks object */
+    yyjson_mut_val *hooks = yyjson_mut_obj_get(root, "hooks");
+    if (!hooks || !yyjson_mut_is_obj(hooks)) {
+        hooks = yyjson_mut_obj(mdoc);
+        yyjson_mut_obj_add_val(mdoc, root, "hooks", hooks);
+    }
+
+    /* Get or create the hook event array (e.g. PreToolUse / BeforeTool) */
+    yyjson_mut_val *event_arr = yyjson_mut_obj_get(hooks, hook_event);
+    if (!event_arr || !yyjson_mut_is_arr(event_arr)) {
+        event_arr = yyjson_mut_arr(mdoc);
+        yyjson_mut_obj_add_val(mdoc, hooks, hook_event, event_arr);
+    }
+
+    /* Remove existing CMM entry if present */
+    size_t idx;
+    size_t max;
+    yyjson_mut_val *item;
+    yyjson_mut_arr_foreach(event_arr, idx, max, item) {
+        if (is_cmm_hook_entry(item, matcher_str, old_matchers, args.match_command_substr)) {
+            yyjson_mut_arr_remove(event_arr, idx);
+            break;
+        }
+    }
+
+    /* Build our hook entry */
+    yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_str(mdoc, entry, "matcher", matcher_str);
+
+    yyjson_mut_val *hooks_arr = yyjson_mut_arr(mdoc);
+    yyjson_mut_val *hook_obj = yyjson_mut_obj(mdoc);
+    yyjson_mut_obj_add_str(mdoc, hook_obj, "type", "command");
+    yyjson_mut_obj_add_str(mdoc, hook_obj, "command", command_str);
+    if (args.timeout_sec > 0) {
+        yyjson_mut_obj_add_int(mdoc, hook_obj, "timeout", args.timeout_sec);
+    }
+    yyjson_mut_arr_append(hooks_arr, hook_obj);
+    yyjson_mut_obj_add_val(mdoc, entry, "hooks", hooks_arr);
+
+    yyjson_mut_arr_append(event_arr, entry);
+
+    int rc = write_json_file(settings_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+/* Generic hook remove for both Claude Code and Gemini CLI */
+
+typedef struct {
+    const char *settings_path;
+    const char *hook_event;
+    const char *matcher_str;
+    const char *const *old_matchers;  /* NULL-terminated; may be NULL */
+    const char *match_command_substr; /* non-NULL: also require this in the
+                                       * entry command to claim ownership */
+} hooks_remove_args_t;
+static int remove_hooks_json(hooks_remove_args_t args) {
+    const char *settings_path = args.settings_path;
+    const char *hook_event = args.hook_event;
+    const char *matcher_str = args.matcher_str;
+    const char *const *old_matchers = args.old_matchers;
+    if (!settings_path) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = read_json_file(settings_path);
+    if (!doc) {
+        return CLI_ERR;
+    }
+
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root) {
+        yyjson_mut_doc_free(mdoc);
+        return CLI_ERR;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+
+    yyjson_mut_val *hooks = yyjson_mut_obj_get(root, "hooks");
+    if (!hooks) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    yyjson_mut_val *event_arr = yyjson_mut_obj_get(hooks, hook_event);
+    if (!event_arr || !yyjson_mut_is_arr(event_arr)) {
+        yyjson_mut_doc_free(mdoc);
+        return 0;
+    }
+
+    size_t idx;
+    size_t max;
+    yyjson_mut_val *item;
+    yyjson_mut_arr_foreach(event_arr, idx, max, item) {
+        if (is_cmm_hook_entry(item, matcher_str, old_matchers, args.match_command_substr)) {
+            yyjson_mut_arr_remove(event_arr, idx);
+            break;
+        }
+    }
+
+    /* Prune the event key once its array is empty, so removing our hook leaves
+     * no stale "<Event>": [] cruft behind. */
+    if (yyjson_mut_arr_size(event_arr) == 0) {
+        yyjson_mut_obj_remove_key(hooks, hook_event);
+    }
+
+    int rc = write_json_file(settings_path, mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return rc;
+}
+
+int cbm_upsert_claude_hooks(const char *settings_path) {
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command));
+    return upsert_hooks_json((hooks_upsert_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PreToolUse",
+        .matcher_str = CMM_HOOK_MATCHER,
+        .command_str = command,
+        .old_matchers = cmm_claude_old_matchers,
+        .timeout_sec = CMM_HOOK_TIMEOUT_SEC,
+    });
+}
+
+int cbm_remove_claude_hooks(const char *settings_path) {
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PreToolUse",
+        .matcher_str = CMM_HOOK_MATCHER,
+        .old_matchers = cmm_claude_old_matchers,
+    });
+}
+
+/* PostToolUse on edits: the same shim script; the binary dispatches on
+ * hook_event_name and answers with the edited file's blast radius. Fires
+ * exactly when the agent needs impact information and costs it nothing. */
+#define CMM_POST_HOOK_MATCHER "Edit|Write|MultiEdit"
+
+int cbm_upsert_claude_post_hooks(const char *settings_path) {
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command));
+    return upsert_hooks_json((hooks_upsert_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PostToolUse",
+        .matcher_str = CMM_POST_HOOK_MATCHER,
+        .command_str = command,
+        .timeout_sec = CMM_HOOK_TIMEOUT_SEC,
+        .match_command_substr = CMM_HOOK_GATE_SCRIPT,
+    });
+}
+
+int cbm_remove_claude_post_hooks(const char *settings_path) {
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = "PostToolUse",
+        .matcher_str = CMM_POST_HOOK_MATCHER,
+        .match_command_substr = CMM_HOOK_GATE_SCRIPT,
+    });
+}
+
+/* Install the search-augmenter shim to ~/.claude/hooks/.
+ * The shim is a thin wrapper that delegates to `<binary> hook-augment`,
+ * which adds graph context to Grep/Glob/Bash search calls. It NEVER blocks a
+ * tool call:
+ * a missing/old/hung binary results in a silent exit 0 (issue #362/#288).
+ * The legacy filename `cbm-code-discovery-gate` is retained so existing
+ * settings.json entries and uninstall keep working with zero migration. */
+void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
+    if (!home || !binary_path) {
+        return;
+    }
+    /* Defensive: refuse to embed a binary path containing a double-quote, which
+     * would break the BIN="..." shell quoting in the generated shim. In normal
+     * installs this is unreachable (paths come from cbm_detect_self_path), but
+     * fail-loud here beats silently emitting a malformed script. */
+    if (strchr(binary_path, '"') != NULL) {
+        return;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return;
+    }
+    char hooks_dir[CLI_BUF_1K];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
+
+    char script_path[CLI_BUF_1K];
+    snprintf(script_path, sizeof(script_path), "%s/" CMM_HOOK_GATE_SCRIPT, hooks_dir);
+
+    FILE *f = fopen(script_path, "w");
+    if (!f) {
+        return;
+    }
+    (void)fprintf(f,
+                  "#!/usr/bin/env bash\n"
+                  "# code-cortex-mcp search augmenter (Claude Code PreToolUse).\n"
+                  "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
+                  "# Despite the name this NEVER blocks a tool call - it only adds\n"
+                  "# graph context. Any failure is silent (exit 0, no output).\n"
+                  "BIN=\"%s\"\n"
+                  "[ -x \"$BIN\" ] || exit 0\n"
+                  "\"$BIN\" hook-augment 2>/dev/null\n"
+                  "exit 0\n",
+                  binary_path);
+    /* fchmod before close to avoid TOCTOU race (CodeQL cpp/toctou-race-condition) */
+#ifndef _WIN32
+    fchmod(fileno(f), CLI_OCTAL_PERM);
+#endif
+    (void)fclose(f);
+#ifdef _WIN32
+    chmod(script_path, CLI_OCTAL_PERM);
+#endif
+}
+
+/* SessionStart hook: remind agent to use MCP tools on every context reset. */
+#define CMM_SESSION_REMINDER_SCRIPT "cbm-session-reminder"
+
+static void cbm_install_session_reminder_script(const char *home, const char *binary_path) {
+    if (!home || !binary_path || strchr(binary_path, '"') != NULL) {
+        return;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return;
+    }
+    char hooks_dir[CLI_BUF_1K];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
+
+    char script_path[CLI_BUF_1K];
+    snprintf(script_path, sizeof(script_path), "%s/" CMM_SESSION_REMINDER_SCRIPT, hooks_dir);
+
+    FILE *f = fopen(script_path, "w");
+    if (!f) {
+        return;
+    }
+    /* The binary renders an architecture brief for the session's project
+     * (or a one-line "not indexed" pointer) from the hook payload on stdin.
+     * The heredoc is the fallback when the binary is gone: a short statement
+     * of what the graph is for, not a directive to use it for everything —
+     * "ALWAYS use graph tools FIRST" measurably made agents search more
+     * without ever calling the graph. */
+    (void)fprintf(f,
+                  "#!/usr/bin/env bash\n"
+                  "# SessionStart hook: code-cortex-mcp architecture brief.\n"
+                  "# Installed by code-cortex-mcp. Fires on startup/resume/clear/compact.\n"
+                  "BIN=\"%s\"\n"
+                  "if [ -x \"$BIN\" ]; then\n"
+                  "  OUT=\"$(\"$BIN\" hook-augment 2>/dev/null)\"\n"
+                  "  if [ -n \"$OUT\" ]; then printf '%%s\\n' \"$OUT\"; exit 0; fi\n"
+                  "fi\n"
+                  "cat << 'REMINDER'\n"
+                  "code-cortex-mcp is installed. Use its graph for what grep cannot do: "
+                  "inspect_symbol(<name>) for direct callers with call-site lines, related "
+                  "tests and cross-language callers; trace_path for multi-hop call chains; "
+                  "detect_changes for the blast radius of your edits. Plain grep is fine for "
+                  "text and exact identifiers. The project argument is optional inside an "
+                  "indexed repository; run index_repository once if it is not indexed.\n"
+                  "REMINDER\n",
+                  binary_path);
+#ifndef _WIN32
+    fchmod(fileno(f), CLI_OCTAL_PERM);
+#endif
+    (void)fclose(f);
+#ifdef _WIN32
+    chmod(script_path, CLI_OCTAL_PERM);
+#endif
+}
+
+static int cbm_upsert_session_hooks(const char *settings_path) {
+    static const char *matchers[] = {"startup", "resume", "clear", "compact"};
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command));
+    int rc = 0;
+    for (int i = 0; i < NUM_DIRS; i++) {
+        if (upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
+                                                    .hook_event = "SessionStart",
+                                                    .matcher_str = matchers[i],
+                                                    .command_str = command}) != 0) {
+            rc = CLI_ERR;
+        }
+    }
+    return rc;
+}
+
+static int cbm_remove_session_hooks(const char *settings_path) {
+    static const char *matchers[] = {"startup", "resume", "clear", "compact"};
+    int rc = 0;
+    for (int i = 0; i < NUM_DIRS; i++) {
+        if (remove_hooks_json((hooks_remove_args_t){.settings_path = settings_path,
+                                                    .hook_event = "SessionStart",
+                                                    .matcher_str = matchers[i]}) != 0) {
+            rc = CLI_ERR;
+        }
+    }
+    return rc;
+}
+
+/* SubagentStart hook: subagents spawned via the Agent tool do NOT fire
+ * SessionStart, so the SessionStart reminder above never reaches them. This
+ * hook is their equivalent. Unlike SessionStart (where plain stdout is injected
+ * as context), SubagentStart injects context only via a JSON object on stdout:
+ *   {"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"…"}}
+ * The text is a leaner variant of the SessionStart protocol: it omits the
+ * "run index_repository first" step, since the parent session has already
+ * indexed the project. Matcher "*" fires for every agent type. */
+#define CMM_SUBAGENT_REMINDER_SCRIPT "cbm-subagent-reminder"
+
+static void cbm_install_subagent_reminder_script(const char *home) {
+    if (!home) {
+        return;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return;
+    }
+    char hooks_dir[CLI_BUF_1K];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
+
+    char script_path[CLI_BUF_1K];
+    snprintf(script_path, sizeof(script_path), "%s/" CMM_SUBAGENT_REMINDER_SCRIPT, hooks_dir);
+
+    FILE *f = fopen(script_path, "w");
+    if (!f) {
+        return;
+    }
+    /* The additionalContext value is a single line with no embedded quotes,
+     * backslashes, or newlines, so the JSON below is valid as written — no
+     * runtime escaping (and no python3/jq dependency) is required. */
+    (void)fprintf(f,
+                  "#!/usr/bin/env bash\n"
+                  "# SubagentStart hook: tell subagents to use code-cortex-mcp tools.\n"
+                  "# Installed by code-cortex-mcp. Fires when any subagent is spawned.\n"
+                  "# SubagentStart injects context via JSON additionalContext, not plain stdout.\n"
+                  "cat << 'REMINDER'\n"
+                  "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\","
+                  "\"additionalContext\":\"code-cortex-mcp graph tools are available. Use "
+                  "inspect_symbol(<name>) for direct callers with call-site lines, related tests "
+                  "and cross-language callers; trace_path for multi-hop call chains; "
+                  "detect_changes for the blast radius of edits. Plain grep is fine for text and "
+                  "exact identifiers. The project argument is optional inside this "
+                  "repository.\"}}\n"
+                  "REMINDER\n");
+#ifndef _WIN32
+    fchmod(fileno(f), CLI_OCTAL_PERM);
+#endif
+    (void)fclose(f);
+#ifdef _WIN32
+    chmod(script_path, CLI_OCTAL_PERM);
+#endif
+}
+
+int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, command, sizeof(command));
+    /* matcher "*" is the natural choice a user would also pick for their own
+     * catch-all SubagentStart hook, so claim ownership by command too — never
+     * clobber or remove a foreign "*" entry. */
+    return upsert_hooks_json(
+        (hooks_upsert_args_t){.settings_path = settings_path,
+                              .hook_event = "SubagentStart",
+                              .matcher_str = "*",
+                              .command_str = command,
+                              .match_command_substr = CMM_SUBAGENT_REMINDER_SCRIPT});
+}
+
+int cbm_remove_claude_subagent_hooks(const char *settings_path) {
+    return remove_hooks_json(
+        (hooks_remove_args_t){.settings_path = settings_path,
+                              .hook_event = "SubagentStart",
+                              .matcher_str = "*",
+                              .match_command_substr = CMM_SUBAGENT_REMINDER_SCRIPT});
+}
+
+/* Matcher excludes read_file for consistency with the Claude fix: the hook
+ * is an advisory reminder, not a gate over the agent's file reads. */
+#define GEMINI_HOOK_MATCHER "google_search|grep_search"
+#define GEMINI_HOOK_COMMAND                                                          \
+    "echo 'code-cortex-mcp: for callers, impact, call chains or tests of a symbol, " \
+    "inspect_symbol / trace_path / detect_changes beat a text search.' >&2"
+
+int cbm_upsert_gemini_hooks(const char *settings_path) {
+    return upsert_hooks_json((hooks_upsert_args_t){
+        .settings_path = settings_path,
+        .hook_event = "BeforeTool",
+        .matcher_str = GEMINI_HOOK_MATCHER,
+        .command_str = GEMINI_HOOK_COMMAND,
+        .old_matchers = cmm_gemini_old_matchers,
+    });
+}
+
+int cbm_remove_gemini_hooks(const char *settings_path) {
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = "BeforeTool",
+        .matcher_str = GEMINI_HOOK_MATCHER,
+        .old_matchers = cmm_gemini_old_matchers,
+    });
+}
+
+/* Gemini CLI / Antigravity SessionStart reminder. settings.json uses the same
+ * hooks.<Event>[].hooks[] JSON shape as Claude, so it reuses upsert_hooks_json.
+ * The SessionStart matcher is advisory in Gemini (it does not filter lifecycle
+ * sources), so a single "startup" entry fires on startup/resume/clear. The
+ * command's stdout is injected as session context. (Gemini/Antigravity parity
+ * with the Claude/Codex SessionStart reminder.) */
+int cbm_upsert_gemini_session_hooks(const char *settings_path) {
+    return upsert_hooks_json((hooks_upsert_args_t){
+        .settings_path = settings_path,
+        .hook_event = "SessionStart",
+        .matcher_str = "startup",
+        .command_str = CMM_SESSION_REMINDER_CMD,
+    });
+}
+
+int cbm_remove_gemini_session_hooks(const char *settings_path) {
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = "SessionStart",
+        .matcher_str = "startup",
+    });
+}
+
+/* ── PATH management ──────────────────────────────────────────── */
+
+int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
+    if (!bin_dir || !rc_file) {
+        return CLI_ERR;
+    }
+
+    /* fish uses a different syntax than POSIX shells: `export PATH="...:$PATH"`
+     * is a syntax error in fish and breaks config.fish (#319). When the target
+     * is a fish config, emit the fish-native `fish_add_path` (idempotent,
+     * prepends only if absent) instead. */
+    size_t rc_len = strlen(rc_file);
+    bool is_fish = rc_len >= CBM_SZ_5 && strcmp(rc_file + rc_len - CBM_SZ_5, ".fish") == 0;
+
+    char line[CLI_BUF_1K];
+    if (is_fish) {
+        snprintf(line, sizeof(line), "fish_add_path %s", bin_dir);
+    } else {
+        snprintf(line, sizeof(line), "export PATH=\"%s:$PATH\"", bin_dir);
+    }
+
+    /* Check if already present in rc file */
+    FILE *f = fopen(rc_file, "r");
+    if (f) {
+        char buf[CLI_BUF_2K];
+        while (fgets(buf, sizeof(buf), f)) {
+            if (strstr(buf, line)) {
+                (void)fclose(f);
+                return CLI_TRUE; /* already present */
+            }
+        }
+        (void)fclose(f);
+    }
+
+    if (dry_run) {
+        return 0;
+    }
+
+    f = fopen(rc_file, "a");
+    if (!f) {
+        return CLI_ERR;
+    }
+
+    (void)fprintf(f, "\n# Added by code-cortex-mcp install\n%s\n", line);
+    (void)fclose(f);
+    return 0;
+}
+
+/* ── Tar.gz extraction ────────────────────────────────────────── */
+
+/* Decompress gzip data into a malloc'd buffer. Returns NULL on failure.
+ * *out_total receives the decompressed size. Caller must free the result. */
+static unsigned char *gzip_decompress(const unsigned char *data, int data_len, size_t *out_total) {
+    z_stream strm = {0};
+    unsigned char *mutable_data;
+    memcpy(&mutable_data, &data, sizeof(data));
+    strm.next_in = mutable_data;
+    strm.avail_in = (unsigned int)data_len;
+
+    if (inflateInit2(&strm, 16 + MAX_WBITS) != Z_OK) {
+        return NULL;
+    }
+
+    size_t buf_cap = (size_t)data_len * DECOMP_FACTOR;
+    if (buf_cap < CLI_BUF_4K) {
+        buf_cap = CLI_BUF_4K;
+    }
+    if (buf_cap > DECOMPRESS_MAX_BYTES) {
+        buf_cap = DECOMPRESS_MAX_BYTES;
+    }
+    unsigned char *decompressed = (unsigned char *)malloc(buf_cap);
+    if (!decompressed) {
+        inflateEnd(&strm);
+        return NULL;
+    }
+
+    size_t total = 0;
+    int ret;
+    do {
+        if (total >= buf_cap) {
+            size_t new_cap = buf_cap * GROWTH_FACTOR;
+            if (new_cap > DECOMPRESS_MAX_BYTES) {
+                free(decompressed);
+                inflateEnd(&strm);
+                return NULL;
+            }
+            unsigned char *nb = (unsigned char *)realloc(decompressed, new_cap);
+            if (!nb) {
+                free(decompressed);
+                inflateEnd(&strm);
+                return NULL;
+            }
+            decompressed = nb;
+            buf_cap = new_cap;
+        }
+        strm.next_out = decompressed + total;
+        strm.avail_out = (unsigned int)(buf_cap - total);
+        ret = inflate(&strm, Z_NO_FLUSH);
+        total = buf_cap - strm.avail_out;
+    } while (ret == Z_OK);
+
+    inflateEnd(&strm);
+
+    if (ret != Z_STREAM_END) {
+        free(decompressed);
+        return NULL;
+    }
+    *out_total = total;
+    return decompressed;
+}
+
+/* Check if a tar block is all zeros (end of archive). */
+static bool is_tar_end_of_archive(const unsigned char *hdr) {
+    for (int i = 0; i < TAR_BLOCK_SIZE; i++) {
+        if (hdr[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Try to extract the target binary from a tar entry. Returns malloc'd data or NULL. */
+static unsigned char *tar_try_extract_binary(const unsigned char *hdr, char typeflag,
+                                             const char *name, const unsigned char *archive,
+                                             size_t data_pos, long file_size, size_t total,
+                                             int *out_len) {
+    (void)hdr;
+    if (typeflag != '0' && typeflag != '\0') {
+        return NULL;
+    }
+    const char *basename = strrchr(name, '/');
+    basename = basename ? basename + CLI_SKIP_ONE : name;
+    if (strncmp(basename, TAR_BINARY_NAME, TAR_BINARY_NAME_LEN) != 0) {
+        return NULL;
+    }
+    if (data_pos + (size_t)file_size > total) {
+        return NULL;
+    }
+    unsigned char *result = (unsigned char *)malloc((size_t)file_size);
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, archive + data_pos, (size_t)file_size);
+    *out_len = (int)file_size;
+    return result;
+}
+
+unsigned char *cbm_extract_binary_from_targz(const unsigned char *data, int data_len,
+                                             int *out_len) {
+    if (!data || data_len <= 0 || !out_len) {
+        return NULL;
+    }
+
+    size_t total = 0;
+    unsigned char *decompressed = gzip_decompress(data, data_len, &total);
+    if (!decompressed) {
+        return NULL;
+    }
+
+    /* Parse tar: find entry starting with "code-cortex-mcp" */
+    size_t pos = 0;
+    while (pos + TAR_BLOCK_SIZE <= total) {
+        const unsigned char *hdr = decompressed + pos;
+
+        if (is_tar_end_of_archive(hdr)) {
+            break;
+        }
+
+        char name[TAR_NAME_LEN] = {0};
+        memcpy(name, hdr, TAR_NAME_LEN - SKIP_ONE);
+        char size_str[TAR_SIZE_LEN] = {0};
+        memcpy(size_str, hdr + TAR_SIZE_OFFSET, TAR_SIZE_LEN - SKIP_ONE);
+        long file_size = strtol(size_str, NULL, OCTAL_BASE);
+        char typeflag = (char)hdr[TAR_TYPE_OFFSET];
+        pos += TAR_BLOCK_SIZE;
+
+        unsigned char *found = tar_try_extract_binary(hdr, typeflag, name, decompressed, pos,
+                                                      file_size, total, out_len);
+        if (found) {
+            free(decompressed);
+            return found;
+        }
+
+        size_t blocks = ((size_t)file_size + TAR_BLOCK_MASK) / TAR_BLOCK_SIZE;
+        pos += blocks * TAR_BLOCK_SIZE;
+    }
+
+    free(decompressed);
+    return NULL; /* binary not found */
+}
+
+/* ── Zip extraction (in-memory, replaces external unzip) ──────── */
+
+/* Zip local file header constants */
+enum {
+    ZIP_SIG_0 = 0x50,
+    ZIP_SIG_1 = 0x4B,
+    ZIP_SIG_2 = 0x03,
+    ZIP_SIG_3 = 0x04,
+    ZIP_HDR_SZ = 30,
+    ZIP_OFF_METHOD = 8,
+    ZIP_OFF_COMP = 18,
+    ZIP_OFF_UNCOMP = 22,
+    ZIP_OFF_NAMELEN = 26,
+    ZIP_OFF_EXTRALEN = 28,
+    ZIP_STORED = 0,
+    ZIP_DEFLATE = 8
+};
+static const size_t ZIP_MAX_UNCOMP = 500U * 1024U * 1024U;
+
+static uint16_t zip_read_u16le(const unsigned char *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << BYTE_SHIFT));
+}
+
+static uint32_t zip_read_u32le(const unsigned char *p) {
+    return ((uint32_t)p[0]) | ((uint32_t)p[1] << BYTE_SHIFT) |
+           ((uint32_t)p[2] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
+           ((uint32_t)p[3] << (BYTE_SHIFT * CLI_JSON_INDENT));
+}
+
+/* Decompress a single zip entry (stored or deflated). Returns malloc'd buffer
+ * or NULL on failure. *out_len receives the decompressed size. */
+static unsigned char *zip_extract_entry(const unsigned char *file_data, uint16_t method,
+                                        size_t comp_size, size_t uncomp_size, int *out_len) {
+    if (method == ZIP_STORED) {
+        if (comp_size > ZIP_MAX_UNCOMP) {
+            return NULL;
+        }
+        unsigned char *out = (unsigned char *)malloc(comp_size);
+        if (!out) {
+            return NULL;
+        }
+        memcpy(out, file_data, comp_size);
+        *out_len = (int)comp_size;
+        return out;
+    }
+    if (method == ZIP_DEFLATE) {
+        if (uncomp_size > ZIP_MAX_UNCOMP) {
+            return NULL;
+        }
+        if (comp_size > UINT_MAX || uncomp_size > UINT_MAX) {
+            return NULL;
+        }
+        unsigned char *out = (unsigned char *)malloc(uncomp_size);
+        if (!out) {
+            return NULL;
+        }
+        z_stream strm = {0};
+        strm.next_in = (unsigned char *)file_data;
+        strm.avail_in = (uInt)comp_size;
+        strm.next_out = out;
+        strm.avail_out = (uInt)uncomp_size;
+        if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
+            free(out);
+            return NULL;
+        }
+        int ret = inflate(&strm, Z_FINISH);
+        inflateEnd(&strm);
+        if (ret != Z_STREAM_END) {
+            free(out);
+            return NULL;
+        }
+        *out_len = (int)strm.total_out;
+        return out;
+    }
+    return NULL; /* unknown method */
+}
+
+unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_len, int *out_len) {
+    if (!data || data_len <= 0 || !out_len) {
+        return NULL;
+    }
+    *out_len = 0;
+
+    int pos = 0;
+    while (pos + ZIP_HDR_SZ <= data_len) {
+        if (data[pos] != ZIP_SIG_0 || data[pos + CLI_SKIP_ONE] != ZIP_SIG_1 ||
+            data[pos + CLI_PAIR_LEN] != ZIP_SIG_2 || data[pos + CLI_JSON_INDENT] != ZIP_SIG_3) {
+            break;
+        }
+
+        uint16_t method = zip_read_u16le(data + pos + ZIP_OFF_METHOD);
+        uint32_t comp_size = zip_read_u32le(data + pos + ZIP_OFF_COMP);
+        uint32_t uncomp_size = zip_read_u32le(data + pos + ZIP_OFF_UNCOMP);
+        uint16_t name_len = zip_read_u16le(data + pos + ZIP_OFF_NAMELEN);
+        uint16_t extra_len = zip_read_u16le(data + pos + ZIP_OFF_EXTRALEN);
+
+        int header_end = pos + ZIP_HDR_SZ + name_len + extra_len;
+        if (header_end > data_len || comp_size > (uint32_t)(data_len - header_end)) {
+            break;
+        }
+
+        char fname[CLI_BUF_512] = {0};
+        int fn_copy = name_len < (int)sizeof(fname) - CLI_SKIP_ONE
+                          ? name_len
+                          : (int)sizeof(fname) - CLI_SKIP_ONE;
+        memcpy(fname, data + pos + 30, (size_t)fn_copy);
+        fname[fn_copy] = '\0';
+
+        if (strstr(fname, "..")) {
+            pos = header_end + (int)comp_size;
+            continue;
+        }
+
+        const char *basename = strrchr(fname, '/');
+        basename = basename ? basename + CLI_SKIP_ONE : fname;
+
+        if (strcmp(basename, "code-cortex-mcp") == 0 ||
+            strcmp(basename, "code-cortex-mcp.exe") == 0) {
+            return zip_extract_entry(data + header_end, method, comp_size, uncomp_size, out_len);
+        }
+
+        pos = header_end + (int)comp_size;
+    }
+
+    return NULL;
+}
+
+/* ── Index management ─────────────────────────────────────────── */
+
+static const char *get_cache_dir(const char *home_dir) {
+    static char buf[CLI_BUF_1K];
+    if (!home_dir) {
+        home_dir = cbm_get_home_dir();
+    }
+    if (!home_dir) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s", cbm_resolve_cache_dir());
+    return buf;
+}
+
+int cbm_list_indexes(const char *home_dir) {
+    const char *cache_dir = get_cache_dir(home_dir);
+    if (!cache_dir) {
+        return 0;
+    }
+
+    cbm_dir_t *d = cbm_opendir(cache_dir);
+    if (!d) {
+        return 0;
+    }
+
+    int count = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        size_t len = strlen(ent->name);
+        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+            printf("  %s/%s\n", cache_dir, ent->name);
+            count++;
+        }
+    }
+    cbm_closedir(d);
+    return count;
+}
+
+static int remove_indexes_in_dir(const char *cache_dir) {
+    if (!cache_dir) {
+        return 0;
+    }
+
+    cbm_dir_t *d = cbm_opendir(cache_dir);
+    if (!d) {
+        return 0;
+    }
+
+    int count = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        size_t len = strlen(ent->name);
+        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+            char path[CLI_BUF_1K];
+            snprintf(path, sizeof(path), "%s/%s", cache_dir, ent->name);
+            cbm_db_lease_t *lease = NULL;
+            int claim_rc = cbm_db_lease_try_acquire(path, &lease);
+            if (claim_rc != 0) {
+                fprintf(stderr, "Keeping index %s: %s.\n", path,
+                        claim_rc == CBM_INDEX_BUSY ? "database busy" : "cannot acquire lease");
+                continue;
+            }
+            // Lock the referent, but remove only the requested cache entry and
+            // its sidecars; a symlink must not broaden deletion outside cache.
+            const char *target = path;
+            /* Also remove the old temporary generation, under the same lease. */
+            char tmp_path[CLI_FIELD_1040];
+            snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target);
+            if (cbm_unlink(target) == 0) {
+                cbm_unlink(tmp_path);
+                cbm_remove_db_sidecars(target);
+                count++;
+            }
+            cbm_db_lease_release(lease);
+        }
+    }
+    cbm_closedir(d);
+    return count;
+}
+
+int cbm_remove_indexes(const char *home_dir) {
+    return remove_indexes_in_dir(get_cache_dir(home_dir));
+}
+
+/* ── Config store (persistent key-value in _config.db) ─────────── */
+
+#include <sqlite3.h>
+
+struct cbm_config {
+    sqlite3 *db;
+    char get_buf[CLI_BUF_4K]; /* static buffer for cbm_config_get return values */
+};
+
+cbm_config_t *cbm_config_open(const char *cache_dir) {
+    if (!cache_dir) {
+        return NULL;
+    }
+
+    char dbpath[CLI_BUF_1K];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", cache_dir);
+
+    /* Ensure directory exists */
+    mkdirp(cache_dir, DIR_PERMS);
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open(dbpath, &db) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return NULL;
+    }
+
+    /* Create table if not exists */
+    const char *sql = "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)";
+    char *err_msg = NULL;
+    if (sqlite3_exec(db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
+        sqlite3_free(err_msg);
+        sqlite3_close(db);
+        return NULL;
+    }
+
+    cbm_config_t *cfg = (cbm_config_t *)calloc(CBM_ALLOC_ONE, sizeof(*cfg));
+    if (!cfg) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    cfg->db = db;
+    return cfg;
+}
+
+void cbm_config_close(cbm_config_t *cfg) {
+    if (!cfg) {
+        return;
+    }
+    if (cfg->db) {
+        sqlite3_close(cfg->db);
+    }
+    free(cfg);
+}
+
+const char *cbm_config_get(cbm_config_t *cfg, const char *key, const char *default_val) {
+    if (!cfg || !key) {
+        return default_val;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "SELECT value FROM config WHERE key = ?", SQL_NUL_TERM, &stmt,
+                           NULL) != SQLITE_OK) {
+        return default_val;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
+
+    const char *result = default_val;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *val = (const char *)sqlite3_column_text(stmt, 0);
+        if (val) {
+            snprintf(cfg->get_buf, sizeof(cfg->get_buf), "%s", val);
+            result = cfg->get_buf;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
+    const char *val = cbm_config_get(cfg, key, NULL);
+    if (!val) {
+        return default_val;
+    }
+    if (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "on") == 0) {
+        return true;
+    }
+    if (strcmp(val, "false") == 0 || strcmp(val, "0") == 0 || strcmp(val, "off") == 0) {
+        return false;
+    }
+    return default_val;
+}
+
+int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
+    const char *val = cbm_config_get(cfg, key, NULL);
+    if (!val) {
+        return default_val;
+    }
+    char *endptr;
+    long v = strtol(val, &endptr, CLI_STRTOL_BASE);
+    if (endptr == val || *endptr != '\0') {
+        return default_val;
+    }
+    return (int)v;
+}
+
+int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value) {
+    if (!cfg || !key || !value) {
+        return CLI_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                           SQL_NUL_TERM, &stmt, NULL) != SQLITE_OK) {
+        return CLI_ERR;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
+    sqlite3_bind_text(stmt, SQL_PARAM_2, value, SQL_NUL_TERM, cbm_sqlite_transient);
+
+    int rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : CLI_ERR;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_config_delete(cbm_config_t *cfg, const char *key) {
+    if (!cfg || !key) {
+        return CLI_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(cfg->db, "DELETE FROM config WHERE key = ?", SQL_NUL_TERM, &stmt,
+                           NULL) != SQLITE_OK) {
+        return CLI_ERR;
+    }
+    sqlite3_bind_text(stmt, SQL_PARAM_1, key, SQL_NUL_TERM, cbm_sqlite_transient);
+
+    int rc = sqlite3_step(stmt) == SQLITE_DONE ? 0 : CLI_ERR;
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+/* ── Config CLI subcommand ────────────────────────────────────── */
+
+int cbm_cmd_config(int argc, char **argv) {
+    /* NULL argv with a nonzero argc previously slipped past this guard and
+     * dereferenced argv[0] below -- caught by the clang-analyzer lane. */
+    if (argc == 0 || !argv) {
+        printf("Usage: code-cortex-mcp config <command> [args]\n\n");
+        printf("Commands:\n");
+        printf("  list             Show all config values\n");
+        printf("  get <key>        Get a config value\n");
+        printf("  set <key> <val>  Set a config value\n");
+        printf("  reset <key>      Reset a key to default\n\n");
+        printf("Config keys:\n");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
+               "Enable auto-indexing on MCP session start");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
+               "Max files for auto-indexing new projects");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
+               "Register background git watcher on session connect");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
+               "Pin graph UI language: en, zh, or auto");
+        return 0;
+    }
+
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
+        return CLI_TRUE;
+    }
+
+    char cache_dir[CLI_BUF_1K];
+    snprintf(cache_dir, sizeof(cache_dir), "%s", cbm_resolve_cache_dir());
+
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    if (!cfg) {
+        (void)fprintf(stderr, "error: cannot open config database\n");
+        return CLI_TRUE;
+    }
+
+    int rc = 0;
+    if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
+        printf("Configuration:\n");
+        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
+               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
+               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
+               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
+               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+    } else if (strcmp(argv[0], "get") == 0) {
+        if (argc < MIN_ARGC_GET) {
+            (void)fprintf(stderr, "Usage: config get <key>\n");
+            rc = CLI_TRUE;
+        } else {
+            printf("%s\n", cbm_config_get(cfg, argv[CLI_SKIP_ONE], ""));
+        }
+    } else if (strcmp(argv[0], "set") == 0) {
+        if (argc < MIN_ARGC_CMD) {
+            (void)fprintf(stderr, "Usage: config set <key> <value>\n");
+            rc = CLI_TRUE;
+        } else {
+            if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
+                printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
+            } else {
+                (void)fprintf(stderr, "error: failed to set %s\n", argv[CLI_SKIP_ONE]);
+                rc = CLI_TRUE;
+            }
+        }
+    } else if (strcmp(argv[0], "reset") == 0) {
+        if (argc < MIN_ARGC_GET) {
+            (void)fprintf(stderr, "Usage: config reset <key>\n");
+            rc = CLI_TRUE;
+        } else {
+            cbm_config_delete(cfg, argv[CLI_SKIP_ONE]);
+            printf("%s reset to default\n", argv[CLI_SKIP_ONE]);
+        }
+    } else {
+        (void)fprintf(stderr, "Unknown config command: %s\n", argv[0]);
+        rc = CLI_TRUE;
+    }
+
+    cbm_config_close(cfg);
+    return rc;
+}
+
+/* ── Interactive prompt ───────────────────────────────────────── */
+
+/* Global auto-answer mode: 0=interactive, 1=always yes, -1=always no */
+static int g_auto_answer = 0;
+
+/* Test seam: force the auto-answer state so non-interactive bug-repro tests
+ * can drive prompt_yn() deterministically (1 => yes, -1 => no, 0 => prompt).
+ * Not declared in cli.h (internal); the repro runner links cli.c directly and
+ * carries an extern forward declaration. Production never calls this. */
+extern "C" void cbm_set_auto_answer_for_test(int value);
+extern "C" void cbm_set_auto_answer_for_test(int value) {
+    g_auto_answer = value;
+}
+
+static void parse_auto_answer(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
+            g_auto_answer = AUTO_YES;
+        }
+        if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no") == 0) {
+            g_auto_answer = AUTO_NO;
+        }
+    }
+}
+
+static bool prompt_yn(const char *question) {
+    if (g_auto_answer == AUTO_YES) {
+        printf("%s (y/n): y (auto)\n", question);
+        return true;
+    }
+    if (g_auto_answer == AUTO_NO) {
+        printf("%s (y/n): n (auto)\n", question);
+        return false;
+    }
+
+    /* Non-interactive stdin: default to "no" to avoid hanging */
+#ifndef _WIN32
+    if (!isatty(fileno(stdin))) {
+        (void)fprintf(stderr,
+                      "error: interactive prompt requires a terminal. Use -y or -n flags.\n");
+        return false;
+    }
+#endif
+
+    printf("%s (y/n): ", question);
+    (void)fflush(stdout);
+
+    char buf[CLI_BUF_16];
+    if (!fgets(buf, sizeof(buf), stdin)) {
+        return false;
+    }
+    return (buf[0] == 'y' || buf[0] == 'Y') ? true : false;
+}
+
+/* ── SHA-256 checksum verification ─────────────────────────────── */
+
+/* SHA-256 hex digest: 64 hex chars + NUL */
+#define SHA256_HEX_LEN CBM_SZ_64
+#define SHA256_BUF_SIZE (SHA256_HEX_LEN + CLI_SKIP_ONE)
+/* Minimum line length in checksums.txt: 64 hex + 2 spaces + 1 char filename */
+#define CHECKSUM_LINE_MIN (SHA256_HEX_LEN + 2)
+
+/* Compute the SHA-256 of a file in-process (no external hashing tool — those
+ * differ per OS, may be absent, and mis-quote paths under cmd.exe). Writes a
+ * 64-char hex digest + NUL to out. Returns 0 on success. Not static:
+ * exercised directly by the self-update checksum regression test. */
+extern "C" int cbm_cli_sha256_file(const char *path, char *out, size_t out_size);
+extern "C" int cbm_cli_sha256_file(const char *path, char *out, size_t out_size) {
+    if (out_size < SHA256_BUF_SIZE) {
+        return CLI_ERR;
+    }
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return CLI_ERR;
+    }
+    cbm_sha256_ctx ctx;
+    cbm_sha256_init(&ctx);
+    unsigned char buf[CLI_BUF_1K];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        cbm_sha256_update(&ctx, buf, n);
+    }
+    int read_err = ferror(fp);
+    fclose(fp);
+    if (read_err) {
+        return CLI_ERR;
+    }
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_final(&ctx, digest);
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[SHA256_HEX_LEN] = '\0';
+    return 0;
+}
+
+/* ── Download helper (shell-free curl via exec) ───────────────── */
+
+static int cbm_download_to_file(const char *url, const char *dest) {
+    const char *argv[] = {"curl", "-fSL", "--progress-bar", "-o", dest, url, NULL};
+    return cbm_exec_no_shell(argv);
+}
+
+static int cbm_download_to_file_quiet(const char *url, const char *dest) {
+    const char *argv[] = {"curl", "-fsSL", "-o", dest, url, NULL};
+    return cbm_exec_no_shell(argv);
+}
+
+/* ── macOS ad-hoc signing ─────────────────────────────────────── */
+
+#ifdef __APPLE__
+static int cbm_macos_adhoc_sign(const char *binary_path) {
+    /* Remove quarantine xattr (best effort — may not exist) */
+    const char *xattr_argv[] = {"xattr", "-d", "com.apple.quarantine", binary_path, NULL};
+    (void)cbm_exec_no_shell(xattr_argv);
+
+    /* Ad-hoc sign (required for arm64, harmless for x86_64) */
+    const char *sign_argv[] = {"codesign", "--sign", "-", "--force", binary_path, NULL};
+    return cbm_exec_no_shell(sign_argv);
+}
+#endif
+
+/* ── Kill other MCP server instances ──────────────────────────── */
+
+static int cbm_kill_other_instances(void) {
+    /* Also match the pre-rename binary name so migration can stop (and, on
+     * Windows, delete) legacy servers still running under the old name. */
+#ifdef _WIN32
+    /* taskkill /IM kills ALL matching processes INCLUDING self.
+     * Use /FI filter to exclude our own PID. */
+    char pid_filter[CBM_SZ_64];
+    snprintf(pid_filter, sizeof(pid_filter), "PID ne %lu", (unsigned long)GetCurrentProcessId());
+    const char *argv[] = {"taskkill", "/F",       "/FI", "IMAGENAME eq code-cortex-mcp.exe",
+                          "/FI",      pid_filter, NULL};
+    (void)cbm_exec_no_shell(argv);
+    const char *argv_legacy[] = {
+        "taskkill", "/F", "/FI", "IMAGENAME eq codebase-memory-mcp.exe", "/FI", pid_filter, NULL};
+    (void)cbm_exec_no_shell(argv_legacy);
+    return 0;
+#else
+    int killed = 0;
+    pid_t self = getpid();
+    static const char *const pgrep_cmds[] = {"pgrep -x code-cortex-mcp",
+                                             "pgrep -x codebase-memory-mcp", NULL};
+    for (int c = 0; pgrep_cmds[c]; c++) {
+        FILE *fp = cbm_popen(pgrep_cmds[c], "r");
+        if (!fp) {
+            continue;
+        }
+        char line[CLI_BUF_32];
+        while (fgets(line, sizeof(line), fp)) {
+            pid_t pid = (pid_t)strtol(line, NULL, CLI_STRTOL_BASE);
+            if (pid > 0 && pid != self) {
+                if (kill(pid, SIGTERM) == 0) {
+                    killed++;
+                }
+            }
+        }
+        cbm_pclose(fp);
+    }
+    return killed;
+#endif
+}
+
+/* Download checksums.txt and verify the archive integrity.
+ * Returns: 0 = verified OK, 1 = mismatch (FAIL), -1 = could not verify (warning). */
+static int verify_download_checksum(const char *archive_path, const char *archive_name) {
+    char checksum_file[CLI_BUF_256];
+    snprintf(checksum_file, sizeof(checksum_file), "%s/cbm-checksums.txt", cbm_tmpdir());
+
+    char dl_base_buf[CLI_BUF_512];
+    const char *dl_base =
+        cbm_safe_getenv("CBM_DOWNLOAD_URL", dl_base_buf, sizeof(dl_base_buf), NULL);
+    char checksum_url[CLI_BUF_512];
+    if (dl_base && dl_base[0]) {
+        snprintf(checksum_url, sizeof(checksum_url), "%s/checksums.txt", dl_base);
+    } else {
+        snprintf(checksum_url, sizeof(checksum_url), "%s",
+                 "https://github.com/tigercosmos/code-cortex-mcp/releases/latest/download/"
+                 "checksums.txt");
+    }
+    int rc = cbm_download_to_file_quiet(checksum_url, checksum_file);
+    if (rc != 0) {
+        (void)fprintf(stderr,
+                      "warning: could not download checksums.txt — skipping verification\n");
+        cbm_unlink(checksum_file);
+        return CLI_ERR;
+    }
+
+    FILE *fp = fopen(checksum_file, "r");
+    cbm_unlink(checksum_file);
+    if (!fp) {
+        return CLI_ERR;
+    }
+
+    char expected[SHA256_BUF_SIZE] = {0};
+    char line[CLI_BUF_512];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Format: <CBM_SZ_64-char sha256>  <filename>\n */
+        if (strlen(line) > CHECKSUM_LINE_MIN && strstr(line, archive_name)) {
+            memcpy(expected, line, SHA256_HEX_LEN);
+            expected[SHA256_HEX_LEN] = '\0';
+            break;
+        }
+    }
+    (void)fclose(fp);
+
+    if (expected[0] == '\0') {
+        (void)fprintf(stderr, "warning: %s not found in checksums.txt\n", archive_name);
+        return CLI_ERR;
+    }
+
+    char actual[SHA256_BUF_SIZE] = {0};
+    if (cbm_cli_sha256_file(archive_path, actual, sizeof(actual)) != 0) {
+        (void)fprintf(stderr, "error: could not compute checksum (sha256 tool unavailable)\n");
+        return CLI_ERR;
+    }
+
+    if (strcmp(expected, actual) != 0) {
+        (void)fprintf(stderr, "error: CHECKSUM MISMATCH — downloaded binary may be compromised!\n");
+        (void)fprintf(stderr, "  expected: %s\n", expected);
+        (void)fprintf(stderr, "  actual:   %s\n", actual);
+        return CLI_TRUE;
+    }
+
+    printf("Checksum verified: %s\n", actual);
+    return 0;
+}
+
+/* ── Detect OS/arch for download URL ──────────────────────────── */
+
+static const char *detect_os(void) {
+#ifdef _WIN32
+    return "windows";
+#elif defined(__APPLE__)
+    return "darwin";
+#else
+    return "linux";
+#endif
+}
+
+static const char *detect_arch(void) {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return "arm64";
+#else
+    return "amd64";
+#endif
+}
+
+/* ── Agent config install/refresh (shared by install + update) ── */
+
+/* Print detected agent names on a single line. */
+static void print_detected_agents(const cbm_detected_agents_t *a) {
+    struct {
+        bool flag;
+        const char *name;
+    } agents[] = {
+        {a->claude_code, "Claude-Code"},
+        {a->codex, "Codex"},
+        {a->gemini, "Gemini-CLI"},
+        {a->zed, "Zed"},
+        {a->opencode, "OpenCode"},
+        {a->antigravity, "Antigravity"},
+        {a->aider, "Aider"},
+        {a->kilocode, "KiloCode"},
+        {a->vscode, "VS-Code"},
+        {a->cursor, "Cursor"},
+        {a->openclaw, "OpenClaw"},
+        {a->kiro, "Kiro"},
+        {a->junie, "Junie"},
+    };
+    printf("Detected agents:");
+    bool any = false;
+    for (int i = 0; i < (int)(sizeof(agents) / sizeof(agents[0])); i++) {
+        if (agents[i].flag) {
+            printf(" %s", agents[i].name);
+            any = true;
+        }
+    }
+    if (!any) {
+        printf(" (none)");
+    }
+    printf("\n\n");
+}
+
+/* Install Claude Code-specific configs (skills, MCP, hooks). */
+/* ── Install plan recorder (issue #388) ────────────────────────────
+ * When g_install_plan != NULL, the install path runs as a dry-run and each
+ * write site records its planned target HERE — at the same point it would
+ * perform the write — so the emitted plan cannot drift from actual install
+ * behavior (it is the same code path with mutations disabled). */
+typedef struct {
+    char agent[CLI_BUF_32];
+    char kind[CLI_BUF_32]; /* mcp_config | instructions | skills | hook */
+    char path[CLI_BUF_1K];
+} cbm_plan_entry_t;
+
+typedef struct {
+    cbm_plan_entry_t *items;
+    int count;
+    int cap;
+} cbm_install_plan_t;
+
+static cbm_install_plan_t *g_install_plan = NULL;
+
+static void plan_record(const char *agent, const char *kind, const char *path) {
+    if (!g_install_plan || !path || !path[0]) {
+        return;
+    }
+    cbm_install_plan_t *pl = g_install_plan;
+    if (pl->count >= pl->cap) {
+        int ncap = pl->cap ? pl->cap * 2 : CLI_BUF_16;
+        cbm_plan_entry_t *ni = (cbm_plan_entry_t *)realloc(pl->items, (size_t)ncap * sizeof(*ni));
+        if (!ni) {
+            return;
+        }
+        pl->items = ni;
+        pl->cap = ncap;
+    }
+    cbm_plan_entry_t *e = &pl->items[pl->count++];
+    snprintf(e->agent, sizeof(e->agent), "%s", agent);
+    snprintf(e->kind, sizeof(e->kind), "%s", kind);
+    snprintf(e->path, sizeof(e->path), "%s", path);
+}
+
+static void install_claude_code_config(const char *home, const char *binary_path, bool force,
+                                       bool dry_run) {
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    char user_root[CLI_BUF_1K];
+    cbm_claude_user_root(home, user_root, sizeof(user_root));
+
+    char skills_dir[CLI_BUF_1K];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
+
+    /* Plan mode: record the planned writes and return without mutating (#388). */
+    if (g_install_plan) {
+        char p[CLI_BUF_1K];
+        plan_record("Claude Code", "skills", skills_dir);
+        snprintf(p, sizeof(p), "%s/.mcp.json", config_dir);
+        plan_record("Claude Code", "mcp_config", p);
+        snprintf(p, sizeof(p), "%s/.claude.json", user_root);
+        plan_record("Claude Code", "mcp_config", p);
+        snprintf(p, sizeof(p), "%s/settings.json", config_dir);
+        plan_record("Claude Code", "mcp_config", p);
+        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
+        plan_record("Claude Code", "hook", p);
+        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
+        plan_record("Claude Code", "hook", p);
+        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SUBAGENT_REMINDER_SCRIPT);
+        plan_record("Claude Code", "hook", p);
+        return;
+    }
+
+    printf("Claude Code:\n");
+
+    int skill_count = cbm_install_skills(skills_dir, force, dry_run);
+    printf("  skills: %d installed\n", skill_count);
+
+    if (cbm_remove_old_monolithic_skill(skills_dir, dry_run)) {
+        printf("  removed old monolithic skill\n");
+    }
+
+    char mcp_path[CLI_BUF_1K];
+    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
+    if (!dry_run) {
+        cbm_install_editor_mcp(binary_path, mcp_path);
+    }
+    printf("  mcp: %s\n", mcp_path);
+
+    char mcp_path2[CLI_BUF_1K];
+    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
+    if (!dry_run) {
+        cbm_install_editor_mcp(binary_path, mcp_path2);
+    }
+    printf("  mcp: %s\n", mcp_path2);
+
+    char settings_path[CLI_BUF_1K];
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    if (!dry_run) {
+        cbm_upsert_claude_hooks(settings_path);
+        cbm_upsert_claude_post_hooks(settings_path);
+        cbm_install_hook_gate_script(home, binary_path);
+        cbm_install_session_reminder_script(home, binary_path);
+        cbm_upsert_session_hooks(settings_path);
+        cbm_install_subagent_reminder_script(home);
+        cbm_upsert_claude_subagent_hooks(settings_path);
+    }
+    printf("  hooks: PreToolUse (Grep/Glob/Bash: exact-symbol facts grep cannot show; "
+           "Read: coverage note; non-blocking)\n");
+    printf("  hooks: PostToolUse (Edit/Write/MultiEdit: blast radius of the edited file)\n");
+    printf("  hooks: SessionStart (architecture brief on startup/resume/clear/compact)\n");
+    printf("  hooks: SubagentStart (when to use the graph, for subagents)\n");
+
+    /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
+     * still exists, mention it so users can clean up stale artifacts. */
+    if (home && home[0]) {
+        char legacy_dir[CLI_BUF_1K];
+        snprintf(legacy_dir, sizeof(legacy_dir), "%s/.claude", home);
+        if (strcmp(legacy_dir, config_dir) != 0 && dir_exists(legacy_dir)) {
+            (void)fprintf(stderr,
+                          "  note: $CLAUDE_CONFIG_DIR=%s used; legacy %s still exists.\n"
+                          "        Remove stale {skills,hooks,settings.json,.mcp.json} there if "
+                          "no longer needed.\n",
+                          config_dir, legacy_dir);
+        }
+    }
+}
+
+/* Install MCP config + optional instructions for a generic agent. */
+static void install_generic_agent_config(const char *label, const char *binary_path,
+                                         const char *config_path, const char *instr_path,
+                                         bool dry_run,
+                                         int (*install_mcp)(const char *, const char *)) {
+    /* Plan mode: record planned writes, mutate nothing (#388). */
+    if (g_install_plan) {
+        plan_record(label, "mcp_config", config_path);
+        if (instr_path) {
+            plan_record(label, "instructions", instr_path);
+        }
+        return;
+    }
+    printf("%s:\n", label);
+    if (!dry_run) {
+        install_mcp(binary_path, config_path);
+    }
+    printf("  mcp: %s\n", config_path);
+    if (instr_path) {
+        if (!dry_run) {
+            cbm_upsert_instructions(instr_path, agent_instructions_content);
+        }
+        printf("  instructions: %s\n", instr_path);
+    }
+}
+
+/* Install MCP configs for CLI-based agents (Codex, Gemini, OpenCode, Antigravity, Aider). */
+/* Install Gemini CLI config with hooks. */
+static void install_gemini_config(const char *home, const char *binary_path, bool dry_run) {
+    char cp[CLI_BUF_1K];
+    char ip[CLI_BUF_1K];
+    snprintf(cp, sizeof(cp), "%s/.gemini/settings.json", home);
+    snprintf(ip, sizeof(ip), "%s/.gemini/GEMINI.md", home);
+    install_generic_agent_config("Gemini CLI", binary_path, cp, ip, dry_run,
+                                 cbm_install_editor_mcp);
+    if (g_install_plan) {
+        plan_record("Gemini CLI", "hook", cp); /* BeforeTool + SessionStart in settings.json */
+        return;
+    }
+    if (!dry_run) {
+        cbm_upsert_gemini_hooks(cp);
+        cbm_upsert_gemini_session_hooks(cp);
+    }
+    printf("  hooks: BeforeTool + SessionStart (code-cortex-mcp reminder)\n");
+}
+
+static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const char *home,
+                                      const char *binary_path, bool dry_run) {
+    if (agents->codex) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.codex/config.toml", home);
+        snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
+        install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
+                                     cbm_upsert_codex_mcp);
+        /* Choose the hook target: if ~/.codex/hooks.json already exists, the
+         * user manages Codex hooks via the JSON representation — write the
+         * SessionStart reminder there instead of config.toml. Writing both
+         * makes Codex warn about loading hooks from two representations (#570).
+         * config.toml remains the mcp_config target above either way. */
+        char hooks_json[CLI_BUF_1K];
+        snprintf(hooks_json, sizeof(hooks_json), "%s/.codex/hooks.json", home);
+        bool use_hooks_json = cbm_file_exists(hooks_json);
+        const char *hook_target = use_hooks_json ? hooks_json : cp;
+        if (g_install_plan) {
+            plan_record("Codex CLI", "hook", hook_target);
+        } else {
+            if (!dry_run) {
+                if (use_hooks_json) {
+                    cbm_upsert_gemini_session_hooks(hooks_json);
+                } else {
+                    cbm_upsert_codex_hooks(cp);
+                }
+            }
+            printf("  hooks: SessionStart (code-cortex-mcp reminder)\n");
+        }
+    }
+    if (agents->gemini) {
+        install_gemini_config(home, binary_path, dry_run);
+    }
+    if (agents->opencode) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.config/opencode/opencode.json", home);
+        snprintf(ip, sizeof(ip), "%s/.config/opencode/AGENTS.md", home);
+        install_generic_agent_config("OpenCode", binary_path, cp, ip, dry_run,
+                                     cbm_upsert_opencode_mcp);
+    }
+    if (agents->antigravity) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        /* MCP config is the SHARED Antigravity config (CLI + IDE), not a
+         * per-tool file (2026 unification). */
+        snprintf(cp, sizeof(cp), "%s/.gemini/config/mcp_config.json", home);
+        snprintf(ip, sizeof(ip), "%s/.gemini/antigravity-cli/AGENTS.md", home);
+        if (!dry_run && !g_install_plan) {
+            char cfg_dir[CLI_BUF_1K];
+            snprintf(cfg_dir, sizeof(cfg_dir), "%s/.gemini/config", home);
+            cbm_mkdir_p(cfg_dir, CLI_OCTAL_PERM);
+        }
+        install_generic_agent_config("Antigravity", binary_path, cp, ip, dry_run,
+                                     cbm_upsert_antigravity_mcp);
+        /* Antigravity CLI is Gemini-lineage and keeps a settings.json under
+         * ~/.gemini/antigravity-cli/; install the SessionStart reminder there
+         * using the shared Gemini hook JSON schema. */
+        char sp[CLI_BUF_1K];
+        snprintf(sp, sizeof(sp), "%s/.gemini/antigravity-cli/settings.json", home);
+        if (g_install_plan) {
+            plan_record("Antigravity", "hook", sp);
+        } else {
+            if (!dry_run) {
+                cbm_upsert_gemini_session_hooks(sp);
+            }
+            printf("  hooks: SessionStart (code-cortex-mcp reminder)\n");
+        }
+    }
+    if (agents->aider) {
+        char ip[CLI_BUF_1K];
+        snprintf(ip, sizeof(ip), "%s/CONVENTIONS.md", home);
+        if (g_install_plan) {
+            plan_record("Aider", "instructions", ip);
+        } else {
+            printf("Aider:\n");
+            if (!dry_run) {
+                cbm_upsert_instructions(ip, agent_instructions_content);
+            }
+            printf("  instructions: %s\n", ip);
+        }
+    }
+}
+
+/* Scan Code/User/profiles/ and install (or plan) a per-profile mcp.json for
+ * each existing profile subdirectory, so VS Code profile users inherit the MCP
+ * server without manual steps (#431). No-op when profiles/ is absent. */
+static void install_vscode_profile_configs(const char *code_user, const char *binary_path,
+                                           bool dry_run) {
+    char profiles_dir[CLI_BUF_1K];
+    snprintf(profiles_dir, sizeof(profiles_dir), "%s/profiles", code_user);
+    cbm_dir_t *d = cbm_opendir(profiles_dir);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, ".") == 0 || strcmp(ent->name, "..") == 0) {
+            continue;
+        }
+        char profile_path[CLI_BUF_1K];
+        snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
+        struct stat st;
+        if (stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/mcp.json", profile_path);
+        install_generic_agent_config("VS Code", binary_path, cp, NULL, dry_run,
+                                     cbm_install_vscode_mcp);
+    }
+    cbm_closedir(d);
+}
+
+/* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
+static void install_editor_agent_configs(const cbm_detected_agents_t *agents, const char *home,
+                                         const char *binary_path, bool dry_run) {
+    if (agents->zed) {
+        char cp[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Zed/settings.json", home);
+#elif defined(_WIN32)
+        snprintf(cp, sizeof(cp), "%s/Zed/settings.json", cbm_app_local_dir());
+#else
+        snprintf(cp, sizeof(cp), "%s/zed/settings.json", cbm_app_config_dir());
+#endif
+        install_generic_agent_config("Zed", binary_path, cp, NULL, dry_run, cbm_install_zed_mcp);
+    }
+    if (agents->kilocode) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(cp, sizeof(cp),
+                 "%s/Library/Application Support/Code/User/globalStorage/"
+                 "kilocode.kilo-code/settings/mcp_settings.json",
+                 home);
+#else
+        snprintf(cp, sizeof(cp),
+                 "%s/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+                 cbm_app_config_dir());
+#endif
+        snprintf(ip, sizeof(ip), "%s/.kilocode/rules/code-cortex-mcp.md", home);
+        install_generic_agent_config("KiloCode", binary_path, cp, ip, dry_run,
+                                     cbm_install_editor_mcp);
+    }
+    if (agents->vscode) {
+        char code_user[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(code_user, sizeof(code_user), "%s/Library/Application Support/Code/User", home);
+#else
+        snprintf(code_user, sizeof(code_user), "%s/Code/User", cbm_app_config_dir());
+#endif
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/mcp.json", code_user);
+        install_generic_agent_config("VS Code", binary_path, cp, NULL, dry_run,
+                                     cbm_install_vscode_mcp);
+        /* VS Code profiles each keep their own settings under
+         * Code/User/profiles/<id>/. The default mcp.json above does NOT apply
+         * to a named profile, so write/plan a per-profile mcp.json for every
+         * existing profile directory (#431). */
+        install_vscode_profile_configs(code_user, binary_path, dry_run);
+    }
+    if (agents->cursor) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.cursor/mcp.json", home);
+        install_generic_agent_config("Cursor", binary_path, cp, NULL, dry_run,
+                                     cbm_install_editor_mcp);
+    }
+    if (agents->openclaw) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.openclaw/openclaw.json", home);
+        install_generic_agent_config("OpenClaw", binary_path, cp, NULL, dry_run,
+                                     cbm_install_openclaw_mcp);
+    }
+    if (agents->kiro) {
+        char cp[CLI_BUF_1K];
+        char sd[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.kiro/settings/mcp.json", home);
+        snprintf(sd, sizeof(sd), "%s/.kiro/settings", home);
+        if (!dry_run) {
+            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+        }
+        install_generic_agent_config("Kiro", binary_path, cp, NULL, dry_run,
+                                     cbm_install_editor_mcp);
+    }
+    if (agents->junie) {
+        char cp[CLI_BUF_1K];
+        char sd[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.junie/mcp/mcp.json", home);
+        snprintf(sd, sizeof(sd), "%s/.junie/mcp", home);
+        if (!dry_run) {
+            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+        }
+        install_generic_agent_config("Junie", binary_path, cp, NULL, dry_run, cbm_upsert_junie_mcp);
+    }
+}
+
+static void cbm_install_agent_configs(const char *home, const char *binary_path, bool force,
+                                      bool dry_run) {
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    if (!g_install_plan) {
+        print_detected_agents(&agents);
+    }
+
+    if (agents.claude_code) {
+        install_claude_code_config(home, binary_path, force, dry_run);
+    }
+    install_cli_agent_configs(&agents, home, binary_path, dry_run);
+    install_editor_agent_configs(&agents, home, binary_path, dry_run);
+}
+
+/* Count .db files in the cache directory. */
+static int count_db_indexes(const char *home) {
+    const char *cache_dir = get_cache_dir(home);
+    if (!cache_dir) {
+        return 0;
+    }
+    cbm_dir_t *d = cbm_opendir(cache_dir);
+    if (!d) {
+        return 0;
+    }
+    int count = 0;
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        size_t len = strlen(ent->name);
+        if (len > DB_EXT_LEN && strcmp(ent->name + len - DB_EXT_LEN, ".db") == 0) {
+            count++;
+        }
+    }
+    cbm_closedir(d);
+    return count;
+}
+
+/* Handle pre-existing indexes during (re)install (#607).
+ *
+ * Returns 1 to proceed with the install, 0 to abort (user declined the
+ * destructive reset prompt).
+ *
+ * Default (reset=false): PRESERVE the indexed graph. We do NOT delete any
+ * .db. We print an honest message telling the user the indexes are kept and
+ * that they should re-index after install to pick up this version's
+ * extraction improvements. The old behaviour deleted every index here while
+ * printing "must be rebuilt" and never rebuilt — silent, irrecoverable data
+ * loss (#607). Deletion is NOT a schema requirement (the store uses CREATE
+ * TABLE IF NOT EXISTS with no migrations); it only guarded against stale
+ * content, which a re-index fixes without destroying anything.
+ *
+ * Opt-in (reset=true, via `install --reset-indexes`): keep the original
+ * prompt-and-delete behaviour, with honest "Delete" wording.
+ *
+ * Not static: linked into the bug-repro test runner so repro_issue607.c can
+ * assert the default path preserves the DB. It is intentionally NOT declared
+ * in cli.h (internal helper); the test carries an extern forward declaration.
+ */
+extern "C" int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run);
+extern "C" int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run) {
+    int index_count = count_db_indexes(home);
+    if (index_count <= 0) {
+        return 1; /* nothing to handle, proceed */
+    }
+
+    if (!reset) {
+        /* Default: preserve. Be honest — keep the indexes, advise re-index. */
+        printf("Found %d existing index(es). Keeping them. After install, "
+               "re-index to pick up this version's improvements:\n",
+               index_count);
+        cbm_list_indexes(home);
+        printf("\n");
+        return 1; /* proceed without deleting */
+    }
+
+    /* Opt-in reset (--reset-indexes): the original prompt-and-delete path. */
+    printf("Found %d existing index(es):\n", index_count);
+    cbm_list_indexes(home);
+    printf("\n");
+    if (!prompt_yn("Delete these indexes and continue with install?")) {
+        printf("Install cancelled.\n");
+        return 0; /* abort */
+    }
+    if (!dry_run) {
+        int removed = cbm_remove_indexes(home);
+        printf("Removed %d index(es).\n\n", removed);
+    }
+    return 1; /* proceed */
+}
+
+/* ── Subcommand: install ──────────────────────────────────────── */
+
+/* Detect the running binary's path at runtime. Falls back to ~/.local/bin/. */
+static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
+    buf[0] = '\0';
+#ifdef _WIN32
+    GetModuleFileNameA(NULL, buf, (DWORD)buf_sz);
+    cbm_normalize_path_sep(buf);
+#elif defined(__APPLE__)
+    uint32_t sp_sz = (uint32_t)buf_sz;
+    if (_NSGetExecutablePath(buf, &sp_sz) != 0) {
+        buf[0] = '\0';
+    }
+#else
+    ssize_t sp_len = readlink("/proc/self/exe", buf, buf_sz - SKIP_ONE);
+    if (sp_len > 0) {
+        buf[sp_len] = '\0';
+    }
+#endif
+    if (!buf[0]) {
+#ifdef _WIN32
+        snprintf(buf, buf_sz, "%s/.local/bin/code-cortex-mcp.exe", home);
+#else
+        snprintf(buf, buf_sz, "%s/.local/bin/code-cortex-mcp", home);
+#endif
+    }
+}
+
+/* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
+ * the config / instruction / hook files `install` WOULD write, produced by
+ * running the real install dispatch in record-only mode (no mutation, no
+ * network). Returns a heap JSON string (caller frees) or NULL. */
+char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
+    if (!home || !binary_path) {
+        return NULL;
+    }
+
+    /* Same code path as a real install, but mutations disabled and every write
+     * site records into `plan` — so the receipt cannot drift from behavior. */
+    cbm_install_plan_t plan = {0};
+    g_install_plan = &plan;
+    cbm_install_agent_configs(home, binary_path, false, true);
+    g_install_plan = NULL;
+
+    cbm_detected_agents_t det = cbm_detect_agents(home);
+    struct {
+        bool flag;
+        const char *name;
+    } names[] = {
+        {det.claude_code, "claude-code"},
+        {det.codex, "codex"},
+        {det.gemini, "gemini"},
+        {det.zed, "zed"},
+        {det.opencode, "opencode"},
+        {det.antigravity, "antigravity"},
+        {det.aider, "aider"},
+        {det.kilocode, "kilocode"},
+        {det.vscode, "vscode"},
+        {det.cursor, "cursor"},
+        {det.openclaw, "openclaw"},
+        {det.kiro, "kiro"},
+        {det.junie, "junie"},
+    };
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "type", "agent.install.plan.v1");
+
+    yyjson_mut_val *agents = yyjson_mut_arr(doc);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (names[i].flag) {
+            yyjson_mut_arr_add_str(doc, agents, names[i].name);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "agents_detected", agents);
+
+    yyjson_mut_val *configs = yyjson_mut_arr(doc);
+    yyjson_mut_val *instrs = yyjson_mut_arr(doc);
+    yyjson_mut_val *hooks = yyjson_mut_arr(doc);
+    for (int i = 0; i < plan.count; i++) {
+        cbm_plan_entry_t *e = &plan.items[i];
+        if (strcmp(e->kind, "mcp_config") == 0) {
+            yyjson_mut_arr_add_strcpy(doc, configs, e->path);
+        } else if (strcmp(e->kind, "hook") == 0) {
+            yyjson_mut_val *h = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, h, "agent", e->agent);
+            yyjson_mut_obj_add_strcpy(doc, h, "path", e->path);
+            yyjson_mut_arr_add_val(hooks, h);
+        } else {
+            yyjson_mut_arr_add_strcpy(doc, instrs, e->path);
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "config_files_planned", configs);
+    yyjson_mut_obj_add_val(doc, root, "instruction_files_planned", instrs);
+    yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
+    yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
+    yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
+    yyjson_mut_obj_add_str(doc, root, "next_safe_command", "code-cortex-mcp install -y");
+
+    char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL);
+    yyjson_mut_doc_free(doc);
+    free(plan.items);
+    return json; /* malloc'd; caller frees */
+}
+
+/* ── Migration from the pre-rename product (codebase-memory-mcp) ──
+ * Config entries migrate inside the per-agent install/remove helpers (the
+ * legacy server key and Codex TOML section are dropped on upsert); this
+ * handles the filesystem leftovers: the old binary, the old default cache
+ * dir, and the old skill directories. Returns the number of items removed
+ * (or that would be removed under dry_run). */
+int cbm_migrate_legacy_install(const char *home, bool dry_run) {
+    if (!home) {
+        return 0;
+    }
+    int migrated = 0;
+    struct stat st;
+
+    /* Old binary */
+    char old_bin[CLI_BUF_1K];
+#ifdef _WIN32
+    snprintf(old_bin, sizeof(old_bin), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
+    snprintf(old_bin, sizeof(old_bin), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
+    if (stat(old_bin, &st) == 0) {
+        if (dry_run) {
+            printf("Would remove legacy binary: %s\n", old_bin);
+            migrated++;
+        } else if (cbm_unlink(old_bin) == 0) {
+            printf("Removed legacy binary: %s\n", old_bin);
+            migrated++;
+        }
+    }
+
+    /* Old default cache dir (indexes rebuild under the new name) */
+    char old_cache[CLI_BUF_1K];
+    snprintf(old_cache, sizeof(old_cache), "%s/.cache/codebase-memory-mcp", home);
+    if (stat(old_cache, &st) == 0) {
+        if (dry_run) {
+            printf("Would remove idle legacy indexes (retain metadata and leases): %s\n",
+                   old_cache);
+            migrated++;
+        } else {
+            int removed = remove_indexes_in_dir(old_cache);
+            printf("Removed %d legacy indexes from %s; retained cache directory, "
+                   "metadata, and lease files.\n",
+                   removed, old_cache);
+            if (removed > 0) {
+                migrated++;
+            }
+        }
+    }
+
+    /* Old skill directories */
+    static const char *const legacy_skills[] = {
+        "codebase-memory",         "codebase-memory-exploring", "codebase-memory-tracing",
+        "codebase-memory-quality", "codebase-memory-reference",
+    };
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    for (size_t i = 0; i < sizeof(legacy_skills) / sizeof(legacy_skills[0]); i++) {
+        char skill_path[CLI_BUF_1K];
+        snprintf(skill_path, sizeof(skill_path), "%s/skills/%s", config_dir, legacy_skills[i]);
+        if (stat(skill_path, &st) != 0) {
+            continue;
+        }
+        if (dry_run) {
+            printf("Would remove legacy skill: %s\n", skill_path);
+            migrated++;
+        } else if (rmdir_recursive(skill_path) == 0) {
+            printf("Removed legacy skill: %s\n", skill_path);
+            migrated++;
+        }
+    }
+
+    return migrated;
+}
+
+int cbm_cmd_install(int argc, char **argv) {
+    parse_auto_answer(argc, argv);
+    bool dry_run = false;
+    bool force = false;
+    bool plan = false;
+    bool reset_indexes = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0) {
+            dry_run = true;
+        }
+        if (strcmp(argv[i], "--force") == 0) {
+            force = true;
+        }
+        if (strcmp(argv[i], "--plan") == 0) {
+            plan = true;
+        }
+        /* Opt-in: delete existing indexes during install. Default preserves
+         * the indexed graph (#607). Only this flag triggers deletion. */
+        if (strcmp(argv[i], "--reset-indexes") == 0) {
+            reset_indexes = true;
+        }
+    }
+
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
+        return CLI_TRUE;
+    }
+
+    /* --plan: emit the machine-readable install receipt and exit WITHOUT
+     * mutating anything (no config writes, no index deletion, no network) so
+     * an agent can inspect exactly what install would touch first (#388). */
+    if (plan) {
+        char self_path[CLI_BUF_1K] = {0};
+        cbm_detect_self_path(self_path, sizeof(self_path), home);
+        char *json = cbm_build_install_plan_json(home, self_path);
+        if (!json) {
+            (void)fprintf(stderr, "error: failed to build install plan\n");
+            return CLI_TRUE;
+        }
+        printf("%s\n", json);
+        free(json);
+        return 0;
+    }
+
+    printf("code-cortex-mcp install %s\n\n", CBM_VERSION);
+
+    /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
+     * the old prompt-and-delete behaviour. The helper returns 0 only when the
+     * user declines the reset prompt, in which case we abort the install. */
+    if (cbm_install_handle_existing_indexes(home, reset_indexes, dry_run) == 0) {
+        return CLI_TRUE;
+    }
+
+    /* Step 1b: Kill running MCP server instances so agents pick up new config
+     * (matches the legacy binary name too, so migration can remove it). */
+    if (!dry_run) {
+        int killed = cbm_kill_other_instances();
+        if (killed > 0) {
+            printf("Stopped %d running MCP server instance(s).\n\n", killed);
+        }
+    }
+
+    /* Step 1b': Migrate from a pre-rename (codebase-memory-mcp) install. */
+    {
+        int migrated = cbm_migrate_legacy_install(home, dry_run);
+        if (migrated > 0) {
+            printf("%s %d leftover(s) from a codebase-memory-mcp install.\n\n",
+                   dry_run ? "Would migrate" : "Migrated", migrated);
+        }
+    }
+
+    /* Step 1c: Place the running binary at the canonical install target.
+     * Previously install only re-signed whatever was already at the target, so
+     * `install --force` from a freshly built binary silently kept the OLD file
+     * — operators ran stale code believing they had upgraded (#472). Copy the
+     * running binary to ~/.local/bin (unless we ARE that file), then sign it. */
+    char self_path[CLI_BUF_1K] = {0};
+    cbm_detect_self_path(self_path, sizeof(self_path), home);
+
+    char bin_target[CLI_BUF_1K];
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/code-cortex-mcp.exe", home);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/code-cortex-mcp", home);
+#endif
+
+    if (!cbm_same_file(self_path, bin_target)) {
+        struct stat tgt_st;
+        bool target_exists = (stat(bin_target, &tgt_st) == 0);
+        bool do_copy = !target_exists || force;
+        if (target_exists && !force) {
+            printf("A different binary already exists at:\n  %s\n", bin_target);
+            if (prompt_yn("Replace it with the binary you ran install from?")) {
+                do_copy = true;
+                force = true; /* user approved replacement for this run */
+            } else {
+                printf("Keeping existing binary; configs will point at it.\n\n");
+            }
+        }
+        if (do_copy) {
+            char bin_dir[CLI_BUF_1K];
+            snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+            if (dry_run) {
+                printf("Would install binary -> %s\n\n", bin_target);
+            } else {
+                cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM);
+                if (cbm_copy_binary_to_target(self_path, bin_target) != 0) {
+                    (void)fprintf(stderr, "error: failed to copy binary to %s\n", bin_target);
+                    return CLI_TRUE;
+                }
+                printf("Installed binary -> %s\n\n", bin_target);
+            }
+        }
+    }
+
+    /* Step 1d: macOS ad-hoc signing of the installed binary. A freshly
+     * clang-built arm64 binary is linker-signed (flags=0x20002) and gets
+     * Killed:9 when spawned by an MCP host; re-signing ad-hoc (flags=0x2)
+     * makes it launchable. Sign the target, not whatever the operator ran. */
+#ifdef __APPLE__
+    if (!dry_run) {
+        struct stat sign_st;
+        if (stat(bin_target, &sign_st) == 0) {
+            if (cbm_macos_adhoc_sign(bin_target) != 0) {
+                (void)fprintf(
+                    stderr, "warning: ad-hoc signing failed — binary may not run on macOS arm64\n");
+            }
+        }
+    }
+#endif
+
+    /* Step 3: Install/refresh all agent configs, pointing at the install target. */
+    cbm_install_agent_configs(home, bin_target, force, dry_run);
+
+    /* Step 4: Ensure PATH */
+    char bin_dir[CLI_BUF_1K];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    const char *rc = cbm_detect_shell_rc(home);
+    if (rc[0]) {
+        int path_rc = cbm_ensure_path(bin_dir, rc, dry_run);
+        if (path_rc == 0) {
+            printf("\nAdded %s to PATH in %s\n", bin_dir, rc);
+        } else if (path_rc == CLI_TRUE) {
+            printf("\nPATH already includes %s\n", bin_dir);
+        }
+    }
+
+    printf("\nInstall complete. Restart your shell or run:\n");
+    printf("  source %s\n", rc);
+    if (dry_run) {
+        printf("\n(dry-run — no files were modified)\n");
+    }
+    return 0;
+}
+
+/* ── Subcommand: uninstall ────────────────────────────────────── */
+
+/* Remove Claude Code agent configs. */
+static void uninstall_claude_code(const char *home, bool dry_run) {
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    char user_root[CLI_BUF_1K];
+    cbm_claude_user_root(home, user_root, sizeof(user_root));
+
+    char skills_dir[CLI_BUF_1K];
+    snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
+    int removed = cbm_remove_skills(skills_dir, dry_run);
+    printf("Claude Code: removed %d skill(s)\n", removed);
+
+    char mcp_path[CLI_BUF_1K];
+    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
+    if (!dry_run) {
+        cbm_remove_editor_mcp(mcp_path);
+    }
+    printf("  removed MCP config entry\n");
+
+    char mcp_path2[CLI_BUF_1K];
+    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
+    if (!dry_run) {
+        cbm_remove_editor_mcp(mcp_path2);
+    }
+
+    char settings_path[CLI_BUF_1K];
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    if (!dry_run) {
+        cbm_remove_claude_hooks(settings_path);
+        cbm_remove_claude_post_hooks(settings_path);
+        cbm_remove_session_hooks(settings_path);
+        cbm_remove_claude_subagent_hooks(settings_path);
+    }
+    printf("  removed PreToolUse + PostToolUse + SessionStart + SubagentStart hooks\n");
+}
+
+/* Remove MCP + instructions for a generic agent. */
+
+typedef struct {
+    const char *name;
+    const char *config_path;
+    const char *instr_path;
+} mcp_uninstall_args_t;
+static void uninstall_agent_mcp_instr(mcp_uninstall_args_t paths, bool dry_run,
+                                      int (*remove_fn)(const char *)) {
+    const char *name = paths.name;
+    const char *instr_path = paths.instr_path;
+    if (!dry_run) {
+        remove_fn(paths.config_path);
+    }
+    printf("%s: removed MCP config entry\n", name);
+    if (instr_path) {
+        if (!dry_run) {
+            cbm_remove_instructions(instr_path);
+        }
+        printf("  removed instructions\n");
+    }
+}
+
+/* Remove CLI agent configs (Codex, Gemini, OpenCode, Antigravity, Aider). */
+/* Uninstall Gemini CLI config + hooks. */
+static void uninstall_gemini_config(const char *home, bool dry_run) {
+    char cp[CLI_BUF_1K];
+    char ip[CLI_BUF_1K];
+    snprintf(cp, sizeof(cp), "%s/.gemini/settings.json", home);
+    snprintf(ip, sizeof(ip), "%s/.gemini/GEMINI.md", home);
+    if (!dry_run) {
+        cbm_remove_editor_mcp(cp);
+        cbm_remove_gemini_hooks(cp);
+        cbm_remove_gemini_session_hooks(cp);
+        cbm_remove_instructions(ip);
+    }
+    printf("Gemini CLI: removed MCP config + hooks + instructions\n");
+}
+
+static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char *home,
+                                 bool dry_run) {
+    if (agents->codex) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.codex/config.toml", home);
+        snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
+                                  cbm_remove_codex_mcp);
+        if (!dry_run) {
+            cbm_remove_codex_hooks(cp);
+        }
+    }
+    if (agents->gemini) {
+        uninstall_gemini_config(home, dry_run);
+    }
+    if (agents->opencode) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.config/opencode/opencode.json", home);
+        snprintf(ip, sizeof(ip), "%s/.config/opencode/AGENTS.md", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenCode", cp, ip}, dry_run,
+                                  cbm_remove_opencode_mcp);
+    }
+    if (agents->antigravity) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.gemini/config/mcp_config.json", home);
+        snprintf(ip, sizeof(ip), "%s/.gemini/antigravity-cli/AGENTS.md", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Antigravity", cp, ip}, dry_run,
+                                  cbm_remove_antigravity_mcp);
+        if (!dry_run) {
+            char sp[CLI_BUF_1K];
+            snprintf(sp, sizeof(sp), "%s/.gemini/antigravity-cli/settings.json", home);
+            cbm_remove_gemini_session_hooks(sp);
+        }
+    }
+    if (agents->aider) {
+        char ip[CLI_BUF_1K];
+        snprintf(ip, sizeof(ip), "%s/CONVENTIONS.md", home);
+        if (!dry_run) {
+            cbm_remove_instructions(ip);
+        }
+        printf("Aider: removed instructions\n");
+    }
+}
+
+/* Remove editor agent configs (Zed, KiloCode, VS Code, OpenClaw). */
+static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const char *home,
+                                    bool dry_run) {
+    if (agents->zed) {
+        char cp[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Zed/settings.json", home);
+#elif defined(_WIN32)
+        snprintf(cp, sizeof(cp), "%s/Zed/settings.json", cbm_app_local_dir());
+#else
+        snprintf(cp, sizeof(cp), "%s/zed/settings.json", cbm_app_config_dir());
+#endif
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Zed", cp, NULL}, dry_run,
+                                  cbm_remove_zed_mcp);
+    }
+    if (agents->kilocode) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(cp, sizeof(cp),
+                 "%s/Library/Application Support/Code/User/globalStorage/"
+                 "kilocode.kilo-code/settings/mcp_settings.json",
+                 home);
+#else
+        snprintf(cp, sizeof(cp),
+                 "%s/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json",
+                 cbm_app_config_dir());
+#endif
+        snprintf(ip, sizeof(ip), "%s/.kilocode/rules/code-cortex-mcp.md", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"KiloCode", cp, ip}, dry_run,
+                                  cbm_remove_editor_mcp);
+    }
+    if (agents->vscode) {
+        char cp[CLI_BUF_1K];
+#ifdef __APPLE__
+        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Code/User/mcp.json", home);
+#else
+        snprintf(cp, sizeof(cp), "%s/Code/User/mcp.json", cbm_app_config_dir());
+#endif
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"VS Code", cp, NULL}, dry_run,
+                                  cbm_remove_vscode_mcp);
+    }
+    if (agents->cursor) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.cursor/mcp.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cursor", cp, NULL}, dry_run,
+                                  cbm_remove_editor_mcp);
+    }
+    if (agents->openclaw) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.openclaw/openclaw.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenClaw", cp, NULL}, dry_run,
+                                  cbm_remove_openclaw_mcp);
+    }
+    if (agents->kiro) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.kiro/settings/mcp.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Kiro", cp, NULL}, dry_run,
+                                  cbm_remove_editor_mcp);
+    }
+    if (agents->junie) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.junie/mcp/mcp.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Junie", cp, NULL}, dry_run,
+                                  cbm_remove_junie_mcp);
+    }
+}
+
+int cbm_cmd_uninstall(int argc, char **argv) {
+    parse_auto_answer(argc, argv);
+    bool dry_run = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0) {
+            dry_run = true;
+        }
+    }
+
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
+        return CLI_TRUE;
+    }
+
+    printf("code-cortex-mcp uninstall\n\n");
+
+    cbm_detected_agents_t agents = cbm_detect_agents(home);
+    if (agents.claude_code) {
+        uninstall_claude_code(home, dry_run);
+    }
+    uninstall_cli_agents(&agents, home, dry_run);
+    uninstall_editor_agents(&agents, home, dry_run);
+
+    /* Step 2: Remove indexes */
+    int index_count = count_db_indexes(home);
+    if (index_count > 0) {
+        printf("\nFound %d index(es):\n", index_count);
+        cbm_list_indexes(home);
+        if (prompt_yn("Delete these indexes?")) {
+            int idx_removed = cbm_remove_indexes(home);
+            printf("Removed %d index(es).\n", idx_removed);
+        } else {
+            printf("Indexes kept.\n");
+        }
+    }
+
+    /* Step 3: Remove binary */
+    char bin_path[CLI_BUF_1K];
+#ifdef _WIN32
+    snprintf(bin_path, sizeof(bin_path), "%s/.local/bin/code-cortex-mcp.exe", home);
+#else
+    snprintf(bin_path, sizeof(bin_path), "%s/.local/bin/code-cortex-mcp", home);
+#endif
+    struct stat st;
+    if (stat(bin_path, &st) == 0) {
+        if (!dry_run) {
+            cbm_unlink(bin_path);
+        }
+        printf("Removed %s\n", bin_path);
+    }
+
+    printf("\nUninstall complete.\n");
+    if (dry_run) {
+        printf("(dry-run — no files were modified)\n");
+    }
+    return 0;
+}
+
+/* ── Subcommand: update ───────────────────────────────────────── */
+
+/* Read archive from disk, extract binary (tar.gz or zip), write to bin_dest.
+ * Returns 0 on success, 1 on failure. Cleans up tmp_archive. */
+
+typedef struct {
+    const char *tmp_archive;
+    const char *ext;
+    const char *bin_dest;
+} extract_install_args_t;
+static int extract_and_install_binary(extract_install_args_t args) {
+    const char *tmp_archive = args.tmp_archive;
+    const char *ext = args.ext;
+    const char *bin_dest = args.bin_dest;
+    FILE *f = fopen(tmp_archive, "rb");
+    if (!f) {
+        (void)fprintf(stderr, "error: cannot open %s\n", tmp_archive);
+        return CLI_TRUE;
+    }
+    (void)fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    (void)fseek(f, 0, SEEK_SET);
+
+    unsigned char *data = (unsigned char *)malloc((size_t)fsize);
+    if (!data) {
+        (void)fclose(f);
+        cbm_unlink(tmp_archive);
+        return CLI_TRUE;
+    }
+    (void)fread(data, CLI_ELEM_SIZE, (size_t)fsize, f);
+    (void)fclose(f);
+
+    int bin_len = 0;
+    unsigned char *bin_data = NULL;
+    if (strcmp(ext, "tar.gz") == 0) {
+        bin_data = cbm_extract_binary_from_targz(data, (int)fsize, &bin_len);
+    } else {
+        bin_data = cbm_extract_binary_from_zip(data, (int)fsize, &bin_len);
+    }
+    free(data);
+    cbm_unlink(tmp_archive);
+
+    if (!bin_data || bin_len <= 0) {
+        (void)fprintf(stderr, "error: binary not found in archive\n");
+        free(bin_data);
+        return CLI_TRUE;
+    }
+
+    if (cbm_replace_binary(bin_dest, bin_data, bin_len, CLI_OCTAL_PERM) != 0) {
+        (void)fprintf(stderr, "error: cannot write to %s\n", bin_dest);
+        free(bin_data);
+        return CLI_TRUE;
+    }
+    free(bin_data);
+    return 0;
+}
+
+/* Build the download URL for the update command. */
+static void build_update_url(char *url, int url_sz, const char *os, const char *arch,
+                             const char *ext) {
+    char base_url_buf[CLI_BUF_512];
+    const char *base_url =
+        cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
+    if (!base_url || !base_url[0]) {
+        base_url = "https://github.com/tigercosmos/code-cortex-mcp/releases/latest/download";
+    }
+    /* Linux ships a fully-static "-portable" build; the standard linux binary
+     * dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
+     * have no such variant. Keep in sync with install.sh / install.js / pypi
+     * _cli.py. */
+    const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
+    snprintf(url, url_sz, "%s/code-cortex-mcp-%s-%s%s.%s", base_url, os, arch, portable, ext);
+}
+
+/* Prompt to delete existing indexes. Returns 0 to continue, 1 to abort. */
+static int update_clear_indexes(const char *home, bool dry_run) {
+    int index_count = count_db_indexes(home);
+    if (index_count == 0) {
+        return 0;
+    }
+    printf("Found %d existing index(es) that must be rebuilt after update:\n", index_count);
+    cbm_list_indexes(home);
+    printf("\n");
+    if (dry_run) {
+        printf("(dry-run — indexes would be deleted)\n\n");
+        return 0;
+    }
+    if (!prompt_yn("Delete these indexes and continue with update?")) {
+        printf("Update cancelled.\n");
+        return CLI_TRUE;
+    }
+    int removed = cbm_remove_indexes(home);
+    printf("Removed %d index(es).\n\n", removed);
+    return 0;
+}
+
+/* Download, verify checksum, kill old instances, and install binary. Returns 0 on success. */
+static int download_verify_install(const char *url, const char *ext, const char *os,
+                                   const char *arch, const char *bin_dest) {
+    char tmp_archive[CLI_BUF_256];
+    snprintf(tmp_archive, sizeof(tmp_archive), "%s/cbm-update.%s", cbm_tmpdir(), ext);
+
+    int rc = cbm_download_to_file(url, tmp_archive);
+    if (rc != 0) {
+        (void)fprintf(stderr, "error: download failed (exit %d)\n", rc);
+        cbm_unlink(tmp_archive);
+        return CLI_TRUE;
+    }
+
+    char archive_name[CLI_BUF_256];
+    /* Must match build_update_url: linux uses the static "-portable" asset. */
+    const char *portable = (strcmp(os, "linux") == 0) ? "-portable" : "";
+    snprintf(archive_name, sizeof(archive_name), "code-cortex-mcp-%s-%s%s.%s", os, arch, portable,
+             ext);
+    /* Fail closed: install only a positively-verified download. A mismatch,
+     * a missing checksum entry, or an unavailable hash tool (crc != 0) all
+     * abort rather than install an unverified binary. */
+    int crc = verify_download_checksum(tmp_archive, archive_name);
+    if (crc != 0) {
+        (void)fprintf(stderr, "error: refusing to install an unverified download\n");
+        cbm_unlink(tmp_archive);
+        return CLI_TRUE;
+    }
+
+    int killed = cbm_kill_other_instances();
+    if (killed > 0) {
+        printf("Stopped %d running MCP server instance(s).\n", killed);
+    }
+
+    if (extract_and_install_binary((extract_install_args_t){tmp_archive, ext, bin_dest}) != 0) {
+        return CLI_TRUE;
+    }
+    return 0;
+}
+
+/* Case-insensitive prefix match (portable — no strncasecmp dependency). */
+static bool prefix_icase(const char *s, const char *prefix) {
+    while (*prefix) {
+        if (tolower((unsigned char)*s) != tolower((unsigned char)*prefix)) {
+            return false;
+        }
+        s++;
+        prefix++;
+    }
+    return true;
+}
+
+/* Fetch latest release tag from GitHub via redirect header.
+ * Returns heap-allocated tag (e.g. "v0.5.7") or NULL on failure. */
+static char *fetch_latest_tag(void) {
+    FILE *fp = cbm_popen("curl -sfI https://github.com/tigercosmos/code-cortex-mcp/releases/latest "
+                         "2>/dev/null",
+                         "r");
+    if (!fp) {
+        return NULL;
+    }
+    char line[CBM_SZ_512];
+    char *tag = NULL;
+    while (fgets(line, sizeof(line), fp)) {
+        if (!prefix_icase(line, "location:")) {
+            continue;
+        }
+        char *slash = strrchr(line, '/');
+        if (!slash) {
+            break;
+        }
+        slash++;
+        size_t len = strlen(slash);
+        while (len > 0 && (slash[len - SKIP_ONE] == '\r' || slash[len - SKIP_ONE] == '\n' ||
+                           slash[len - SKIP_ONE] == ' ')) {
+            slash[--len] = '\0';
+        }
+        if (len > 0) {
+            tag = strdup(slash);
+        }
+        break;
+    }
+    cbm_pclose(fp);
+    return tag;
+}
+
+/* Check if current version is already latest. Returns true to skip update. */
+static bool check_already_latest(void) {
+    char dl_env[CBM_SZ_256] = "";
+    cbm_safe_getenv("CBM_DOWNLOAD_URL", dl_env, sizeof(dl_env), NULL);
+    if (dl_env[0]) {
+        return false; /* testing override — always update */
+    }
+    char *latest = fetch_latest_tag();
+    if (!latest) {
+        (void)fprintf(stderr, "warning: could not check latest version (network unavailable?). "
+                              "Proceeding with update.\n");
+        return false;
+    }
+    int cmp = cbm_compare_versions(latest, CBM_VERSION);
+    if (cmp <= 0) {
+        if (cmp < 0) {
+            printf("Already up to date (%s, ahead of latest %s).\n", CBM_VERSION, latest);
+        } else {
+            printf("Already up to date (%s).\n", CBM_VERSION);
+        }
+        free(latest);
+        return true;
+    }
+    printf("Update available: %s -> %s\n", CBM_VERSION, latest);
+    free(latest);
+    return false;
+}
+
+int cbm_cmd_update(int argc, char **argv) {
+    parse_auto_answer(argc, argv);
+
+    bool dry_run = false;
+    bool force = false;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0) {
+            dry_run = true;
+        } else if (strcmp(argv[i], "--force") == 0) {
+            force = true;
+        }
+    }
+
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
+        return CLI_TRUE;
+    }
+
+    printf("code-cortex-mcp update (current: %s)\n\n", CBM_VERSION);
+
+    /* Version check — skip download if already on latest (not in dry-run). */
+    if (!force && !dry_run && check_already_latest()) {
+        return 0;
+    }
+
+    /* Step 1: Check for existing indexes */
+    if (update_clear_indexes(home, dry_run) != 0) {
+        return CLI_TRUE;
+    }
+
+    const char *os = detect_os();
+    const char *arch = detect_arch();
+    const char *ext = strcmp(os, "windows") == 0 ? "zip" : "tar.gz";
+
+    char url[CLI_BUF_512];
+    build_update_url(url, sizeof(url), os, arch, ext);
+
+    if (dry_run) {
+        printf("\nWould download binary for %s/%s ...\n", os, arch);
+    } else {
+        printf("\nDownloading binary for %s/%s ...\n", os, arch);
+    }
+    printf("  %s\n", url);
+
+    if (dry_run) {
+        printf("\n(dry-run — skipping download, extraction, and binary replacement)\n");
+        printf("  target: %s/.local/bin/code-cortex-mcp\n", home);
+        printf("  os/arch: %s/%s\n", os, arch);
+        printf("\nUpdate dry-run complete.\n");
+        return 0;
+    }
+
+    /* Step 4-5: Download, verify, and install binary */
+    char bin_dest[CLI_BUF_1K];
+#ifdef _WIN32
+    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/code-cortex-mcp.exe", home);
+#else
+    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/code-cortex-mcp", home);
+#endif
+    char bin_dir[CLI_BUF_1K];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM);
+
+    int rc = download_verify_install(url, ext, os, arch, bin_dest);
+    if (rc != 0) {
+        return CLI_TRUE;
+    }
+
+    /* Step 5b: macOS ad-hoc signing (required for arm64, harmless for x86_64) */
+#ifdef __APPLE__
+    if (cbm_macos_adhoc_sign(bin_dest) != 0) {
+        (void)fprintf(stderr,
+                      "warning: ad-hoc signing failed — binary may not run on macOS arm64\n");
+    }
+#endif
+
+    /* Step 6: Refresh all agent configs (skills, MCP entries, hooks) */
+    printf("Refreshing agent configurations...\n");
+    cbm_install_agent_configs(home, bin_dest, true, false);
+
+    /* Step 7: Verify new version (exec directly, no shell interpretation) */
+    printf("\nUpdate complete. Verifying:\n");
+    {
+        const char *ver_argv[] = {bin_dest, "--version", NULL};
+        (void)cbm_exec_no_shell(ver_argv);
+    }
+
+    printf("\nAll project indexes were cleared. They will be rebuilt\n");
+    printf("automatically when you next use the MCP server.\n");
+    printf("\nPlease restart your MCP client to use the new binary.\n");
+    return 0;
+}
+
+/* ── CLI tool arguments (flags / --args-file / --help) ────────────── */
+
+/* Flag-name normalization: kebab-case CLI flags map to snake_case JSON keys
+ * (--name-pattern -> name_pattern). In-place; buffer is NUL-terminated. */
+static void cli_kebab_to_snake(char *s) {
+    for (; *s; s++) {
+        if (*s == '-') {
+            *s = '_';
+        }
+    }
+}
+
+/* snake_case JSON key -> kebab-case flag name (for --help display). In-place. */
+static void cli_snake_to_kebab(char *s) {
+    for (; *s; s++) {
+        if (*s == '_') {
+            *s = '-';
+        }
+    }
+}
+
+/* Heap-format a one-argument error message for *err_out. Caller frees. */
+static char *cli_heap_msgf(const char *fmt, const char *arg) {
+    char buf[CLI_BUF_512];
+    snprintf(buf, sizeof(buf), fmt, arg);
+    return cbm_strdup(buf);
+}
+
+/* True if the schema's required[] array contains `key`. */
+static bool cli_schema_required_has(yyjson_val *required, const char *key) {
+    if (!required || !yyjson_is_arr(required)) {
+        return false;
+    }
+    size_t idx;
+    size_t max;
+    yyjson_val *v;
+    yyjson_arr_foreach(required, idx, max, v) {
+        if (yyjson_is_str(v) && strcmp(yyjson_get_str(v), key) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Look up a property's JSON-schema "type" string (string/integer/number/
+ * boolean/array). Returns NULL when the schema or property is unknown — the
+ * caller then treats the value as a plain string. */
+static const char *cli_schema_type(yyjson_val *props, const char *key) {
+    if (!props || !yyjson_is_obj(props)) {
+        return NULL;
+    }
+    yyjson_val *p = yyjson_obj_get(props, key);
+    if (!p || !yyjson_is_obj(p)) {
+        return NULL;
+    }
+    yyjson_val *t = yyjson_obj_get(p, "type");
+    return (t && yyjson_is_str(t)) ? yyjson_get_str(t) : NULL;
+}
+
+/* Append a typed value to the output object under `key`. For array-typed
+ * properties, repeated flags accumulate into a single JSON array. */
+static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *key,
+                          const char *type, const char *value, bool have_value) {
+    if (type && strcmp(type, "array") == 0) {
+        yyjson_mut_val *arr = yyjson_mut_obj_get(obj, key);
+        if (!arr || !yyjson_mut_is_arr(arr)) {
+            arr = yyjson_mut_arr(out);
+            yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), arr);
+        }
+        yyjson_mut_arr_add_strcpy(out, arr, have_value ? value : "");
+        return;
+    }
+
+    yyjson_mut_val *vv;
+    if (type && strcmp(type, "boolean") == 0) {
+        bool b = !have_value || strcmp(value, "true") == 0 || strcmp(value, "1") == 0 ||
+                 strcmp(value, "yes") == 0;
+        vv = yyjson_mut_bool(out, b);
+    } else if (type && strcmp(type, "integer") == 0) {
+        char *endp = NULL;
+        const char *v = have_value ? value : "";
+        long n = strtol(v, &endp, CLI_STRTOL_BASE);
+        vv = (endp && endp != v && *endp == '\0') ? yyjson_mut_int(out, (int64_t)n)
+                                                  : yyjson_mut_strcpy(out, v);
+    } else if (type && strcmp(type, "number") == 0) {
+        char *endp = NULL;
+        const char *v = have_value ? value : "";
+        double d = strtod(v, &endp);
+        vv = (endp && endp != v && *endp == '\0') ? yyjson_mut_real(out, d)
+                                                  : yyjson_mut_strcpy(out, v);
+    } else {
+        /* string or unknown type */
+        vv = yyjson_mut_strcpy(out, have_value ? value : "");
+    }
+    yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
+}
+
+char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out) {
+    if (err_out) {
+        *err_out = NULL;
+    }
+
+    /* The tool's input_schema (may be NULL for an unknown tool — then every
+     * value is treated as a string). Static lifetime; do not free. */
+    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
+    yyjson_doc *schema_doc = NULL;
+    yyjson_val *props = NULL;
+    if (schema_str) {
+        schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
+        if (schema_doc) {
+            props = yyjson_obj_get(yyjson_doc_get_root(schema_doc), "properties");
+        }
+    }
+
+    yyjson_mut_doc *out = yyjson_mut_doc_new(NULL);
+    if (!out) {
+        if (schema_doc) {
+            yyjson_doc_free(schema_doc);
+        }
+        return NULL;
+    }
+    yyjson_mut_val *obj = yyjson_mut_obj(out);
+    yyjson_mut_doc_set_root(out, obj);
+
+    bool ok = true;
+    for (int i = 0; i < argc && ok; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--") == 0) {
+            break; /* end of flag parsing */
+        }
+        if (strncmp(arg, "--", CLI_PAIR_LEN) != 0) {
+            if (err_out) {
+                *err_out = cli_heap_msgf("unexpected argument '%s' (expected --flag value)", arg);
+            }
+            ok = false;
+            break;
+        }
+
+        const char *body = arg + CLI_PAIR_LEN; /* skip leading "--" */
+        const char *eq = strchr(body, '=');
+        char key[CLI_BUF_256];
+        const char *value = NULL;
+        bool have_value = false;
+
+        if (eq) {
+            /* --key=value : split on the FIRST '='; value may contain '='/spaces. */
+            size_t klen = (size_t)(eq - body);
+            if (klen >= sizeof(key)) {
+                klen = sizeof(key) - CLI_SKIP_ONE;
+            }
+            memcpy(key, body, klen);
+            key[klen] = '\0';
+            value = eq + CLI_SKIP_ONE;
+            have_value = true;
+        } else {
+            snprintf(key, sizeof(key), "%s", body);
+            /* Consume the next token as the value unless it is itself a flag
+             * (then this is a bare boolean/string flag). */
+            if (i + CLI_SKIP_ONE < argc &&
+                strncmp(argv[i + CLI_SKIP_ONE], "--", CLI_PAIR_LEN) != 0) {
+                value = argv[i + CLI_SKIP_ONE];
+                have_value = true;
+                i++;
+            }
+        }
+
+        cli_kebab_to_snake(key);
+        const char *type = cli_schema_type(props, key);
+
+        if (type && strcmp(type, "array") == 0 && !have_value) {
+            if (err_out) {
+                *err_out = cli_heap_msgf("flag --%s requires a value", key);
+            }
+            ok = false;
+            break;
+        }
+
+        cli_add_typed(out, obj, key, type, value, have_value);
+    }
+
+    char *result = NULL;
+    if (ok) {
+        size_t len = 0;
+        result = yyjson_mut_write(out, 0, &len); /* malloc'd; caller frees */
+    }
+
+    yyjson_mut_doc_free(out);
+    if (schema_doc) {
+        yyjson_doc_free(schema_doc);
+    }
+    return result;
+}
+
+int cbm_cli_print_tool_help(const char *tool_name) {
+    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
+    if (!schema_str) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *props = root ? yyjson_obj_get(root, "properties") : NULL;
+    yyjson_val *required = root ? yyjson_obj_get(root, "required") : NULL;
+
+    printf("Usage:\n");
+    printf("  code-cortex-mcp cli %s --flag value [--flag2 value2 ...]\n", tool_name);
+    printf("  code-cortex-mcp cli %s --args-file <path-to-json>\n", tool_name);
+    printf("  echo '<json>' | code-cortex-mcp cli %s\n", tool_name);
+    printf("  code-cortex-mcp cli %s '<raw-json-args>'\n", tool_name);
+
+    printf("\nFlags:\n");
+    if (props && yyjson_is_obj(props)) {
+        yyjson_obj_iter iter;
+        yyjson_obj_iter_init(props, &iter);
+        yyjson_val *pkey;
+        while ((pkey = yyjson_obj_iter_next(&iter)) != NULL) {
+            yyjson_val *pval = yyjson_obj_iter_get_val(pkey);
+            const char *name = yyjson_get_str(pkey);
+            if (!name) {
+                continue;
+            }
+            const char *type = "string";
+            const char *desc = "";
+            if (yyjson_is_obj(pval)) {
+                yyjson_val *t = yyjson_obj_get(pval, "type");
+                if (t && yyjson_is_str(t)) {
+                    type = yyjson_get_str(t);
+                }
+                yyjson_val *d = yyjson_obj_get(pval, "description");
+                if (d && yyjson_is_str(d)) {
+                    desc = yyjson_get_str(d);
+                }
+            }
+            char flag[CLI_BUF_256];
+            snprintf(flag, sizeof(flag), "%s", name);
+            cli_snake_to_kebab(flag);
+            bool req = cli_schema_required_has(required, name);
+            printf("  --%s <%s>%s", flag, type, req ? " [required]" : "");
+            if (desc[0]) {
+                printf("  %s", desc);
+            }
+            printf("\n");
+        }
+    }
+
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return CLI_OK;
+}
+
+/* ── doctor ────────────────────────────────────────────────────────
+ * A stale install degrades to a silent no-op: list_projects hides projects,
+ * the hook matcher misses Bash, the agent concludes "not indexed" and falls
+ * back to grep with no error anywhere. `doctor` makes that visible in one
+ * command: binary version, tool count, whether the cwd resolves to an
+ * indexed project (and how fresh/complete that index is), and whether the
+ * Claude Code / Codex integration files reference this binary and the
+ * current hook matchers. */
+
+static char *doctor_read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    enum { DOCTOR_FILE_CAP = 1024 * 1024 };
+    char *buf = (char *)malloc(DOCTOR_FILE_CAP + 1);
+    if (!buf) {
+        (void)fclose(f);
+        return NULL;
+    }
+    size_t n = fread(buf, 1, DOCTOR_FILE_CAP, f);
+    (void)fclose(f);
+    buf[n] = '\0';
+    return buf;
+}
+
+/* Count protocol entries, not nested input-schema fields or description text. */
+static int doctor_catalog_stats(const char *json, bool *has_inspect, bool *has_cursor) {
+    *has_inspect = false;
+    *has_cursor = false;
+    yyjson_doc *doc = json ? yyjson_read(json, strlen(json), 0) : nullptr;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *tools = yyjson_obj_get(root, "tools");
+    yyjson_val *cursor = yyjson_obj_get(root, "nextCursor");
+    *has_cursor = cursor && !yyjson_is_null(cursor);
+    int count = -1;
+    if (yyjson_is_arr(tools)) {
+        count = 0;
+        size_t index, maximum;
+        yyjson_val *entry;
+        yyjson_arr_foreach(tools, index, maximum, entry) {
+            const char *name = yyjson_get_str(yyjson_obj_get(entry, "name"));
+            if (!name || !name[0]) {
+                count = -1;
+                break;
+            }
+            count++;
+            if (strcmp(name, "inspect_symbol") == 0) {
+                *has_inspect = true;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return count;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+int cbm_cli_doctor_catalog_for_testing(const char *json, bool *has_inspect, bool *has_cursor) {
+    return doctor_catalog_stats(json, has_inspect, has_cursor);
+}
+#endif
+
+/* Value of "<key>": in an escaped-JSON tool envelope (index_status text). */
+static int doctor_json_int(const char *res, const char *key) {
+    char pat[CLI_BUF_256];
+    snprintf(pat, sizeof(pat), "\\\"%s\\\":", key);
+    const char *p = res ? strstr(res, pat) : NULL;
+    return p ? (int)strtol(p + strlen(pat), NULL, 10) : 0;
+}
+
+int cbm_cmd_doctor(const char *version) {
+    int warnings = 0;
+    int failures = 0;
+    printf("code-cortex-mcp doctor\n");
+    printf("  version:   %s\n", version ? version : "?");
+    printf("  cache dir: %s\n", cbm_resolve_cache_dir());
+
+    /* Tool catalog: one page must hold every tool (Codex never follows the
+     * cursor). */
+    char *tools = cbm_mcp_tools_list();
+    bool has_inspect = false;
+    bool has_cursor = false;
+    int tool_count = doctor_catalog_stats(tools, &has_inspect, &has_cursor);
+    free(tools);
+    if (tool_count >= 15 && has_inspect && !has_cursor) {
+        printf("  OK   tools/list: %d tools on one page (inspect_symbol present)\n", tool_count);
+    } else {
+        printf("  FAIL tools/list: %d tools, inspect_symbol %s, nextCursor %s — "
+               "the complete catalog must fit on one page\n",
+               tool_count, has_inspect ? "present" : "missing", has_cursor ? "present" : "absent");
+        failures++;
+    }
+
+    /* Working directory → project. */
+    const char *project = cbm_mcp_cwd_project();
+    if (!project) {
+        char cwd[CLI_BUF_1K];
+        if (!getcwd(cwd, sizeof(cwd))) {
+            cwd[0] = '\0';
+        }
+        printf("  WARN cwd %s is not inside an indexed repository: graph tools will need an "
+               "explicit project, and callers/impact queries for this code are unavailable. "
+               "Fix: run the index_repository tool once (or `code-cortex-mcp cli "
+               "index_repository --repo_path <root>`).\n",
+               cwd);
+        warnings++;
+    } else {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            char args[CLI_BUF_1K];
+            snprintf(args, sizeof(args), "{\"project\":\"%s\"}", project);
+            char *res = cbm_mcp_handle_tool(srv, "index_status", args);
+            int nodes = doctor_json_int(res, "nodes");
+            int edges = doctor_json_int(res, "edges");
+            int partial = 0;
+            const char *pp = res ? strstr(res, "\\\"parse_partial\\\":{") : NULL;
+            if (pp) {
+                partial = doctor_json_int(pp, "count");
+            }
+            char indexed_at[CLI_BUF_256] = "";
+            const char *ia = res ? strstr(res, "\\\"indexed_at\\\":\\\"") : NULL;
+            if (ia) {
+                ia += strlen("\\\"indexed_at\\\":\\\"");
+                size_t k = 0;
+                while (ia[k] && ia[k] != '\\' && k + 1 < sizeof(indexed_at)) {
+                    indexed_at[k] = ia[k];
+                    k++;
+                }
+                indexed_at[k] = '\0';
+            }
+            free(res);
+            printf("  OK   cwd resolves to project \"%s\" (%d nodes, %d edges%s%s)\n", project,
+                   nodes, edges, indexed_at[0] ? ", indexed " : "", indexed_at);
+            if (partial > 0) {
+                printf("  WARN %d file(s) were only partially parsed; graph answers for them are "
+                       "lower bounds (index_status lists them)\n",
+                       partial);
+                warnings++;
+            }
+            cbm_mcp_server_free(srv);
+        }
+    }
+
+    /* Claude Code integration. */
+    const char *home = cbm_get_home_dir();
+    char config_dir[CLI_BUF_1K] = "";
+    if (home) {
+        cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    }
+    if (config_dir[0]) {
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/settings.json", config_dir);
+        char *settings = doctor_read_file(path);
+        if (!settings) {
+            printf("  INFO Claude Code: no %s (not installed for Claude Code)\n", path);
+        } else {
+            bool pre = strstr(settings, "\"" CMM_HOOK_MATCHER "\"") != NULL &&
+                       strstr(settings, CMM_HOOK_GATE_SCRIPT) != NULL;
+            bool post = strstr(settings, "\"PostToolUse\"") != NULL &&
+                        strstr(settings, "\"" CMM_POST_HOOK_MATCHER "\"") != NULL;
+            bool session = strstr(settings, CMM_SESSION_REMINDER_SCRIPT) != NULL;
+            if (pre && post && session) {
+                printf("  OK   Claude Code hooks: PreToolUse(%s), PostToolUse(%s), SessionStart\n",
+                       CMM_HOOK_MATCHER, CMM_POST_HOOK_MATCHER);
+            } else {
+                printf("  WARN Claude Code hooks out of date (PreToolUse %s, PostToolUse %s, "
+                       "SessionStart %s). Fix: code-cortex-mcp install -y\n",
+                       pre ? "ok" : "missing/old matcher", post ? "ok" : "missing",
+                       session ? "ok" : "missing");
+                warnings++;
+            }
+            free(settings);
+        }
+        snprintf(path, sizeof(path), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
+        char *gate = doctor_read_file(path);
+        if (gate) {
+            const char *bin = strstr(gate, "BIN=\"");
+            char shown[CLI_BUF_1K] = "?";
+            if (bin) {
+                bin += strlen("BIN=\"");
+                size_t k = 0;
+                while (bin[k] && bin[k] != '"' && k + 1 < sizeof(shown)) {
+                    shown[k] = bin[k];
+                    k++;
+                }
+                shown[k] = '\0';
+            }
+            if (cbm_file_exists(shown)) {
+                printf("  OK   hook shim runs %s\n", shown);
+            } else {
+                printf("  WARN hook shim points at %s, which does not exist. Fix: "
+                       "code-cortex-mcp install -y\n",
+                       shown);
+                warnings++;
+            }
+            free(gate);
+        }
+        snprintf(path, sizeof(path), "%s/.mcp.json", config_dir);
+        char *mcp = doctor_read_file(path);
+        if (mcp && strstr(mcp, "code-cortex-mcp")) {
+            printf("  OK   Claude Code MCP registration: %s\n", path);
+        } else if (mcp) {
+            printf("  WARN %s does not register code-cortex-mcp. Fix: code-cortex-mcp install -y\n",
+                   path);
+            warnings++;
+        }
+        free(mcp);
+    }
+
+    /* Codex. */
+    if (home) {
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/.codex/config.toml", home);
+        char *toml = doctor_read_file(path);
+        if (toml) {
+            if (strstr(toml, "[mcp_servers.code-cortex-mcp]")) {
+                printf("  OK   Codex MCP registration: %s (tools appear as "
+                       "mcp__code_cortex_mcp__<tool>; optional servers get a 1 s startup grace, "
+                       "which a cold first exec can exceed — install warms the binary)\n",
+                       path);
+            } else {
+                printf("  INFO Codex: %s does not register code-cortex-mcp\n", path);
+            }
+            free(toml);
+        }
+    }
+
+    printf("%d failure(s), %d warning(s)\n", failures, warnings);
+    return failures ? CLI_ERR : 0;
+}

@@ -1,0 +1,222 @@
+# Reusable: soak tests (quick + ASan, all platforms)
+name: Soak
+
+on:
+  workflow_call:
+    inputs:
+      duration_minutes:
+        description: 'Soak duration in minutes'
+        type: number
+        default: 10
+      quick_timeout_minutes:
+        description: 'Job ceiling for the quick-soak legs. MUST exceed duration_minutes
+          by enough to cover checkout, msys2 setup and the build — the jobs check this
+          and fail fast if it does not.'
+        type: number
+        default: 40
+      run_asan:
+        description: 'Run ASan soak in addition to quick soak'
+        type: boolean
+        default: false
+      version:
+        description: 'Version string for build'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  soak-quick:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    # Comes from the caller alongside the duration, and the two are checked
+    # against each other below. A constant here can only truncate the thing the
+    # job exists to measure: this was `timeout-minutes: 30` while nightly-soak
+    # asked for a 240-minute soak, so all 13 scheduled Nightly Soak runs were
+    # cancelled mid-soak and none ever reported a result. Expressions cannot do
+    # arithmetic, so the ceiling cannot be derived from duration_minutes here.
+    timeout-minutes: ${{ inputs.quick_timeout_minutes }}
+    steps:
+      - name: Check the job ceiling clears the soak
+        shell: bash
+        run: |
+          soak=${{ inputs.duration_minutes }}
+          ceiling=${{ inputs.quick_timeout_minutes }}
+          if [ "$ceiling" -le "$soak" ]; then
+            echo "::error::quick_timeout_minutes ($ceiling) must exceed duration_minutes ($soak)." \
+                 "The runner would cancel this job mid-soak and report nothing."
+            exit 1
+          fi
+          echo "soak ${soak}m under a ${ceiling}m ceiling"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+      - name: Build
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+      - name: Soak (${{ inputs.duration_minutes }} min)
+        run: scripts/soak-test.sh build/c/code-cortex-mcp ${{ inputs.duration_minutes }}
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-quick-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results/
+          retention-days: 14
+
+  soak-quick-windows:
+    runs-on: windows-latest
+    # Same ceiling as soak-quick — see the note there. This leg spends the most
+    # of it before the soak starts, on msys2 setup plus the build.
+    timeout-minutes: ${{ inputs.quick_timeout_minutes }}
+    steps:
+      - name: Check the job ceiling clears the soak
+        shell: bash
+        run: |
+          soak=${{ inputs.duration_minutes }}
+          ceiling=${{ inputs.quick_timeout_minutes }}
+          if [ "$ceiling" -le "$soak" ]; then
+            echo "::error::quick_timeout_minutes ($ceiling) must exceed duration_minutes ($soak)." \
+                 "The runner would cancel this job mid-soak and report nothing."
+            exit 1
+          fi
+          echo "soak ${soak}m under a ${ceiling}m ceiling"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            git
+            coreutils
+      - name: Build
+        shell: msys2 {0}
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
+      - name: Soak (${{ inputs.duration_minutes }} min)
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/code-cortex-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }}
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-quick-windows-amd64
+          path: soak-results/
+          retention-days: 14
+
+  soak-asan:
+    if: ${{ inputs.run_asan }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cc: gcc
+            cxx: g++
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            cc: cc
+            cxx: c++
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cc: cc
+            cxx: c++
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install deps (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
+      - name: Build (ASan)
+        run: |
+          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+      - name: ASan soak (15 min)
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
+        run: scripts/soak-test.sh build/c/code-cortex-mcp 15
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-asan-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results/
+          retention-days: 14
+
+  soak-asan-windows:
+    if: ${{ inputs.run_asan }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            git
+            coreutils
+      - name: Build (ASan)
+        shell: msys2 {0}
+        run: |
+          SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++ EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+      - name: ASan soak (15 min, no leak detection)
+        shell: msys2 {0}
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:halt_on_error=0:log_path=soak-results/asan"
+        run: |
+          BIN=build/c/code-cortex-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" 15
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-asan-windows-amd64
+          path: soak-results/
+          retention-days: 14

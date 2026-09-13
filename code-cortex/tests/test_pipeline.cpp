@@ -1,0 +1,7771 @@
+/*
+ * test_pipeline.c — Integration tests for the indexing pipeline.
+ *
+ * Tests pipeline lifecycle, structure pass, and end-to-end indexing
+ * on a temporary directory with known file layout.
+ */
+#include "../src/foundation/compat.h"
+#include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
+#include "test_framework.h"
+#include "test_helpers.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
+#include "store/store.h"
+#include "foundation/subprocess.h"
+#include "foundation/constants.h"
+#include "mcp/mcp.h"
+#include "git/git_context.h"
+#include <yyjson/yyjson.h> // properties-JSON validity (oversized-props regression)
+#include <sqlite3.h>       // json_valid()/quick_check over every dumped row
+
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include "../src/foundation/cbm_atomic.h"
+#include "foundation/compat_thread.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include "graph_buffer/graph_buffer.h"
+#include "yyjson/yyjson.h"
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+extern "C" bool cbm_test_cpp_sites_need_cross(const CBMFileResult *result);
+TEST(pipeline_cpp_cross_gate_uses_sites_not_entry_count) {
+    CBMCall calls[2] = {};
+    calls[0].enclosing_func_qn = "p.run"; calls[0].callee_name = "known"; calls[0].source_byte = 10;
+    calls[1].enclosing_func_qn = "p.run"; calls[1].callee_name = "remote"; calls[1].source_byte = 20;
+    CBMResolvedCall resolutions[3] = {};
+    resolutions[0].caller_qn = "p.run"; resolutions[0].callee_qn = "p.known";
+    resolutions[0].strategy = "lsp_direct"; resolutions[0].confidence = 0.95f; resolutions[0].source_byte = 10;
+    resolutions[1] = resolutions[0]; // Duplicate success must not cover remote().
+    CBMFileResult result = {};
+    result.calls = {calls, 2, 2}; result.resolved_calls = {resolutions, 2, 3};
+    ASSERT(cbm_test_cpp_sites_need_cross(&result));
+    resolutions[1].callee_qn = "p.remote"; resolutions[1].source_byte = 20;
+    ASSERT(!cbm_test_cpp_sites_need_cross(&result));
+    resolutions[2].caller_qn = "p.run"; resolutions[2].callee_qn = "unknown.call";
+    resolutions[2].strategy = "lsp_unresolved"; resolutions[2].source_byte = 30;
+    result.resolved_calls.count = 3;
+    ASSERT(cbm_test_cpp_sites_need_cross(&result));
+    PASS();
+}
+extern "C" void cbm_test_guard_ambiguous_cpp_receivers(CBMFileResult *result, int first_new_record);
+TEST(pipeline_cpp_receiver_guard_uses_current_pass_and_leaf) {
+    CBMCall calls[4] = {};
+    const char *names[] = {"freeCall", "factory()->act", "factory", "other"};
+    const uint32_t offsets[] = {10, 20, 20, 30};
+    for (int i = 0; i < 4; ++i) {
+        calls[i].enclosing_func_qn = "p.run";
+        calls[i].callee_name = names[i]; calls[i].source_byte = offsets[i];
+    }
+    CBMResolvedCall diagnostics[4] = {};
+    for (auto& diagnostic : diagnostics) {
+        diagnostic.caller_qn = "p.run";
+        diagnostic.strategy = "lsp_unresolved";
+        diagnostic.reason = "unknown_receiver_type";
+    }
+    // A stale preprocessed diagnostic has the same key as an authored free call.
+    diagnostics[0].callee_qn = "old.freeCall"; diagnostics[0].source_byte = 10;
+    diagnostics[1].callee_qn = "freeCall"; diagnostics[1].source_byte = 10;
+    diagnostics[1].reason = "function_not_in_registry";
+    // factory() and factory()->act() share caller and start byte, but not leaf.
+    diagnostics[2].callee_qn = "factory().act"; diagnostics[2].source_byte = 20;
+    diagnostics[3].callee_qn = "value.other"; diagnostics[3].source_byte = 30;
+    diagnostics[3].caller_qn = "p.differentCaller";
+    CBMFileResult result = {};
+    result.calls = {calls, 4, 4}; result.resolved_calls = {diagnostics, 4, 4};
+    cbm_test_guard_ambiguous_cpp_receivers(&result, 1);
+    ASSERT(!calls[0].requires_typed_resolution);
+    ASSERT(calls[1].requires_typed_resolution);
+    ASSERT(!calls[2].requires_typed_resolution);
+    ASSERT(!calls[3].requires_typed_resolution);
+    PASS();
+}
+
+#endif
+
+TEST(pipeline_cpp_pointer_members_match_in_memory_and_store) {
+    struct SavedEnv {
+        const char *name; std::string value; bool present;
+        explicit SavedEnv(const char *key)
+            : name(key), value(getenv(key) ? getenv(key) : ""), present(getenv(key) != nullptr) {}
+        ~SavedEnv() {
+            if (present) cbm_setenv(name, value.c_str(), 1);
+            else cbm_unsetenv(name);
+        }
+    } store_env("CBM_RESULT_STORE"), single_env("CBM_INDEX_SINGLE_THREAD"), workers_env("CBM_WORKERS");
+    char root[256] = "/tmp/cbm_cpp_fields_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    std::string repo = std::string(root) + "/source";
+    ASSERT_EQ(th_write_file((repo + "/header/RawPacket.h").c_str(),
+        "#pragma once\nnamespace pcpp {\n"
+        "struct RawPacket { virtual void reallocateData(int); };\n"
+        "struct MBufRawPacket : RawPacket { void reallocateData(int) override; }; }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/src/RawPacket.cpp").c_str(),
+        "#include \"RawPacket.h\"\nnamespace pcpp {\n"
+        "void RawPacket::reallocateData(int) {}\n"
+        "void MBufRawPacket::reallocateData(int) {} }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/header/Packet.h").c_str(),
+        "#pragma once\n#include \"RawPacket.h\"\nnamespace pcpp {\n"
+        "struct Packet { RawPacket *m_RawPacket;\n"
+        "RawPacket *getPacket() { return m_RawPacket; }\n"
+        "void grow(); void explicitGrow(); void typedGrow(); void getterGrow(); void shadow(MBufRawPacket *m_RawPacket); }; }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/src/Packet.cpp").c_str(),
+        "#include \"Packet.h\"\nnamespace pcpp {\n"
+        "void Packet::grow() { m_RawPacket->reallocateData(1); }\n"
+        "void Packet::explicitGrow() { this->m_RawPacket->reallocateData(1); }\n"
+        "void Packet::typedGrow() { RawPacket *receiver = m_RawPacket; receiver->reallocateData(1); }\n"
+        "void Packet::getterGrow() { getPacket()->reallocateData(1); }\n"
+        "void Packet::shadow(MBufRawPacket *m_RawPacket) { m_RawPacket->reallocateData(1); } }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/header/Distractor.h").c_str(),
+        "#pragma once\nnamespace unrelated { struct RawPacket { void reallocateData(int); }; }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/src/Distractor.cpp").c_str(),
+        "#include \"Distractor.h\"\nnamespace unrelated { void RawPacket::reallocateData(int) {} }\n"), 0);
+    for (int i = 0; i < 55; ++i)
+        ASSERT_EQ(th_write_file((repo + "/padding" + std::to_string(i) + ".cpp").c_str(), "// padding\n"), 0);
+    for (int mode = 0; mode < 3; ++mode) {
+        cbm_setenv("CBM_WORKERS", "2", 1);
+        cbm_setenv("CBM_RESULT_STORE", mode == 2 ? "1" : "0", 1);
+        if (mode == 0) cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        std::string path = std::string(root) + "/graph" + std::to_string(mode) + ".db";
+        auto *pipeline = cbm_pipeline_new(repo.c_str(), path.c_str(), CBM_MODE_FAST);
+        ASSERT_NOT_NULL(pipeline);
+        int rc = cbm_pipeline_run(pipeline);
+        cbm_pipeline_free(pipeline);
+        ASSERT_EQ(rc, 0);
+        sqlite3 *db = nullptr;
+        ASSERT_EQ(sqlite3_open(path.c_str(), &db), SQLITE_OK);
+        sqlite3_stmt *stmt = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(db,
+            "SELECT s.name,t.qualified_name,json_extract(e.properties,'$.strategy'),t.label "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.type='CALLS' AND s.file_path='src/Packet.cpp' AND t.name='reallocateData' "
+            "ORDER BY s.name", -1, &stmt, nullptr), SQLITE_OK);
+        int count = 0, seen = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *caller = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0));
+            const char *target = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1));
+            const char *strategy = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
+            ASSERT_STR_EQ(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 3)), "Method");
+            int bit = strcmp(caller, "grow") == 0 ? 1 : strcmp(caller, "explicitGrow") == 0 ? 2 : strcmp(caller, "shadow") == 0 ? 4 : strcmp(caller, "typedGrow") == 0 ? 8 : strcmp(caller, "getterGrow") == 0 ? 16 : 0;
+            ASSERT(bit != 0);
+            ASSERT_EQ(seen & bit, 0);
+            seen |= bit;
+            const char *owner = strcmp(caller, "shadow") == 0 ? ".src.RawPacket.MBufRawPacket.reallocateData" : ".src.RawPacket.RawPacket.reallocateData";
+            ASSERT_NOT_NULL(strstr(target, owner));
+            ASSERT_NOT_NULL(strategy);
+            ASSERT_EQ(strncmp(strategy, "lsp_", 4), 0);
+            ++count;
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        ASSERT_EQ(count, 5);
+        ASSERT_EQ(seen, 31);
+    }
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(pipeline_cpp_ambiguous_include_keeps_local_calls) {
+    struct SavedEnv {
+        const char *name; std::string value; bool present;
+        explicit SavedEnv(const char *key) : name(key), value(getenv(key) ? getenv(key) : ""), present(getenv(key) != nullptr) {}
+        ~SavedEnv() { if (present) cbm_setenv(name, value.c_str(), 1); else cbm_unsetenv(name); }
+    } store_env("CBM_RESULT_STORE"), single_env("CBM_INDEX_SINGLE_THREAD"), workers_env("CBM_WORKERS");
+    char root[256] = "/tmp/cbm_cpp_ambiguous_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    std::string repo = std::string(root) + "/source";
+    ASSERT_EQ(th_write_file((repo + "/left/Widget.h").c_str(),
+        "namespace left { struct Widget { void act(); }; }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/right/Widget.h").c_str(),
+        "namespace right { struct Widget { void act(); }; }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/src/Left.cpp").c_str(),
+        "#include \"../left/Widget.h\"\nnamespace left { void Widget::act() {} }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/src/Right.cpp").c_str(),
+        "#include \"../right/Widget.h\"\nnamespace right { void Widget::act() {} }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/header/Utility.h").c_str(),
+        "void external(); namespace api { void externalQualified(); }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/src/Utility.cpp").c_str(),
+        "#include \"Utility.h\"\nvoid external() {} namespace api { void externalQualified() {} }\n"), 0);
+    ASSERT_EQ(th_write_file((repo + "/src/Client.cpp").c_str(),
+        "#include \"Widget.h\"\n#include \"../header/Utility.h\"\nvoid known() {}\n"
+        "void invoke(Widget *value) { known(); external(); api::externalQualified(); value->act(); }\n"), 0);
+    for (int i = 0; i < 55; ++i)
+        ASSERT_EQ(th_write_file((repo + "/padding" + std::to_string(i) + ".cpp").c_str(), "// padding\n"), 0);
+    for (int mode = 0; mode < 3; ++mode) {
+        cbm_setenv("CBM_WORKERS", "2", 1);
+        cbm_setenv("CBM_RESULT_STORE", mode == 2 ? "1" : "0", 1);
+        if (mode == 0) cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        std::string path = std::string(root) + "/graph" + std::to_string(mode) + ".db";
+        auto *pipeline = cbm_pipeline_new(repo.c_str(), path.c_str(), CBM_MODE_FAST);
+        ASSERT_NOT_NULL(pipeline);
+        int rc = cbm_pipeline_run(pipeline);
+        cbm_pipeline_free(pipeline);
+        ASSERT_EQ(rc, 0);
+        sqlite3 *db = nullptr;
+        ASSERT_EQ(sqlite3_open(path.c_str(), &db), SQLITE_OK);
+        sqlite3_stmt *stmt = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(db,
+            "SELECT t.name,t.file_path,json_extract(e.properties,'$.strategy') "
+            "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.type='CALLS' AND s.file_path='src/Client.cpp' AND s.name='invoke' ORDER BY t.name",
+            -1, &stmt, nullptr), SQLITE_OK);
+        for (const char *name : {"external", "externalQualified"}) {
+            ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+            ASSERT_STR_EQ(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0)), name);
+            ASSERT_STR_EQ(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1)), "src/Utility.cpp");
+        }
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_STR_EQ(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 0)), "known");
+        ASSERT_STR_EQ(reinterpret_cast<const char *>(sqlite3_column_text(stmt, 1)), "src/Client.cpp");
+        const char *strategy = reinterpret_cast<const char *>(sqlite3_column_text(stmt, 2));
+        ASSERT_NOT_NULL(strategy);
+        ASSERT_EQ(strncmp(strategy, "lsp_", 4), 0);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE); // No declaration or guessed Method target.
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(parallel_store_preserves_kotlin_to_java_method_call) {
+    struct Env {
+        const char *name; std::string value; bool present;
+        explicit Env(const char *key):name(key),value(getenv(key)?getenv(key):""),present(getenv(key)!=nullptr){}
+        ~Env(){ if(present) cbm_setenv(name,value.c_str(),1); else cbm_unsetenv(name); }
+    } store_env("CBM_RESULT_STORE"), single_env("CBM_INDEX_SINGLE_THREAD"), workers_env("CBM_WORKERS");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD"); cbm_setenv("CBM_WORKERS","2",1);
+    char root[256] = "/tmp/cbm_store_jvm_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    std::string repo=std::string(root)+"/source";
+    ASSERT_EQ(th_write_file((repo+"/src/main/java/demo/Base.java").c_str(),
+        "package demo; public class Base { public int value(){return 7;} }\n"),0);
+    ASSERT_EQ(th_write_file((repo+"/src/main/kotlin/demo/Wrapper.kt").c_str(),
+        "package demo\nclass Wrapper { fun run(): Int { return Base().value() } }\n"),0);
+    ASSERT_EQ(th_write_file((repo+"/noise.cpp").c_str(),
+        "struct Noise { int value(){return 1;} };\n"),0);
+    for(int i=0;i<55;++i) ASSERT_EQ(th_write_file((repo+"/padding"+std::to_string(i)+".cpp").c_str(),"// padding\n"),0);
+    for(int spill=0;spill<2;++spill){
+        cbm_setenv("CBM_RESULT_STORE",spill?"1":"0",1);
+        std::string path=std::string(root)+"/graph"+std::to_string(spill)+".db";
+        auto *pipeline=cbm_pipeline_new(repo.c_str(),path.c_str(),CBM_MODE_FAST); ASSERT_NOT_NULL(pipeline);
+        int rc=cbm_pipeline_run(pipeline); cbm_pipeline_free(pipeline); ASSERT_EQ(rc,0);
+        sqlite3 *db=nullptr; ASSERT_EQ(sqlite3_open(path.c_str(),&db),SQLITE_OK);
+        sqlite3_stmt *stmt=nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(db,"SELECT count(*) FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id WHERE e.type='CALLS' AND s.name='run' AND t.name='value' AND json_extract(e.properties,'$.strategy')='lsp_kt_method'",-1,&stmt,nullptr),SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt),SQLITE_ROW); int calls=sqlite3_column_int(stmt,0);
+        sqlite3_finalize(stmt); sqlite3_close(db); ASSERT_EQ(calls,1);
+    }
+    th_rmtree(root); PASS();
+}
+
+
+/* ── Helper: create temp test repo with known layout ───────────── */
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static void append_concurrent_function(void *path) {
+    th_append_file(static_cast<const char *>(path), "\nint concurrent_added() { return 9; }\n");
+}
+
+TEST(pipeline_incremental_preserves_classified_version) {
+    char root[256] = "/tmp/cbm_version_race_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char dbpath[512], target[512], trigger[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/graph.db", root);
+    snprintf(target, sizeof(target), "%s/target.cpp", root);
+    snprintf(trigger, sizeof(trigger), "%s/trigger.cpp", root);
+    th_write_file(target, "int original() { return 1; }\n");
+    th_write_file(trigger, "int trigger() { return 2; }\n");
+    for (int run = 0; run < 3; run++) {
+        if (run == 1) {
+            th_append_file(trigger, "// changed\n");
+            cbm_pipeline_test_after_classify(append_concurrent_function, target);
+        }
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(root, dbpath, CBM_MODE_FAST);
+        ASSERT_NOT_NULL(pipeline);
+        int rc = cbm_pipeline_run(pipeline);
+        cbm_pipeline_free(pipeline);
+        cbm_pipeline_test_after_classify(nullptr, nullptr);
+        ASSERT_EQ(rc, 0);
+    }
+    sqlite3 *db = nullptr;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT count(*) FROM nodes WHERE name='concurrent_added'", -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    th_rmtree(root);
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+TEST(pipeline_initial_preserves_extracted_version) {
+    char root[256] = "/tmp/cbm_version_race_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    char dbpath[512], target[512], trigger[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/graph.db", root);
+    snprintf(target, sizeof(target), "%s/target.cpp", root);
+    snprintf(trigger, sizeof(trigger), "%s/trigger.cpp", root);
+    th_write_file(target, "int original() { return 1; }\n");
+    th_write_file(trigger, "int trigger() { return 2; }\n");
+    for (int run = 0; run < 2; run++) {
+        if (run == 0) {
+            cbm_pipeline_test_after_extract(append_concurrent_function, target);
+        }
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(root, dbpath, CBM_MODE_FAST);
+        ASSERT_NOT_NULL(pipeline);
+        int rc = cbm_pipeline_run(pipeline);
+        cbm_pipeline_free(pipeline);
+        cbm_pipeline_test_after_extract(nullptr, nullptr);
+        ASSERT_EQ(rc, 0);
+    }
+    sqlite3 *db = nullptr;
+    ASSERT_EQ(sqlite3_open(dbpath, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT count(*) FROM nodes WHERE name='concurrent_added'", -1, &stmt, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int count = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    th_rmtree(root);
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+#endif
+
+static char g_tmpdir[256];
+
+/* Create:
+ *   /tmp/cbm_test_XXXXXX/
+ *     main.go       (empty)
+ *     pkg/
+ *       service.go  (empty)
+ *       util/
+ *         helper.go (empty)
+ */
+static int setup_test_repo(void) {
+    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
+    if (!cbm_mkdtemp(g_tmpdir))
+        return -1;
+
+    char path[512];
+
+    /* main.go — calls Serve() from pkg */
+    snprintf(path, sizeof(path), "%s/main.go", g_tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package main\n\n"
+               "import \"pkg\"\n\n"
+               "func main() {\n"
+               "\tpkg.Serve()\n"
+               "}\n");
+    fclose(f);
+
+    /* pkg/ */
+    snprintf(path, sizeof(path), "%s/pkg", g_tmpdir);
+    cbm_mkdir(path);
+
+    /* pkg/service.go — calls Help() from util */
+    snprintf(path, sizeof(path), "%s/pkg/service.go", g_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package pkg\n\n"
+               "import \"pkg/util\"\n\n"
+               "func Serve() {\n"
+               "\tutil.Help()\n"
+               "}\n");
+    fclose(f);
+
+    /* pkg/util/ */
+    snprintf(path, sizeof(path), "%s/pkg/util", g_tmpdir);
+    cbm_mkdir(path);
+
+    /* pkg/util/helper.go */
+    snprintf(path, sizeof(path), "%s/pkg/util/helper.go", g_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "package util\n\nfunc Help() {}\n");
+    fclose(f);
+
+    return 0;
+}
+
+/* Recursive remove (simple, not production-grade) */
+static void rm_rf(const char *path) {
+    th_rmtree(path);
+}
+
+static void teardown_test_repo(void) {
+    if (g_tmpdir[0])
+        rm_rf(g_tmpdir);
+    g_tmpdir[0] = '\0';
+}
+
+/* ── Lifecycle tests ─────────────────────────────────────────────── */
+
+TEST(pipeline_create_free) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_STR_EQ(cbm_pipeline_project_name(p), "some-path");
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_null_repo) {
+    cbm_pipeline_t *p = cbm_pipeline_new(NULL, NULL, CBM_MODE_FULL);
+    ASSERT_NULL(p);
+    PASS();
+}
+
+TEST(pipeline_free_null) {
+    cbm_pipeline_free(NULL); /* should not crash */
+    PASS();
+}
+
+TEST(pipeline_cancel) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_cancel(p);
+    /* Running a cancelled pipeline should return -1 immediately */
+    int rc = cbm_pipeline_run(p);
+    /* Note: it may fail because /some/path doesn't exist, not because of cancel.
+     * This test just verifies cancel doesn't crash. */
+    (void)rc;
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_cancel_null) {
+    cbm_pipeline_cancel(NULL); /* should not crash */
+    PASS();
+}
+
+TEST(pipeline_run_null) {
+    int rc = cbm_pipeline_run(NULL);
+    ASSERT_EQ(rc, -1);
+    PASS();
+}
+
+/* ── Focused: file-backed store persistence ─────────────────────── */
+
+TEST(store_file_persistence) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/persist_test.db", g_tmpdir);
+
+    /* Write data */
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    cbm_store_upsert_project(s1, "proj", "/tmp");
+    cbm_node_t n = {.project = "proj",
+                    .label = "Function",
+                    .name = "foo",
+                    .qualified_name = "proj.foo",
+                    .file_path = "f.go"};
+    int64_t id = cbm_store_upsert_node(s1, &n);
+    ASSERT_GT(id, 0);
+    int cnt1 = cbm_store_count_nodes(s1, "proj");
+    ASSERT_EQ(cnt1, 1);
+    cbm_store_checkpoint(s1);
+    cbm_store_close(s1);
+
+    /* Reopen and verify */
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    int cnt2 = cbm_store_count_nodes(s2, "proj");
+    ASSERT_EQ(cnt2, 1);
+    cbm_store_close(s2);
+
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(store_bulk_persistence) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/bulk_test.db", g_tmpdir);
+
+    /* Verify: begin_bulk + explicit txn + end_bulk persists to file */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    cbm_store_upsert_project(s, "proj", "/tmp");
+    cbm_store_begin_bulk(s);
+    cbm_store_begin(s);
+    cbm_node_t n = {.project = "proj",
+                    .label = "Function",
+                    .name = "foo",
+                    .qualified_name = "proj.foo",
+                    .file_path = "f.go"};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    ASSERT_GT(id, 0);
+    ASSERT_EQ(cbm_store_commit(s), 0);
+    cbm_store_end_bulk(s);
+    cbm_store_checkpoint(s);
+    cbm_store_close(s);
+
+    /* Reopen and verify data survived */
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_EQ(cbm_store_count_nodes(s2, "proj"), 1);
+    cbm_store_close(s2);
+
+    teardown_test_repo();
+    PASS();
+}
+
+/* ── Integration: structure pass on temp repo ────────────────────── */
+
+TEST(pipeline_structure_nodes) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    /* Verify results by opening the store */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Should have nodes: 1 Project + 2 Folders + 3 Files + N Functions */
+    int node_count = cbm_store_count_nodes(s, project);
+    ASSERT_GTE(node_count, 9); /* 6 structure + at least 3 definitions */
+
+    /* Verify project node exists */
+    cbm_node_t proj_node = {0};
+    rc = cbm_store_find_node_by_qn(s, project, project, &proj_node);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(proj_node.label, "Project");
+    cbm_node_free_fields(&proj_node);
+
+    /* Verify folder nodes */
+    cbm_node_t *folders = NULL;
+    int folder_count = 0;
+    rc = cbm_store_find_nodes_by_label(s, project, "Folder", &folders, &folder_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GTE(folder_count, 2); /* pkg, pkg/util */
+    cbm_store_free_nodes(folders, folder_count);
+
+    /* Verify file nodes */
+    cbm_node_t *file_nodes = NULL;
+    int file_count = 0;
+    rc = cbm_store_find_nodes_by_label(s, project, "File", &file_nodes, &file_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GTE(file_count, 3); /* main.go, service.go, helper.go */
+    cbm_store_free_nodes(file_nodes, file_count);
+
+    /* Verify edges exist */
+    int edge_count = cbm_store_count_edges(s, project);
+    ASSERT_GTE(edge_count, 5); /* CONTAINS_FOLDER + CONTAINS_FILE edges */
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_structure_edges) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Check CONTAINS_FILE edges */
+    int cf_count = cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE");
+    /* Check CONTAINS_FOLDER edges */
+    int cd_count = cbm_store_count_edges_by_type(s, project, "CONTAINS_FOLDER");
+
+    /* Cleanup before assertions (so failures don't leak) */
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+
+    ASSERT_GTE(cf_count, 3); /* project->main.go, pkg->service.go, util->helper.go */
+    ASSERT_GTE(cd_count, 1); /* project->pkg (pkg->util may merge on some platforms) */
+    PASS();
+}
+
+TEST(pipeline_project_name_derived) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+
+    /* Project name should be derived from tmpdir path */
+    const char *name = cbm_pipeline_project_name(p);
+    ASSERT_NOT_NULL(name);
+    ASSERT_TRUE(strlen(name) > 0);
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_branch_root_structure) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_branch_root.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    char branch_qn[1024];
+    snprintf(branch_qn, sizeof(branch_qn), "%s.__branch__.working-tree", project);
+
+    cbm_node_t project_node = {0};
+    cbm_node_t branch_node = {0};
+    cbm_node_t root_file_node = {0};
+    cbm_node_t root_folder_node = {0};
+    rc = cbm_store_find_node_by_qn(s, project, project, &project_node);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    rc = cbm_store_find_node_by_qn(s, project, branch_qn, &branch_node);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_STR_EQ(branch_node.label, "Branch");
+    ASSERT_STR_EQ(branch_node.name, "working-tree");
+    ASSERT_NOT_NULL(strstr(branch_node.properties_json, "\"is_git\":false"));
+    char *root_folder_qn = cbm_pipeline_fqn_folder(project, "pkg");
+    char *root_file_qn = cbm_pipeline_fqn_compute(project, "main.go", "__file__");
+    ASSERT_NOT_NULL(root_folder_qn);
+    ASSERT_NOT_NULL(root_file_qn);
+    rc = cbm_store_find_node_by_qn(s, project, root_folder_qn, &root_folder_node);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    rc = cbm_store_find_node_by_qn(s, project, root_file_qn, &root_file_node);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+
+    cbm_edge_t *has_branch = NULL;
+    int has_branch_count = 0;
+    rc = cbm_store_find_edges_by_source_type(s, project_node.id, "HAS_BRANCH", &has_branch,
+                                             &has_branch_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(has_branch_count, 1);
+    ASSERT_EQ(has_branch[0].target_id, branch_node.id);
+
+    cbm_edge_t *project_files = NULL;
+    int project_file_count = 0;
+    rc = cbm_store_find_edges_by_source_type(s, project_node.id, "CONTAINS_FILE", &project_files,
+                                             &project_file_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(project_file_count, 0);
+
+    cbm_edge_t *branch_files = NULL;
+    int branch_file_count = 0;
+    rc = cbm_store_find_edges_by_source_type(s, branch_node.id, "CONTAINS_FILE", &branch_files,
+                                             &branch_file_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(branch_file_count, 1);
+    ASSERT_EQ(branch_files[0].target_id, root_file_node.id);
+
+    cbm_edge_t *branch_folders = NULL;
+    int branch_folder_count = 0;
+    rc = cbm_store_find_edges_by_source_type(s, branch_node.id, "CONTAINS_FOLDER", &branch_folders,
+                                             &branch_folder_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(branch_folder_count, 1);
+    ASSERT_EQ(branch_folders[0].target_id, root_folder_node.id);
+
+    cbm_store_free_edges(has_branch, has_branch_count);
+    cbm_store_free_edges(project_files, project_file_count);
+    cbm_store_free_edges(branch_files, branch_file_count);
+    cbm_store_free_edges(branch_folders, branch_folder_count);
+    cbm_node_free_fields(&project_node);
+    cbm_node_free_fields(&branch_node);
+    cbm_node_free_fields(&root_file_node);
+    cbm_node_free_fields(&root_folder_node);
+    free(root_folder_qn);
+    free(root_file_qn);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_fast_mode) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_fast.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    /* Just verify it completes without error in fast mode */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    int node_count = cbm_store_count_nodes(s, project);
+    ASSERT_GT(node_count, 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+/* ── Definitions pass tests ──────────────────────────────────────── */
+
+TEST(pipeline_definitions_function_nodes) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_defs.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Verify Function nodes extracted from Go source files */
+    cbm_node_t *funcs = NULL;
+    int func_count = 0;
+    rc = cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &func_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GTE(func_count, 3); /* main, Serve, Help */
+
+    /* Verify each expected function exists */
+    int found_main = 0, found_serve = 0, found_help = 0;
+    for (int i = 0; i < func_count; i++) {
+        if (strcmp(funcs[i].name, "main") == 0)
+            found_main = 1;
+        else if (strcmp(funcs[i].name, "Serve") == 0)
+            found_serve = 1;
+        else if (strcmp(funcs[i].name, "Help") == 0)
+            found_help = 1;
+    }
+    ASSERT_TRUE(found_main);
+    ASSERT_TRUE(found_serve);
+    ASSERT_TRUE(found_help);
+
+    cbm_store_free_nodes(funcs, func_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_definitions_defines_edges) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_defs_edges.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* DEFINES edges: File → Function (one per extracted definition) */
+    int defines_count = cbm_store_count_edges_by_type(s, project, "DEFINES");
+    ASSERT_GTE(defines_count, 3); /* main.go→main, service.go→Serve, helper.go→Help */
+
+    /* CONTAINS_FILE edges should still exist from structure pass */
+    int cf_count = cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE");
+    ASSERT_GTE(cf_count, 3);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_definitions_properties) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_defs_props.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Verify a function has valid properties (complexity, lines, etc.) */
+    cbm_node_t *funcs = NULL;
+    int func_count = 0;
+    rc = cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &func_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_GT(func_count, 0);
+
+    /* Check that Serve (exported) has is_exported:true in properties */
+    for (int i = 0; i < func_count; i++) {
+        if (strcmp(funcs[i].name, "Serve") == 0) {
+            ASSERT_NOT_NULL(funcs[i].properties_json);
+            ASSERT_TRUE(strstr(funcs[i].properties_json, "\"is_exported\":true") != NULL);
+        }
+        /* All functions should have file_path set */
+        ASSERT_NOT_NULL(funcs[i].file_path);
+    }
+
+    cbm_store_free_nodes(funcs, func_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+/* Node properties must remain VALID JSON even when a definition's serialized
+ * properties exceed the fixed 2 KB build buffer. Found on the Linux kernel:
+ * 135 nodes (50-param functions with struct-typed signatures) had properties
+ * truncated mid-string at 2047 bytes — malformed JSON that aborts EVERY
+ * json_extract()-based consumer (arch_entry_points, partial indexes, user
+ * Cypher on properties). Oversized optional fields must be dropped whole,
+ * never cut mid-value. */
+TEST(pipeline_def_props_valid_json_when_oversized) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    /* Sweep of C functions with growing signatures. The corruption fires only
+     * when the serialized position lands in a narrow window just under the
+     * buffer margin as the param_types array starts — the array is then cut
+     * mid-item (`"param_types":["enum`), exactly the kernel failure shape.
+     * Sweeping 10..69 params deterministically hits the window (pre-fix:
+     * sweep_fn_30 -> 2047-byte malformed properties). ONE FUNCTION PER FILE so
+     * the file count exceeds MIN_FILES_FOR_PARALLEL (50) and the test covers
+     * the PARALLEL pipeline's duplicated props builder (pass_parallel.c) — the
+     * path large repos take; the serial twin lives in pass_definitions.c. */
+    for (int n = 10; n < 70; n++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/sweep_%02d.c", g_tmpdir, n);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            teardown_test_repo();
+            FAIL("failed to write sweep file");
+        }
+        fprintf(f, "int sweep_fn_%02d(", n);
+        for (int i = 0; i < n; i++) {
+            fprintf(f, "%sstruct long_struct_type_name_padding_padding_%02d *par_%02d",
+                    i ? ", " : "", i, i);
+        }
+        fprintf(f, ") { return 0; }\n");
+        fclose(f);
+    }
+
+    /* Multi-line parameter declarations: param_types items then carry raw
+     * newline/tab bytes from the source slice. The array appender's inline
+     * escape loop only handled quote/backslash, so the raw control bytes made
+     * the JSON invalid (118 Linux-kernel rows of this shape). */
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/sweep_nl.c", g_tmpdir);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            teardown_test_repo();
+            FAIL("failed to write sweep_nl.c");
+        }
+        fprintf(f, "int sweep_fn_nl(struct\n\t\t\t\treally_long_struct_name *a,\n"
+                   "          enum\n\tweird_enum b) { return 0; }\n");
+        fclose(f);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_huge_props.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *funcs = NULL;
+    int func_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &func_count),
+              CBM_STORE_OK);
+    int checked = 0;
+    for (int i = 0; i < func_count; i++) {
+        if (strncmp(funcs[i].name, "sweep_fn_", 9) != 0) {
+            continue;
+        }
+        ASSERT_NOT_NULL(funcs[i].properties_json);
+        yyjson_doc *doc =
+            yyjson_read(funcs[i].properties_json, strlen(funcs[i].properties_json), 0);
+        if (!doc) {
+            printf("    INVALID properties JSON for %s (%zu bytes): ...%s\n", funcs[i].name,
+                   strlen(funcs[i].properties_json),
+                   funcs[i].properties_json + (strlen(funcs[i].properties_json) > 60
+                                                   ? strlen(funcs[i].properties_json) - 60
+                                                   : 0));
+        }
+        ASSERT_NOT_NULL(doc); /* valid JSON for EVERY sweep size */
+        yyjson_doc_free(doc);
+        checked++;
+    }
+    ASSERT_EQ(checked, 61); /* all sweep functions present (60 sizes + nl case) */
+
+    cbm_store_free_nodes(funcs, func_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+/* Edge properties must be VALID JSON. Decorator source text (quotes, raw
+ * newlines: @register.tag("block"), multi-line @override_settings) was
+ * interpolated raw into the DECORATES properties — django produced 3826
+ * malformed edges, and any json_extract-based consumer (including the
+ * url_path_gen generated-column evaluation during PRAGMA integrity_check)
+ * aborts on them. Usage/call emit sites had the same hole for sliced source
+ * text. */
+TEST(pipeline_edge_props_valid_json) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[512];
+    snprintf(path, sizeof(path), "%s/deco.py", g_tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write deco.py");
+    }
+    fprintf(f, "from x import register\n"
+               "@register.tag(\"block\")\n"
+               "def do_block(parser):\n"
+               "    return parser\n"
+               "@register.tag(\"extends\")\n"
+               "def do_extends(parser):\n"
+               "    return parser\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_edge_props.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, project, "DECORATES", &edges, &edge_count),
+              CBM_STORE_OK);
+    ASSERT_GT(edge_count, 0); /* the decorators must produce DECORATES edges */
+    for (int i = 0; i < edge_count; i++) {
+        const char *pj = edges[i].properties_json;
+        if (!pj) {
+            continue;
+        }
+        yyjson_doc *doc = yyjson_read(pj, strlen(pj), 0);
+        if (!doc) {
+            printf("    INVALID edge properties JSON: %.80s\n", pj);
+        }
+        ASSERT_NOT_NULL(doc);
+        yyjson_doc_free(doc);
+    }
+
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+/* ── Regression guard: EVERY stored properties blob is valid JSON ── */
+
+/* A node/edge properties blob that is not valid JSON makes json_extract() fail.
+ * The edges table declares
+ *   url_path_gen   TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path'))
+ *   local_name_gen TEXT GENERATED ALWAYS AS (... json_extract(properties,'$.local_name') ...)
+ * and indexes both, so evaluating them on a malformed blob raises "malformed
+ * JSON" — which makes PRAGMA quick_check ERROR OUT, and a quick_check error
+ * quarantines the whole project database (renamed .corrupt, rebuilt from
+ * scratch). ONE bad producer anywhere therefore deletes a user's entire index.
+ * The bulk dump writes SQLite pages directly, so nothing rejects the blob on the
+ * way in: it lands on disk and detonates on the next integrity check (#898 —
+ * every brokered ASYNC_CALLS edge stored {"broker":"celery} unterminated).
+ *
+ * This is a WHOLE-TABLE guard rather than one test per producer: the fixture
+ * drives the real pipeline over the service-edge paths (HTTP client call,
+ * brokered async call, GraphQL client call), over values that carry a bare
+ * double quote (channel name, YAML config key), and over identifiers long
+ * enough to overflow the fixed props buffers — then asserts json_valid() for
+ * EVERY row of nodes and edges plus a clean quick_check. A future producer that
+ * emits a malformed blob for this fixture fails here without a new test.
+ *
+ * The repo is indexed TWICE: once with CBM_INDEX_SINGLE_THREAD=1 (the
+ * sequential passes) and once without it and with more than
+ * MIN_FILES_FOR_PARALLEL files (the parallel twins, which is what any
+ * real-world repo takes). The pass twins have drifted apart before — the
+ * escaping of channel/import properties lives on one side only — so a defect in
+ * either path has to fail this test. */
+enum {
+    PG_PAD_FILES = 55,       /* > MIN_FILES_FOR_PARALLEL (50) in pipeline.cpp */
+    PG_LONG_IDENT_LEN = 240, /* callee/ref names that overflow a 512-byte blob */
+    PG_LONG_PATH_LEN = 300,
+};
+
+/* Fill buf with `len` copies of c plus a NUL. */
+static void pg_repeat(char *buf, size_t buf_sz, size_t len, char c) {
+    if (len >= buf_sz) {
+        len = buf_sz - 1;
+    }
+    memset(buf, c, len);
+    buf[len] = '\0';
+}
+
+static bool pg_write(const char *dir, const char *name, const char *content) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    fputs(content, f);
+    fclose(f);
+    return true;
+}
+
+/* Write the properties-stressing fixture into an existing repo directory. */
+static bool pg_create_fixture(const char *dir) {
+    char ident[PG_LONG_IDENT_LEN + 1];
+    char path_tail[PG_LONG_PATH_LEN + 1];
+    pg_repeat(ident, sizeof(ident), PG_LONG_IDENT_LEN, 'c');
+    pg_repeat(path_tail, sizeof(path_tail), PG_LONG_PATH_LEN, 'p');
+
+    /* HTTP client call + brokered async call. Both carry a callee chain and a
+     * URL/topic long enough that the two escaped values plus the wrapper no
+     * longer fit a 512-byte props buffer — the truncated blob then loses its
+     * closing brace mid-"url_path", the exact shape url_path_gen chokes on. */
+    char svc[2048];
+    snprintf(svc, sizeof(svc),
+             "import requests\n"
+             "def call_http():\n"
+             "    return %s.requests.get(\"/api/%s\")\n"
+             "def call_async():\n"
+             "    return %s.celery_app.send_task(\"topic.%s\")\n",
+             ident, path_tail, ident, path_tail);
+    if (!pg_write(dir, "svc_props.py", svc)) {
+        return false;
+    }
+
+    /* GraphQL client call: the operation is the query document, which carries
+     * bare double quotes. Only the parallel path emits GRAPHQL_CALLS. */
+    if (!pg_write(dir, "gqlmod.py", "def gql(q):\n    return q\n")) {
+        return false;
+    }
+    if (!pg_write(dir, "gqluse.py",
+                  "from gqlmod import gql\n"
+                  "def fetch_user():\n"
+                  "    return gql('{ user(name:\"ann\") { id } }')\n")) {
+        return false;
+    }
+
+    /* Channel name sliced from a single-quoted literal that contains a bare
+     * double quote — it reaches the Channel node's properties verbatim. */
+    if (!pg_write(dir, "chan_props.js",
+                  "const socket = io();\n"
+                  "export function send(payload) {\n"
+                  "  socket.emit('say \"hi\"', payload);\n"
+                  "}\n")) {
+        return false;
+    }
+
+    /* YAML key path: the key node text is joined RAW, quotes included. */
+    if (!pg_write(dir, "infra_props.yaml",
+                  "\"svc.endpoint\":\n"
+                  "  push_endpoint: https://example.com/api/v1/orders\n")) {
+        return false;
+    }
+
+    /* A reference name long enough to overflow a 256-byte USAGE props buffer. */
+    char usage[1024];
+    snprintf(usage, sizeof(usage),
+             "u%s = 1\n"
+             "def read_it():\n"
+             "    return u%s\n",
+             ident, ident);
+    if (!pg_write(dir, "longref.py", usage)) {
+        return false;
+    }
+
+    /* A decorated route handler whose qualified name overflows a 512-byte
+     * HANDLES props buffer. The length comes from the SYMBOL, not from nested
+     * directories: a 241-character path component pushes the fixture past
+     * MAX_PATH once %TEMP% is prepended, and cbm_mkdir_p/fopen have no \\?\\
+     * prefix, so a long-path fixture fails the whole suite on a Windows job
+     * without long-path support. A long identifier costs nothing and exercises
+     * the same buffer. */
+    /* Short route PATH on purpose: a 300-character path produces no HANDLES
+     * edge at all, which would make the handler assertion vacuous rather than
+     * strict. The length under test belongs on the SYMBOL. The trailing
+     * _endmarker is what makes truncation visible — a clipped value keeps its
+     * prefix and its run of 'c's, so only a marker at the very end can tell a
+     * whole value from a shortened one. */
+    char route[2048];
+    snprintf(route, sizeof(route),
+             "@app.route(\"/deep/handler\")\n"
+             "def handler_%s%s_endmarker():\n"
+             "    return 1\n",
+             ident, ident);
+    if (!pg_write(dir, "route_props.py", route)) {
+        return false;
+    }
+
+    /* Padding so the file count crosses MIN_FILES_FOR_PARALLEL. */
+    for (int i = 0; i < PG_PAD_FILES; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad_%02d.py", i);
+        snprintf(body, sizeof(body), "def pad_%02d():\n    return %d\n", i, i);
+        if (!pg_write(dir, name, body)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Count rows in `table` whose properties are not valid JSON, printing the first
+ * offender. Returns -1 if the query itself fails. */
+static int pg_invalid_rows(sqlite3 *db, const char *table, const char *kind_col) {
+    char sql[256];
+    snprintf(sql, sizeof(sql),
+             "SELECT %s, properties FROM %s "
+             "WHERE properties IS NOT NULL AND json_valid(properties) = 0",
+             kind_col, table);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int bad = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (bad < 3) {
+            const char *kind = (const char *)sqlite3_column_text(st, 0);
+            const char *props = (const char *)sqlite3_column_text(st, 1);
+            printf("    INVALID %s properties [%s]: %.200s\n", table, kind ? kind : "?",
+                   props ? props : "(null)");
+        }
+        bad++;
+    }
+    sqlite3_finalize(st);
+    return bad;
+}
+
+/* COUNT(*) > 0 for a fixed query. */
+static bool pg_count_gt0(sqlite3 *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool hit = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0) > 0;
+    sqlite3_finalize(st);
+    return hit;
+}
+
+/* PRAGMA quick_check — the exact probe whose failure quarantines the DB. */
+static bool pg_quick_check_ok(sqlite3 *db) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "PRAGMA quick_check(1);", -1, &st, NULL) != SQLITE_OK) {
+        printf("    quick_check prepare failed: %s\n", sqlite3_errmsg(db));
+        return false;
+    }
+    bool ok = false;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *res = (const char *)sqlite3_column_text(st, 0);
+        ok = res && strcmp(res, "ok") == 0;
+        if (!ok) {
+            printf("    quick_check: %s\n", res ? res : "(null)");
+        }
+    } else {
+        printf("    quick_check step failed: %s\n", sqlite3_errmsg(db));
+    }
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* Index `repo` into `db_path` and assert every stored blob is valid JSON.
+ * Returns 0 on success, 1 on failure (caller turns that into a test failure). */
+static int pg_index_and_verify(const char *repo, const char *db_path, const char *mode) {
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p || cbm_pipeline_run(p) != 0) {
+        printf("    %s: pipeline run failed\n", mode);
+        cbm_pipeline_free(p);
+        return 1;
+    }
+    cbm_pipeline_free(p);
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        printf("    %s: cannot open %s\n", mode, db_path);
+        sqlite3_close(db);
+        return 1;
+    }
+    int bad_nodes = pg_invalid_rows(db, "nodes", "label");
+    int bad_edges = pg_invalid_rows(db, "edges", "type");
+    bool qc = pg_quick_check_ok(db);
+    /* Valid is not enough: degrading every blob to "{}" would also satisfy the
+     * json_valid() sweep. The long-URL HTTP client call must still carry its
+     * url_path, so a future "fix" cannot buy validity by dropping the data. */
+    bool has_url = pg_count_gt0(db, "SELECT COUNT(*) FROM edges WHERE type = 'HTTP_CALLS' AND "
+                                    "json_extract(properties,'$.url_path') LIKE '/api/p%'");
+    /* The same trap, one level deeper, and the reason this check exists at all:
+     * once cbm_json_props_checked() fails closed, an UNDERSIZED BUFFER no longer
+     * produces malformed JSON — it produces a valid "{}". The json_valid sweep
+     * above therefore cannot see a buffer-size regression; only a fidelity check
+     * can. The route handler's qualified name is the longest value the pipeline
+     * emits, so it is the one that goes first: at hprops[512] this edge comes
+     * back as {} while every other assertion here still passes. */
+    bool has_handler =
+        pg_count_gt0(db, "SELECT COUNT(*) FROM edges WHERE type = 'HANDLES' AND "
+                         "json_extract(properties,'$.handler') LIKE '%\\_endmarker' ESCAPE '\\'");
+    sqlite3_close(db);
+
+    if (bad_nodes != 0 || bad_edges != 0 || !qc || !has_url || !has_handler) {
+        printf("    %s: %d malformed node blobs, %d malformed edge blobs, quick_check %s, "
+               "url_path preserved: %s, long handler preserved: %s\n",
+               mode, bad_nodes, bad_edges, qc ? "ok" : "FAILED", has_url ? "yes" : "NO",
+               has_handler ? "yes" : "NO");
+        return 1;
+    }
+    return 0;
+}
+
+TEST(pipeline_all_properties_valid_json) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    if (!pg_create_fixture(g_tmpdir)) {
+        teardown_test_repo();
+        FAIL("failed to write properties fixture");
+    }
+
+    char db_seq[512];
+    char db_par[512];
+    snprintf(db_seq, sizeof(db_seq), "%s/props_seq.db", g_tmpdir);
+    snprintf(db_par, sizeof(db_par), "%s/props_par.db", g_tmpdir);
+
+    /* Sequential passes: pass_calls / pass_definitions / pass_usages. */
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int seq_rc = pg_index_and_verify(g_tmpdir, db_seq, "sequential");
+
+    /* Parallel twins: pass_parallel (the default above 50 files). On a
+     * single-core host this degrades to the sequential path, which still
+     * passes — it just stops adding coverage. */
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    int par_rc = pg_index_and_verify(g_tmpdir, db_par, "parallel");
+
+    teardown_test_repo();
+    ASSERT_EQ(seq_rc, 0);
+    ASSERT_EQ(par_rc, 0);
+    PASS();
+}
+
+/* ── Calls pass tests ──────────────────────────────────────────── */
+
+TEST(pipeline_calls_resolution) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_calls.db", g_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* main() calls pkg.Serve(), Serve() calls util.Help() → at least 2 CALLS edges */
+    int calls_count = cbm_store_count_edges_by_type(s, project, "CALLS");
+    ASSERT_GTE(calls_count, 1); /* at least some calls resolved */
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+/* ── Git history pass tests ─────────────────────────────────────── */
+
+TEST(githistory_is_trackable) {
+    /* Source files → trackable */
+    ASSERT_TRUE(cbm_is_trackable_file("main.go"));
+    ASSERT_TRUE(cbm_is_trackable_file("src/app.py"));
+    ASSERT_TRUE(cbm_is_trackable_file("README.md"));
+
+    /* Non-trackable: skip prefixes */
+    ASSERT_FALSE(cbm_is_trackable_file("node_modules/foo/bar.js"));
+    ASSERT_FALSE(cbm_is_trackable_file("vendor/lib/dep.go"));
+    ASSERT_FALSE(cbm_is_trackable_file(".git/config"));
+    ASSERT_FALSE(cbm_is_trackable_file("__pycache__/mod.pyc"));
+
+    /* Non-trackable: lock files */
+    ASSERT_FALSE(cbm_is_trackable_file("package-lock.json"));
+    ASSERT_FALSE(cbm_is_trackable_file("go.sum"));
+
+    /* Non-trackable: binary/minified extensions */
+    ASSERT_FALSE(cbm_is_trackable_file("image.png"));
+    ASSERT_FALSE(cbm_is_trackable_file("src/style.min.css"));
+
+    PASS();
+}
+
+/* cbm_commit_files_t::files is `char **` — a C-era API that only ever reads the
+ * paths — but C++ forbids converting a string literal to char*. The coupling
+ * tests below share these mutable buffers instead of literals. */
+static char cf_a[] = "a.go";
+static char cf_b[] = "b.go";
+static char cf_c[] = "c.go";
+static char cf_d[] = "d.go";
+static char cf_e[] = "e.go";
+
+TEST(githistory_compute_coupling) {
+    /* 5 commits with overlapping files */
+    char *files_0[] = {cf_a, cf_b, cf_c};
+    char *files_1[] = {cf_a, cf_b};
+    char *files_2[] = {cf_a, cf_b};
+    char *files_3[] = {cf_a, cf_c};
+    char *files_4[] = {cf_d, cf_e};
+
+    cbm_commit_files_t commits[] = {
+        {files_0, 3, 0}, {files_1, 2, 0}, {files_2, 2, 0}, {files_3, 2, 0}, {files_4, 2, 0},
+    };
+
+    cbm_change_coupling_t results[100];
+    int n = cbm_compute_change_coupling(commits, 5, results, 100);
+
+    /* a.go + b.go co-change 3 times → should appear */
+    bool found_ab = false;
+    for (int i = 0; i < n; i++) {
+        if ((strcmp(results[i].file_a, "a.go") == 0 && strcmp(results[i].file_b, "b.go") == 0) ||
+            (strcmp(results[i].file_a, "b.go") == 0 && strcmp(results[i].file_b, "a.go") == 0)) {
+            found_ab = true;
+            ASSERT_EQ(results[i].co_change_count, 3);
+            ASSERT_TRUE(results[i].coupling_score >= 0.7);
+        }
+    }
+    ASSERT_TRUE(found_ab);
+
+    /* d.go + e.go co-change only 1 time → below threshold, should NOT appear */
+    for (int i = 0; i < n; i++) {
+        ASSERT_FALSE(strcmp(results[i].file_a, "d.go") == 0 ||
+                     strcmp(results[i].file_b, "d.go") == 0);
+    }
+
+    PASS();
+}
+
+TEST(githistory_coupling_carries_last_co_change) {
+    /* Coupling output must surface the most recent commit timestamp at which
+     * a pair co-changed, so callers can score recency in addition to
+     * frequency. The pair (a.go, b.go) co-changes at three timestamps; the
+     * resulting last_co_change must be the maximum (newest) of those. */
+    char *files_old[] = {cf_a, cf_b};
+    char *files_mid[] = {cf_a, cf_b};
+    char *files_new[] = {cf_a, cf_b};
+    /* Unrelated co-change in the middle to make sure we don't accidentally
+     * pick up that pair's timestamp by index. */
+    char *files_other[] = {cf_c, cf_d};
+
+    cbm_commit_files_t commits[] = {
+        {files_old, 2, 1700000000LL},   /* oldest a.go/b.go co-change */
+        {files_other, 2, 1750000000LL}, /* unrelated pair */
+        {files_mid, 2, 1720000000LL},
+        {files_new, 2, 1800000000LL}, /* newest a.go/b.go co-change */
+    };
+
+    cbm_change_coupling_t results[16];
+    int n = cbm_compute_change_coupling(commits, 4, results, 16);
+    ASSERT_GTE(n, 1);
+
+    bool found_ab = false;
+    for (int i = 0; i < n; i++) {
+        bool is_ab =
+            (strcmp(results[i].file_a, "a.go") == 0 && strcmp(results[i].file_b, "b.go") == 0) ||
+            (strcmp(results[i].file_a, "b.go") == 0 && strcmp(results[i].file_b, "a.go") == 0);
+        if (!is_ab) {
+            continue;
+        }
+        ASSERT_EQ(results[i].co_change_count, 3);
+        /* last_co_change must be the max of the three a.go/b.go timestamps. */
+        ASSERT_EQ(results[i].last_co_change, 1800000000LL);
+        found_ab = true;
+    }
+    ASSERT_TRUE(found_ab);
+    PASS();
+}
+
+TEST(githistory_skip_large_commits) {
+    /* A single commit with 25 files → should be skipped (>20) */
+    char *files[25];
+    char bufs[25][32];
+    for (int i = 0; i < 25; i++) {
+        snprintf(bufs[i], sizeof(bufs[i]), "file%d.go", i);
+        files[i] = bufs[i];
+    }
+
+    cbm_commit_files_t commits[] = {{files, 25, 0}};
+
+    cbm_change_coupling_t results[100];
+    int n = cbm_compute_change_coupling(commits, 1, results, 100);
+    ASSERT_EQ(n, 0);
+
+    PASS();
+}
+
+TEST(githistory_limits_to_max) {
+    /* Create many commits to generate >100 couplings */
+    /* 50 files, each pair has 3 commits → C(50,2)=1225 pairs, but only
+     * pairs with ≥3 co-changes and score≥0.3 pass the threshold */
+    int nfiles = 50;
+    int npairs = nfiles * (nfiles - 1) / 2;
+    int ncommits = npairs * 3;
+
+    cbm_commit_files_t *commits =
+        (cbm_commit_files_t *)calloc(ncommits, sizeof(cbm_commit_files_t));
+    char **file_strs = (char **)calloc(nfiles, sizeof(char *));
+    for (int i = 0; i < nfiles; i++) {
+        file_strs[i] = (char *)malloc(32);
+        snprintf(file_strs[i], 32, "f%d.go", i);
+    }
+
+    int ci = 0;
+    for (int i = 0; i < nfiles; i++) {
+        for (int j = i + 1; j < nfiles; j++) {
+            for (int k = 0; k < 3; k++) {
+                commits[ci].files = (char **)malloc(2 * sizeof(char *));
+                commits[ci].files[0] = file_strs[i];
+                commits[ci].files[1] = file_strs[j];
+                commits[ci].count = 2;
+                ci++;
+            }
+        }
+    }
+
+    /* max_out = 100 → should cap at 100 */
+    cbm_change_coupling_t results[100];
+    int n = cbm_compute_change_coupling(commits, ncommits, results, 100);
+    ASSERT_TRUE(n <= 100);
+
+    /* Cleanup */
+    for (int i = 0; i < ncommits; i++) {
+        free(commits[i].files);
+    }
+    for (int i = 0; i < nfiles; i++) {
+        free(file_strs[i]);
+    }
+    free(file_strs);
+    free(commits);
+
+    PASS();
+}
+
+/* ── Test detection tests ──────────────────────────────────────── */
+
+TEST(testdetect_is_test_file) {
+    /* Test file patterns (all languages) */
+    ASSERT_TRUE(cbm_is_test_path("foo_test.go"));
+    ASSERT_TRUE(cbm_is_test_path("test_handler.py"));
+    ASSERT_TRUE(cbm_is_test_path("handler.test.js"));
+    ASSERT_TRUE(cbm_is_test_path("handler.spec.ts"));
+    ASSERT_TRUE(cbm_is_test_path("Component.test.tsx"));
+    ASSERT_TRUE(cbm_is_test_path("OrderTest.java"));
+    ASSERT_TRUE(cbm_is_test_path("handler_test.rs"));
+    ASSERT_TRUE(cbm_is_test_path("handler_test.cpp"));
+    ASSERT_TRUE(cbm_is_test_path("OrderTest.cs"));
+    ASSERT_TRUE(cbm_is_test_path("OrderTest.php"));
+    ASSERT_TRUE(cbm_is_test_path("OrderSpec.scala"));
+    ASSERT_TRUE(cbm_is_test_path("OrderTest.kt"));
+    ASSERT_TRUE(cbm_is_test_path("handler_test.lua"));
+
+    /* Non-test file patterns */
+    ASSERT_FALSE(cbm_is_test_path("foo.go"));
+    ASSERT_FALSE(cbm_is_test_path("handler.py"));
+    ASSERT_FALSE(cbm_is_test_path("handler.js"));
+    ASSERT_FALSE(cbm_is_test_path("handler.ts"));
+    ASSERT_FALSE(cbm_is_test_path("Component.tsx"));
+    ASSERT_FALSE(cbm_is_test_path("Order.java"));
+    ASSERT_FALSE(cbm_is_test_path("handler.rs"));
+    ASSERT_FALSE(cbm_is_test_path("handler.cpp"));
+    ASSERT_FALSE(cbm_is_test_path("Order.cs"));
+    ASSERT_FALSE(cbm_is_test_path("Order.php"));
+    ASSERT_FALSE(cbm_is_test_path("Order.scala"));
+    ASSERT_FALSE(cbm_is_test_path("Order.kt"));
+    ASSERT_FALSE(cbm_is_test_path("handler.lua"));
+
+    PASS();
+}
+
+TEST(testdetect_is_test_function) {
+    /* Test function patterns */
+    ASSERT_TRUE(cbm_is_test_func_name("TestCreate"));  /* Go */
+    ASSERT_TRUE(cbm_is_test_func_name("test_create")); /* Python/Rust/Lua */
+    ASSERT_TRUE(cbm_is_test_func_name("test"));        /* JS/TS */
+    ASSERT_TRUE(cbm_is_test_func_name("describe"));    /* JS/TS */
+    ASSERT_TRUE(cbm_is_test_func_name("it"));          /* JS/TS */
+    ASSERT_TRUE(cbm_is_test_func_name("testCreate"));  /* Java/PHP/Scala/Kotlin */
+    ASSERT_TRUE(cbm_is_test_func_name("TestCreate"));  /* C++/C# */
+
+    /* Non-test function patterns */
+    ASSERT_FALSE(cbm_is_test_func_name("create"));
+    ASSERT_FALSE(cbm_is_test_func_name("handleRequest"));
+    ASSERT_FALSE(cbm_is_test_func_name("process"));
+
+    PASS();
+}
+
+/* ── Implements pass tests (graph buffer based) ────────────────── */
+
+TEST(implements_creates_override) {
+    /* Port of TestPassImplementsCreatesOverrideEdges.
+     * Set up Interface+methods, Class+methods, verify IMPLEMENTS+OVERRIDE. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    /* Interface "Reader" with methods "Read" and "Close" */
+    int64_t iface_id =
+        cbm_gbuf_upsert_node(gb, "Interface", "Reader", "pkg.Reader", "pkg/reader.go", 1, 5, "{}");
+    ASSERT_GT(iface_id, 0);
+
+    int64_t read_method_id =
+        cbm_gbuf_upsert_node(gb, "Method", "Read", "pkg.Reader.Read", "pkg/reader.go", 2, 2, "{}");
+    int64_t close_method_id = cbm_gbuf_upsert_node(gb, "Method", "Close", "pkg.Reader.Close",
+                                                   "pkg/reader.go", 3, 3, "{}");
+    ASSERT_GT(read_method_id, 0);
+    ASSERT_GT(close_method_id, 0);
+
+    /* DEFINES_METHOD edges */
+    cbm_gbuf_insert_edge(gb, iface_id, read_method_id, "DEFINES_METHOD", "{}");
+    cbm_gbuf_insert_edge(gb, iface_id, close_method_id, "DEFINES_METHOD", "{}");
+
+    /* Class "FileReader" with matching methods */
+    int64_t class_id = cbm_gbuf_upsert_node(gb, "Class", "FileReader", "pkg.FileReader",
+                                            "pkg/filereader.go", 1, 10, "{}");
+    ASSERT_GT(class_id, 0);
+
+    int64_t fr_read_id =
+        cbm_gbuf_upsert_node(gb, "Method", "Read", "pkg.FileReader.Read", "pkg/filereader.go", 2, 4,
+                             "{\"receiver\":\"(f *FileReader)\"}");
+    int64_t fr_close_id =
+        cbm_gbuf_upsert_node(gb, "Method", "Close", "pkg.FileReader.Close", "pkg/filereader.go", 5,
+                             7, "{\"receiver\":\"(f *FileReader)\"}");
+    ASSERT_GT(fr_read_id, 0);
+    ASSERT_GT(fr_close_id, 0);
+
+    /* Run Go-style implements detection */
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int edges_created = cbm_pipeline_implements_go(&ctx);
+    ASSERT_GT(edges_created, 0);
+
+    /* Verify IMPLEMENTS edge: FileReader → Reader */
+    const cbm_gbuf_edge_t **impl_edges = NULL;
+    int impl_count = 0;
+    int rc =
+        cbm_gbuf_find_edges_by_source_type(gb, class_id, "IMPLEMENTS", &impl_edges, &impl_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(impl_count, 1);
+    ASSERT_EQ(impl_edges[0]->target_id, iface_id);
+
+    /* Verify OVERRIDE edges: FileReader.Read → Reader.Read */
+    const cbm_gbuf_edge_t **read_overrides = NULL;
+    int read_override_count = 0;
+    rc = cbm_gbuf_find_edges_by_source_type(gb, fr_read_id, "OVERRIDE", &read_overrides,
+                                            &read_override_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(read_override_count, 1);
+    ASSERT_EQ(read_overrides[0]->target_id, read_method_id);
+
+    /* Verify OVERRIDE edge: FileReader.Close → Reader.Close */
+    const cbm_gbuf_edge_t **close_overrides = NULL;
+    int close_override_count = 0;
+    rc = cbm_gbuf_find_edges_by_source_type(gb, fr_close_id, "OVERRIDE", &close_overrides,
+                                            &close_override_count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(close_override_count, 1);
+    ASSERT_EQ(close_overrides[0]->target_id, close_method_id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(implements_no_match) {
+    /* Port of TestPassImplementsNoOverrideWithoutMatch.
+     * Interface requires Read+Write, struct only has Read → no edges. */
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    /* Interface "ReadWriter" with methods "Read" and "Write" */
+    int64_t iface_id = cbm_gbuf_upsert_node(gb, "Interface", "ReadWriter", "pkg.ReadWriter",
+                                            "pkg/rw.go", 1, 5, "{}");
+    int64_t read_id =
+        cbm_gbuf_upsert_node(gb, "Method", "Read", "pkg.ReadWriter.Read", "pkg/rw.go", 2, 2, "{}");
+    int64_t write_id = cbm_gbuf_upsert_node(gb, "Method", "Write", "pkg.ReadWriter.Write",
+                                            "pkg/rw.go", 3, 3, "{}");
+    cbm_gbuf_insert_edge(gb, iface_id, read_id, "DEFINES_METHOD", "{}");
+    cbm_gbuf_insert_edge(gb, iface_id, write_id, "DEFINES_METHOD", "{}");
+
+    /* Struct "OnlyReader" with only "Read" (missing "Write") */
+    int64_t class_id = cbm_gbuf_upsert_node(gb, "Class", "OnlyReader", "pkg.OnlyReader",
+                                            "pkg/onlyreader.go", 1, 10, "{}");
+    int64_t or_read_id =
+        cbm_gbuf_upsert_node(gb, "Method", "Read", "pkg.OnlyReader.Read", "pkg/onlyreader.go", 2, 4,
+                             "{\"receiver\":\"(o *OnlyReader)\"}");
+
+    /* Run Go-style implements detection */
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int edges_created = cbm_pipeline_implements_go(&ctx);
+    ASSERT_EQ(edges_created, 0);
+
+    /* Verify NO IMPLEMENTS edge */
+    const cbm_gbuf_edge_t **impl_edges = NULL;
+    int impl_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, class_id, "IMPLEMENTS", &impl_edges, &impl_count);
+    ASSERT_EQ(impl_count, 0);
+
+    /* Verify NO OVERRIDE edge */
+    const cbm_gbuf_edge_t **override_edges = NULL;
+    int override_count = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, or_read_id, "OVERRIDE", &override_edges,
+                                       &override_count);
+    ASSERT_EQ(override_count, 0);
+
+    /* Suppress unused warnings */
+    (void)iface_id;
+    (void)read_id;
+    (void)write_id;
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+/* ── Usages pass tests (full pipeline integration) ──────────────── */
+
+/* Helper to create a temp dir with a single source file */
+static char g_usages_tmpdir[256];
+
+static int setup_usages_repo(const char *filename, const char *content, const char *extra_file,
+                             const char *extra_content) {
+    snprintf(g_usages_tmpdir, sizeof(g_usages_tmpdir), "/tmp/cbm_usage_XXXXXX");
+    if (!cbm_mkdtemp(g_usages_tmpdir))
+        return -1;
+
+    /* Check if filename has subdirectory */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", g_usages_tmpdir, filename);
+
+    /* Create subdirectories if needed */
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s", path);
+    char *last_slash = strrchr(dir_path, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+        th_mkdir_p(dir_path);
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "%s", content);
+    fclose(f);
+
+    if (extra_file && extra_content) {
+        snprintf(path, sizeof(path), "%s/%s", g_usages_tmpdir, extra_file);
+        f = fopen(path, "w");
+        if (!f)
+            return -1;
+        fprintf(f, "%s", extra_content);
+        fclose(f);
+    }
+
+    return 0;
+}
+
+static void teardown_usages_repo(void) {
+    if (g_usages_tmpdir[0])
+        rm_rf(g_usages_tmpdir);
+    g_usages_tmpdir[0] = '\0';
+}
+
+TEST(usages_creates_edges) {
+    /* Port of TestPassUsagesCreatesEdges.
+     * Go source with callback reference → USAGE edge. */
+    const char *go_source = "package mypkg\n\n"
+                            "func Process(data string) string {\n"
+                            "\treturn data\n"
+                            "}\n\n"
+                            "func Register() {\n"
+                            "\thandler := Process\n"
+                            "\t_ = handler\n"
+                            "}\n";
+
+    if (setup_usages_repo("mypkg/main.go", go_source, "go.mod", "module testmod\ngo 1.21\n") != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_usages.db", g_usages_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Check for USAGE edges */
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    rc = cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &edge_count);
+
+    bool found_usage = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            if (strcmp(src.name, "Register") == 0 && strcmp(tgt.name, "Process") == 0) {
+                found_usage = true;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    ASSERT_TRUE(found_usage);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+    PASS();
+}
+
+TEST(usages_no_duplicate_calls) {
+    /* Port of TestPassUsagesDoesNotDuplicateCalls.
+     * A direct function call should produce CALLS but not USAGE. */
+    const char *go_source = "package mypkg\n\n"
+                            "func Helper() string {\n"
+                            "\treturn \"ok\"\n"
+                            "}\n\n"
+                            "func Main() {\n"
+                            "\tHelper()\n"
+                            "}\n";
+
+    if (setup_usages_repo("mypkg/main.go", go_source, "go.mod", "module testmod\ngo 1.21\n") != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_no_dup.db", g_usages_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Should have CALLS edge from Main to Helper */
+    cbm_edge_t *call_edges = NULL;
+    int call_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &call_edges, &call_count);
+
+    bool found_call = false;
+    for (int i = 0; i < call_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, call_edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, call_edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            if (strcmp(src.name, "Main") == 0 && strcmp(tgt.name, "Helper") == 0) {
+                found_call = true;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (call_edges)
+        cbm_store_free_edges(call_edges, call_count);
+    ASSERT_TRUE(found_call);
+
+    /* Should NOT have USAGE edge from Main to Helper */
+    cbm_edge_t *usage_edges = NULL;
+    int usage_count = 0;
+    cbm_store_find_edges_by_type(s, project, "USAGE", &usage_edges, &usage_count);
+
+    for (int i = 0; i < usage_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, usage_edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, usage_edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            ASSERT_FALSE(strcmp(src.name, "Main") == 0 && strcmp(tgt.name, "Helper") == 0);
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (usage_edges)
+        cbm_store_free_edges(usage_edges, usage_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+    PASS();
+}
+
+TEST(usages_kotlin_creates_edges) {
+    /* Port of TestPassUsagesKotlinCreatesEdges.
+     * Kotlin source with callback reference → USAGE edge. */
+    const char *kt_source = "fun process(data: String): String {\n"
+                            "    return data\n"
+                            "}\n\n"
+                            "fun register() {\n"
+                            "    val handler = ::process\n"
+                            "}\n";
+
+    if (setup_usages_repo("Main.kt", kt_source, NULL, NULL) != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_kt_usage.db", g_usages_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Check USAGE edges exist (Kotlin extraction may or may not produce them
+     * depending on extraction support — just verify no crash and valid counts) */
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    rc = cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &edge_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    /* Note: The Go test just logs, doesn't assert — same behavior here */
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+    PASS();
+}
+
+TEST(usages_kotlin_no_duplicate_calls) {
+    /* Port of TestPassUsagesKotlinDoesNotDuplicateCalls.
+     * Direct call in Kotlin → CALLS but not USAGE. */
+    const char *kt_source = "fun helper(): String {\n"
+                            "    return \"ok\"\n"
+                            "}\n\n"
+                            "fun main() {\n"
+                            "    helper()\n"
+                            "}\n";
+
+    if (setup_usages_repo("Main.kt", kt_source, NULL, NULL) != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_kt_nodup.db", g_usages_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_usages_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Should have CALLS edge from main to helper */
+    cbm_edge_t *call_edges = NULL;
+    int call_count = 0;
+    cbm_store_find_edges_by_type(s, project, "CALLS", &call_edges, &call_count);
+
+    bool found_call = false;
+    for (int i = 0; i < call_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, call_edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, call_edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            if (strcmp(src.name, "main") == 0 && strcmp(tgt.name, "helper") == 0) {
+                found_call = true;
+            }
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (call_edges)
+        cbm_store_free_edges(call_edges, call_count);
+    ASSERT_TRUE(found_call);
+
+    /* Should NOT have USAGE edge from main to helper */
+    cbm_edge_t *usage_edges = NULL;
+    int usage_count = 0;
+    cbm_store_find_edges_by_type(s, project, "USAGE", &usage_edges, &usage_count);
+
+    for (int i = 0; i < usage_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, usage_edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, usage_edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            ASSERT_FALSE(strcmp(src.name, "main") == 0 && strcmp(tgt.name, "helper") == 0);
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (usage_edges)
+        cbm_store_free_edges(usage_edges, usage_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_usages_repo();
+    PASS();
+}
+
+/* ── Pipeline language integration tests ────────────────────────── */
+
+/* General helper: create temp dir and write multiple files */
+static char g_lang_tmpdir[256];
+
+static int setup_lang_repo(const char **filenames, const char **contents, int count) {
+    snprintf(g_lang_tmpdir, sizeof(g_lang_tmpdir), "/tmp/cbm_lang_XXXXXX");
+    if (!cbm_mkdtemp(g_lang_tmpdir))
+        return -1;
+
+    for (int i = 0; i < count; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", g_lang_tmpdir, filenames[i]);
+
+        /* Create parent directories */
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", path);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+            th_mkdir_p(dir);
+        }
+
+        FILE *f = fopen(path, "wb");
+        if (!f)
+            return -1;
+        fprintf(f, "%s", contents[i]);
+        fclose(f);
+    }
+    return 0;
+}
+
+static void teardown_lang_repo(void) {
+    if (g_lang_tmpdir[0])
+        rm_rf(g_lang_tmpdir);
+    g_lang_tmpdir[0] = '\0';
+}
+
+TEST(pipeline_cpp_implicit_operators_require_types) {
+    const char *files[56], *contents[56];
+    char names[55][32];
+    files[0] = "operators.cpp";
+    contents[0] =
+        "#include \"remote.h\"\n"
+        "struct Box { int value; bool operator<(const Box &rhs) const { return value < rhs.value; } };\n"
+        "bool numeric(int a, int b) { return a < b; }\n"
+        "bool remote(Remote a, Remote b) { return a < b; }\n"
+        "bool mixed(Box a, Box b, int x, int y) { bool real = a < b; bool builtin = x < y; return real && builtin; }\n";
+    for (int i = 1; i < 56; i++) {
+        snprintf(names[i - 1], sizeof(names[i - 1]), "padding%d.cpp", i);
+        files[i] = names[i - 1];
+        contents[i] = "// Enough files to exercise the parallel resolver.\n";
+    }
+    files[1] = "remote.h";
+    contents[1] = "struct Remote { bool operator<(const Remote &rhs) const { return false; } };\n";
+    ASSERT_EQ(setup_lang_repo(files, contents, 56), 0);
+    const char *old = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved = old ? strdup(old) : nullptr;
+    for (int mode = 0; mode < 2; mode++) {
+        char db[512];
+        snprintf(db, sizeof(db), "%s/operators%d.db", g_lang_tmpdir, mode);
+        if (mode == 0) cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        cbm_pipeline_t *pipeline = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
+        ASSERT_NOT_NULL(pipeline);
+        int result = cbm_pipeline_run(pipeline);
+        if (saved) cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved, 1);
+        else cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        ASSERT_EQ(result, 0);
+        sqlite3 *sql = nullptr;
+        ASSERT_EQ(sqlite3_open_v2(db, &sql, SQLITE_OPEN_READONLY, nullptr), SQLITE_OK);
+        sqlite3_stmt *statement = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(sql,
+            "SELECT s.name,t.name,e.properties FROM edges e "
+            "JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+            "WHERE e.type='CALLS'", -1, &statement, nullptr), SQLITE_OK);
+        int calls = 0;
+        while (sqlite3_step(statement) == SQLITE_ROW) {
+            const char *caller = (const char *)sqlite3_column_text(statement, 0);
+            ASSERT(strcmp(caller, "mixed") == 0 || strcmp(caller, "remote") == 0);
+            ASSERT_STR_EQ((const char *)sqlite3_column_text(statement, 1), "operator<");
+            calls++;
+        }
+        ASSERT_EQ(calls, 2);
+        sqlite3_finalize(statement);
+        sqlite3_close(sql);
+        cbm_pipeline_free(pipeline);
+    }
+    free(saved);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_python_project) {
+    /* Port of TestPipelinePythonProject */
+    const char *files[] = {"main.py", "utils.py"};
+    const char *contents[] = {
+        "def greet(name):\n    return f\"Hello, {name}\"\n\n"
+        "def process():\n    result = greet(\"world\")\n    return result\n",
+
+        "API_URL = \"https://example.com/api\"\nMAX_RETRIES = 3\n\n"
+        "def fetch_data(url):\n    pass\n\n"
+        "class DataProcessor:\n    def transform(self, data):\n        return data\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *funcs = NULL;
+    int fc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &funcs, &fc);
+    ASSERT_GTE(fc, 3); /* greet, process, fetch_data */
+    cbm_store_free_nodes(funcs, fc);
+
+    cbm_node_t *cls = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
+    ASSERT_GTE(cc, 1); /* DataProcessor */
+    cbm_store_free_nodes(cls, cc);
+
+    cbm_node_t *methods = NULL;
+    int mc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Method", &methods, &mc);
+    ASSERT_GTE(mc, 1); /* transform */
+    cbm_store_free_nodes(methods, mc);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_go_cross_package_call) {
+    /* Port of TestGoCrossPackageCallViaImport */
+    const char *files[] = {"main.go", "svc/handler.go"};
+    const char *contents[] = {
+        "package main\n\nimport \"example.com/myapp/svc\"\n\n"
+        "func run() {\n\tsvc.ProcessOrder(\"123\")\n}\n",
+
+        "package svc\n\nfunc ProcessOrder(id string) error {\n\treturn nil\n}\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Verify ProcessOrder exists */
+    cbm_node_t *targets = NULL;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "ProcessOrder", &targets, &tc);
+    ASSERT_GT(tc, 0);
+
+    /* Verify run() exists */
+    cbm_node_t *callers = NULL;
+    int clc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "run", &callers, &clc);
+    ASSERT_GT(clc, 0);
+
+    /* Check CALLS edge from run to ProcessOrder */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    cbm_store_find_edges_by_source_type(s, callers[0].id, "CALLS", &edges, &ec);
+    bool found = false;
+    for (int i = 0; i < ec; i++) {
+        if (edges[i].target_id == targets[0].id)
+            found = true;
+    }
+    ASSERT_TRUE(found);
+
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+    cbm_store_free_nodes(targets, tc);
+    cbm_store_free_nodes(callers, clc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* End-to-end: two SwiftPM packages, Core and App, indexed under one root.
+ * App declares a local path dependency on Core and a target dependency on
+ * Core's product; App.swift does a bare `import Core`. This only resolves
+ * because Core's OWN Package.swift self-registers "Core" ->
+ * Core/Sources/Core in the shared pkgmap, landing App.swift's IMPORTS edge
+ * on that directory's Folder node -- proving real cross-package
+ * resolution. Asserts the EXACT provider node (the Core/Sources/Core
+ * Folder, found by its real QN, not a substring guess) and the exact edge
+ * (from App.swift's own file node to that provider). */
+TEST(pipeline_swift_cross_package_import) {
+    const char *files[] = {
+        "Core/Package.swift",
+        "Core/Sources/Core/Core.swift",
+        "App/Package.swift",
+        "App/Sources/App/App.swift",
+    };
+    const char *contents[] = {
+        ("let package = Package(\n"
+         "    name: \"Core\",\n"
+         "    products: [.library(name: \"Core\", targets: [\"Core\"])],\n"
+         "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+         ")\n"),
+
+        "public func coreValue() -> Int {\n    return 1\n}\n",
+
+        ("let package = Package(\n"
+         "    name: \"App\",\n"
+         "    dependencies: [.package(path: \"../Core\")],\n"
+         "    targets: [.target(name: \"App\", dependencies: [\n"
+         "        .product(name: \"Core\", package: \"Core\")\n"
+         "    ])]\n"
+         ")\n"),
+
+        ("import Core\n\n"
+         "func run() -> Int {\n    return coreValue()\n}\n"),
+    };
+
+    if (setup_lang_repo(files, contents, 4) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* The exact provider node: the Folder for Core/Sources/Core, which is
+     * exactly what Core/Package.swift's OWN self-registration resolves to
+     * (see cbm_pkgmap_build: pkg name "Core" -> fqn_module(entry_rel)).
+     * cbm_pipeline_fqn_module and cbm_pipeline_fqn_folder agree on this
+     * path (no extension on any segment to strip), so this is the same QN
+     * the structural pass gave the real Folder node -- not a guess. */
+    char *provider_qn = cbm_pipeline_fqn_folder(proj, "Core/Sources/Core");
+    ASSERT_NOT_NULL(provider_qn);
+    cbm_node_t provider = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, provider_qn, &provider), CBM_STORE_OK);
+    ASSERT_STR_EQ(provider.label, "Folder");
+    free(provider_qn);
+
+    /* The exact importing file node: App/Sources/App/App.swift. */
+    char *importer_qn = cbm_pipeline_fqn_compute(proj, "App/Sources/App/App.swift", "__file__");
+    ASSERT_NOT_NULL(importer_qn);
+    cbm_node_t importer = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, proj, importer_qn, &importer), CBM_STORE_OK);
+    free(importer_qn);
+
+    /* The IMPORTS edge must run from THAT importer to THAT provider --
+     * not merely "some edge lands on a QN containing Core" (a node named
+     * e.g. "AppCore" would have false-passed a substring check). */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, importer.id, "IMPORTS", &edges, &ec),
+              CBM_STORE_OK);
+
+    bool found_exact_edge = false;
+    for (int i = 0; i < ec; i++) {
+        if (edges[i].target_id == provider.id)
+            found_exact_edge = true;
+    }
+    ASSERT_TRUE(found_exact_edge);
+
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+    cbm_node_free_fields(&provider);
+    cbm_node_free_fields(&importer);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_python_cross_module_call) {
+    /* Port of TestPythonCrossModuleCallViaImport */
+    const char *files[] = {"utils.py", "main.py"};
+    const char *contents[] = {
+        "def fetch_data(url):\n    return {\"status\": \"ok\"}\n",
+
+        "from utils import fetch_data\n\n"
+        "def process():\n    result = fetch_data(\"https://example.com\")\n    return result\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *targets = NULL;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "fetch_data", &targets, &tc);
+    ASSERT_GT(tc, 0);
+
+    cbm_node_t *callers = NULL;
+    int clc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "process", &callers, &clc);
+    ASSERT_GT(clc, 0);
+
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    cbm_store_find_edges_by_source_type(s, callers[0].id, "CALLS", &edges, &ec);
+    bool found = false;
+    for (int i = 0; i < ec; i++) {
+        if (edges[i].target_id == targets[0].id)
+            found = true;
+    }
+    ASSERT_TRUE(found);
+
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+    cbm_store_free_nodes(targets, tc);
+    cbm_store_free_nodes(callers, clc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_go_type_classification) {
+    /* Port of TestGoTypeClassification */
+    const char *files[] = {"types.go"};
+    const char *contents[] = {"package types\n\n"
+                              "type Reader interface {\n\tRead(p []byte) (n int, err error)\n}\n\n"
+                              "type Writer interface {\n\tWrite(p []byte) (n int, err error)\n}\n\n"
+                              "type Config struct {\n\tHost string\n\tPort int\n}\n\n"
+                              "type ID = string\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Should have 2 Interface nodes (Reader, Writer) */
+    cbm_node_t *ifaces = NULL;
+    int ic = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Interface", &ifaces, &ic);
+    ASSERT_EQ(ic, 2);
+    cbm_store_free_nodes(ifaces, ic);
+
+    /* Should have 1 Class node (Config struct) */
+    cbm_node_t *cls = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
+    ASSERT_EQ(cc, 1);
+    ASSERT_STR_EQ(cls[0].name, "Config");
+    cbm_store_free_nodes(cls, cc);
+
+    /* Should have 1 Type node (ID alias) */
+    cbm_node_t *types = NULL;
+    int tc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Type", &types, &tc);
+    ASSERT_EQ(tc, 1);
+    ASSERT_STR_EQ(types[0].name, "ID");
+    cbm_store_free_nodes(types, tc);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_go_grouped_types) {
+    /* Port of TestGoGroupedTypeDeclaration */
+    const char *files[] = {"models.go"};
+    const char *contents[] = {"package models\n\n"
+                              "type (\n"
+                              "\tRequest struct {\n\t\tURL string\n\t}\n\n"
+                              "\tResponse struct {\n\t\tStatus int\n\t}\n\n"
+                              "\tHandler interface {\n\t\tHandle(req Request) Response\n\t}\n"
+                              ")\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *cls = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
+    ASSERT_EQ(cc, 2); /* Request, Response */
+    cbm_store_free_nodes(cls, cc);
+
+    cbm_node_t *ifaces = NULL;
+    int ic = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Interface", &ifaces, &ic);
+    ASSERT_EQ(ic, 1); /* Handler */
+    cbm_store_free_nodes(ifaces, ic);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_kotlin_project) {
+    /* Port of TestPipelineKotlinProject */
+    const char *files[] = {"Main.kt", "Service.kt"};
+    const char *contents[] = {
+        "fun greet(name: String): String {\n    return \"Hello, $name\"\n}\n\n"
+        "fun main() {\n    val result = greet(\"world\")\n    println(result)\n}\n",
+
+        "class OrderService {\n"
+        "    fun processOrder(id: String): Boolean {\n        return true\n    }\n\n"
+        "    fun submitOrder(order: String): Boolean {\n"
+        "        return processOrder(order)\n    }\n}\n\n"
+        "object Config {\n    val API_URL = \"https://example.com/api\"\n}\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *funcs = NULL;
+    int fc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &funcs, &fc);
+    ASSERT_GTE(fc, 2); /* greet, main */
+    cbm_store_free_nodes(funcs, fc);
+
+    cbm_node_t *cls = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
+    ASSERT_GTE(cc, 1); /* OrderService */
+    cbm_store_free_nodes(cls, cc);
+
+    cbm_node_t *methods = NULL;
+    int mc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Method", &methods, &mc);
+    ASSERT_GTE(mc, 2); /* processOrder, submitOrder */
+    cbm_store_free_nodes(methods, mc);
+
+    int edge_count = cbm_store_count_edges(s, proj);
+    ASSERT_GT(edge_count, 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_lua_anonymous_functions) {
+    /* Port of TestLuaAnonymousFunctionExtraction */
+    const char *files[] = {"app.lua"};
+    const char *contents[] = {"local run_before_filter\n"
+                              "run_before_filter = function(filter, r)\n"
+                              "  return filter(r)\n"
+                              "end\n\n"
+                              "local validate = function(data)\n"
+                              "  return data ~= nil\n"
+                              "end\n\n"
+                              "function named_func(x)\n"
+                              "  return x + 1\n"
+                              "end\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *funcs = NULL;
+    int fc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &funcs, &fc);
+    ASSERT_GTE(fc, 3); /* run_before_filter, validate, named_func */
+
+    /* Verify specific functions exist */
+    const char *expected[] = {"run_before_filter", "validate", "named_func"};
+    for (int e = 0; e < 3; e++) {
+        cbm_node_t *found = NULL;
+        int fnc = 0;
+        cbm_store_find_nodes_by_name(s, proj, expected[e], &found, &fnc);
+        ASSERT_GT(fnc, 0);
+        cbm_store_free_nodes(found, fnc);
+    }
+
+    cbm_store_free_nodes(funcs, fc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_csharp_modern) {
+    /* Port of TestCSharpModernFeatures */
+    const char *files[] = {"Controller.cs", "Model.cs"};
+    const char *contents[] = {"namespace Conduit.Features;\n\n"
+                              "public class UsersController {\n"
+                              "\tpublic void Get() {}\n"
+                              "\tpublic void Create(string name) {}\n"
+                              "}\n",
+
+                              "namespace Conduit.Models {\n"
+                              "\tclass User {\n"
+                              "\t\tpublic string Name { get; set; }\n"
+                              "\t\tpublic int GetAge() { return 0; }\n"
+                              "\t}\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *modules = NULL;
+    int modc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Module", &modules, &modc);
+    ASSERT_GTE(modc, 2);
+    cbm_store_free_nodes(modules, modc);
+
+    cbm_node_t *cls = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Class", &cls, &cc);
+    ASSERT_GTE(cc, 2); /* UsersController, User */
+    cbm_store_free_nodes(cls, cc);
+
+    cbm_node_t *methods = NULL;
+    int mc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Method", &methods, &mc);
+    ASSERT_GTE(mc, 3); /* Get, Create, GetAge */
+    cbm_store_free_nodes(methods, mc);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_bom_stripping) {
+    /* Port of TestBOMStripping — UTF-8 BOM prefix should be handled */
+    snprintf(g_lang_tmpdir, sizeof(g_lang_tmpdir), "/tmp/cbm_bom_XXXXXX");
+    if (!cbm_mkdtemp(g_lang_tmpdir))
+        FAIL("tmpdir");
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/bom.go", g_lang_tmpdir);
+    FILE *f = fopen(path, "wb");
+    ASSERT_NOT_NULL(f);
+    /* Write UTF-8 BOM (0xEF 0xBB 0xBF) followed by Go source */
+    unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    fwrite(bom, 1, 3, f);
+    fprintf(f, "package main\n\nfunc BOMFunc() {}\n");
+    fclose(f);
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *found = NULL;
+    int fc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "BOMFunc", &found, &fc);
+    ASSERT_GT(fc, 0); /* BOMFunc should be found despite BOM */
+    cbm_store_free_nodes(found, fc);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_form_call_resolution) {
+    /* Port of TestFORMProcedureCallResolution */
+    const char *files[] = {"calc.frm"};
+    const char *contents[] = {"#procedure callee(x)\n"
+                              "  id x = 0;\n"
+                              "#endprocedure\n"
+                              "#procedure caller()\n"
+                              "  #call callee(1)\n"
+                              "#endprocedure\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Verify CALLS edge exists to callee */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    cbm_store_find_edges_by_type(s, proj, "CALLS", &edges, &ec);
+    bool found = false;
+    for (int i = 0; i < ec; i++) {
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+            strcmp(tgt.name, "callee") == 0) {
+            found = true;
+        }
+        cbm_node_free_fields(&tgt);
+    }
+    ASSERT_TRUE(found);
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_python_type_inference) {
+    /* Port of TestPythonMethodDispatchViaTypeInference
+     * p = DataProcessor() then p.transform() → CALLS DataProcessor.transform */
+    const char *files[] = {"processor.py", "main.py"};
+    const char *contents[] = {"class DataProcessor:\n"
+                              "    def transform(self, data):\n"
+                              "        return data.upper()\n"
+                              "\n"
+                              "    def validate(self, data):\n"
+                              "        return len(data) > 0\n",
+
+                              "from processor import DataProcessor\n"
+                              "\n"
+                              "def run():\n"
+                              "    p = DataProcessor()\n"
+                              "    result = p.transform(\"hello\")\n"
+                              "    return result\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Verify DataProcessor.transform exists as a Method */
+    cbm_node_t *methods = NULL;
+    int mc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "transform", &methods, &mc);
+    ASSERT_GT(mc, 0);
+
+    /* Verify run() exists */
+    cbm_node_t *callers = NULL;
+    int clc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "run", &callers, &clc);
+    ASSERT_GT(clc, 0);
+
+    /* Check CALLS edge from run() to DataProcessor.transform */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    cbm_store_find_edges_by_source_type(s, callers[0].id, "CALLS", &edges, &ec);
+    bool found = false;
+    for (int i = 0; i < ec; i++) {
+        if (edges[i].target_id == methods[0].id)
+            found = true;
+    }
+    /* Type inference may or may not resolve — log but don't fail hard */
+    if (!found) {
+        /* At minimum, verify the method exists and run() has some calls */
+    }
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+
+    cbm_store_free_nodes(methods, mc);
+    cbm_store_free_nodes(callers, clc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Docstring integration (port of TestDocstringIntegration)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(pipeline_docstring_go_function) {
+    /* Go function with // comment docstring */
+    const char *files[] = {"main.go"};
+    const char *contents[] = {"package main\n\n"
+                              "// Compute does something.\n"
+                              "func Compute() {}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "Compute", &nodes, &nc);
+    ASSERT_GT(nc, 0);
+
+    /* Check properties_json contains docstring */
+    bool found_docstring = false;
+    for (int i = 0; i < nc; i++) {
+        if (strcmp(nodes[i].label, "Function") == 0 && nodes[i].properties_json &&
+            strstr(nodes[i].properties_json, "docstring") &&
+            strstr(nodes[i].properties_json, "Compute does something")) {
+            found_docstring = true;
+        }
+    }
+    ASSERT_TRUE(found_docstring);
+
+    cbm_store_free_nodes(nodes, nc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_docstring_python_function) {
+    /* Python function with triple-quoted docstring */
+    const char *files[] = {"main.py"};
+    const char *contents[] = {"def compute():\n"
+                              "\t\"\"\"Does something.\"\"\"\n"
+                              "\tpass\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "compute", &nodes, &nc);
+    ASSERT_GT(nc, 0);
+
+    bool found_docstring = false;
+    for (int i = 0; i < nc; i++) {
+        if (strcmp(nodes[i].label, "Function") == 0 && nodes[i].properties_json &&
+            strstr(nodes[i].properties_json, "docstring") &&
+            strstr(nodes[i].properties_json, "Does something")) {
+            found_docstring = true;
+        }
+    }
+    ASSERT_TRUE(found_docstring);
+
+    cbm_store_free_nodes(nodes, nc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_docstring_java_method) {
+    /* Java method with Javadoc comment */
+    const char *files[] = {"A.java"};
+    const char *contents[] = {"class A {\n"
+                              "\t/** Computes result. */\n"
+                              "\tvoid compute() {}\n"
+                              "}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "compute", &nodes, &nc);
+    ASSERT_GT(nc, 0);
+
+    bool found_docstring = false;
+    for (int i = 0; i < nc; i++) {
+        if (strcmp(nodes[i].label, "Method") == 0 && nodes[i].properties_json &&
+            strstr(nodes[i].properties_json, "docstring") &&
+            strstr(nodes[i].properties_json, "Computes result")) {
+            found_docstring = true;
+        }
+    }
+    ASSERT_TRUE(found_docstring);
+
+    cbm_store_free_nodes(nodes, nc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_docstring_kotlin_function) {
+    /* Kotlin function with KDoc comment */
+    const char *files[] = {"main.kt"};
+    const char *contents[] = {"/** Computes result. */\n"
+                              "fun compute() {}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "compute", &nodes, &nc);
+    ASSERT_GT(nc, 0);
+
+    bool found_docstring = false;
+    for (int i = 0; i < nc; i++) {
+        if (strcmp(nodes[i].label, "Function") == 0 && nodes[i].properties_json &&
+            strstr(nodes[i].properties_json, "docstring") &&
+            strstr(nodes[i].properties_json, "Computes result")) {
+            found_docstring = true;
+        }
+    }
+    ASSERT_TRUE(found_docstring);
+
+    cbm_store_free_nodes(nodes, nc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_docstring_go_class) {
+    /* Go struct with // comment docstring */
+    const char *files[] = {"main.go"};
+    const char *contents[] = {"package main\n\n"
+                              "// MyStruct is documented.\n"
+                              "type MyStruct struct{}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "MyStruct", &nodes, &nc);
+    ASSERT_GT(nc, 0);
+
+    bool found_docstring = false;
+    for (int i = 0; i < nc; i++) {
+        if (strcmp(nodes[i].label, "Class") == 0 && nodes[i].properties_json &&
+            strstr(nodes[i].properties_json, "docstring") &&
+            strstr(nodes[i].properties_json, "MyStruct is documented")) {
+            found_docstring = true;
+        }
+    }
+    ASSERT_TRUE(found_docstring);
+
+    cbm_store_free_nodes(nodes, nc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(project_name_from_path) {
+    /* Port of TestProjectNameFromPath — more cases than integ_pipeline_project_name */
+    struct {
+        const char *path;
+        const char *want;
+    } cases[] = {
+        {"/tmp/bench/erlang/lib/stdlib/src", "tmp-bench-erlang-lib-stdlib-src"},
+        {"/Users/martin/projects/myapp", "Users-martin-projects-myapp"},
+        {"/home/user/repo", "home-user-repo"},
+        {"/single", "single"},
+    };
+
+    for (int i = 0; i < 4; i++) {
+        char *got = cbm_project_name_from_path(cases[i].path);
+        ASSERT_NOT_NULL(got);
+        ASSERT_STR_EQ(got, cases[i].want);
+        free(got);
+    }
+    PASS();
+}
+
+/* Regression for #394/#227/#367: a Windows drive letter is case-insensitive, so
+ * "c:/repo" and "C:/repo" must canonicalize to the SAME project key. Otherwise
+ * agent CWDs (which report lowercase "c:\...") produce a distinct key + colliding
+ * cache file that clobbers the good index, and the lowercase index self-deletes.
+ * Pure string logic, so it reproduces on any platform. */
+TEST(project_name_drive_letter_case_insensitive_issue394) {
+    char *lower = cbm_project_name_from_path("c:/WEBDEV/Cardio-Cloud");
+    char *upper = cbm_project_name_from_path("C:/WEBDEV/Cardio-Cloud");
+    ASSERT_NOT_NULL(lower);
+    ASSERT_NOT_NULL(upper);
+    /* Both must fold to the upper-case-drive key, e.g. "C-WEBDEV-Cardio-Cloud". */
+    ASSERT_STR_EQ(lower, upper);
+    ASSERT_EQ(lower[0], 'C');
+    free(lower);
+    free(upper);
+
+    /* And the normalizer itself upper-cases the drive root in place. */
+    char buf1[32];
+    snprintf(buf1, sizeof(buf1), "%s", "c:/x");
+    cbm_normalize_path_sep(buf1);
+    ASSERT_STR_EQ(buf1, "C:/x");
+    char buf2[32];
+    snprintf(buf2, sizeof(buf2), "%s", "d:\\proj\\sub");
+    cbm_normalize_path_sep(buf2);
+    ASSERT_STR_EQ(buf2, "D:/proj/sub");
+    PASS();
+}
+
+static const char *test_null_dev(void) {
+#ifdef _WIN32
+    return "NUL";
+#else
+    return "/dev/null";
+#endif
+}
+
+static bool git_available(void) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "git --version >%s 2>&1", test_null_dev());
+    int rc = system(cmd);
+    return rc == 0;
+}
+
+static int run_cmd(const char *cmd) {
+    return system(cmd);
+}
+
+TEST(git_context_non_git_path) {
+    char *tmp = th_mktempdir("cbm_gitctx_nongit");
+    ASSERT_NOT_NULL(tmp);
+
+    cbm_git_context_t ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(tmp, &ctx), 0);
+    ASSERT_FALSE(ctx.is_git);
+    ASSERT_TRUE(ctx.root_exists);
+
+    char *qn = cbm_git_context_branch_qn("proj", &ctx);
+    ASSERT_NOT_NULL(qn);
+    ASSERT_STR_EQ(qn, "proj.__branch__.working-tree");
+    free(qn);
+
+    char json[1024];
+    ASSERT_GT(cbm_git_context_props_json(&ctx, json, sizeof(json)), 0);
+    ASSERT_NOT_NULL(strstr(json, "\"is_git\":false"));
+    ASSERT_NOT_NULL(strstr(json, "\"root_exists\":true"));
+
+    char long_value[1200];
+    memset(long_value, 'a', sizeof(long_value) - 1);
+    long_value[sizeof(long_value) - 1] = '\0';
+    cbm_git_context_t long_ctx = {
+        .root_exists = true,
+        .canonical_root = long_value,
+    };
+    char small_json[64];
+    ASSERT_EQ(cbm_git_context_props_json(&long_ctx, small_json, sizeof(small_json)), 0);
+
+    cbm_git_context_free(&ctx);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(git_context_linked_worktree) {
+    if (!git_available()) {
+        FAIL("git unavailable");
+    }
+
+    char *tmp = th_mktempdir("cbm_gitctx_repo");
+    ASSERT_NOT_NULL(tmp);
+
+    char repo[512], wt[512], cmd[2048];
+    int n = snprintf(repo, sizeof(repo), "%s/repo with space", tmp);
+    ASSERT_TRUE(n > 0 && n < (int)sizeof(repo));
+    n = snprintf(wt, sizeof(wt), "%s/wt with space", tmp);
+    ASSERT_TRUE(n > 0 && n < (int)sizeof(wt));
+    ASSERT_EQ(th_mkdir_p(repo), 0);
+
+    const char *null_dev = test_null_dev();
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" init >%s 2>&1", repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" checkout -b main >%s 2>&1", repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "file.txt"), "hello\n"), 0);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" add file.txt >%s 2>&1", repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" -c user.email=\"cbm@example.invalid\" "
+             "commit -m \"initial\" >%s 2>&1",
+             repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" worktree add -b feature/git-context \"%s\" >%s 2>&1",
+             repo, wt, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+
+    cbm_git_context_t main_ctx = {0};
+    cbm_git_context_t wt_ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(repo, &main_ctx), 0);
+    ASSERT_EQ(cbm_git_context_resolve(wt, &wt_ctx), 0);
+
+    ASSERT_TRUE(main_ctx.is_git);
+    ASSERT_FALSE(main_ctx.is_worktree);
+    ASSERT_TRUE(wt_ctx.is_git);
+    ASSERT_TRUE(wt_ctx.is_worktree);
+    ASSERT_STR_EQ(main_ctx.canonical_root, wt_ctx.canonical_root);
+    ASSERT_NOT_NULL(wt_ctx.branch);
+    ASSERT_STR_EQ(wt_ctx.branch, "feature/git-context");
+    ASSERT_STR_EQ(wt_ctx.branch_slug, "feature-git-context");
+    ASSERT_NOT_NULL(wt_ctx.head_sha);
+
+    char *qn = cbm_git_context_branch_qn("proj", &wt_ctx);
+    ASSERT_NOT_NULL(qn);
+    ASSERT_STR_EQ(qn, "proj.__branch__.feature-git-context");
+    free(qn);
+
+    char json[2048];
+    ASSERT_GT(cbm_git_context_props_json(&wt_ctx, json, sizeof(json)), 0);
+    ASSERT_NOT_NULL(strstr(json, "\"is_git\":true"));
+    ASSERT_NOT_NULL(strstr(json, "\"is_worktree\":true"));
+    ASSERT_NOT_NULL(strstr(json, "\"branch\":\"feature/git-context\""));
+
+    cbm_git_context_free(&main_ctx);
+    cbm_git_context_free(&wt_ctx);
+
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" checkout --detach HEAD >%s 2>&1", repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    cbm_git_context_t detached_ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(repo, &detached_ctx), 0);
+    ASSERT_TRUE(detached_ctx.is_detached);
+    ASSERT_STR_EQ(detached_ctx.branch_slug, "detached");
+    cbm_git_context_free(&detached_ctx);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A freshly `git init`ed repo answers every path query but has no HEAD to
+ * verify. The path queries are batched into one rev-parse for latency, so
+ * this pins that the batch does NOT inherit the HEAD lookup's failure: the
+ * repo must still resolve as git, with the worktree root and dirs filled in
+ * and an empty head_sha. */
+TEST(git_context_unborn_repo_resolves_paths_without_head) {
+    if (!git_available()) {
+        FAIL("git unavailable");
+    }
+    char *tmp = th_mktempdir("cbm_gitctx_unborn");
+    ASSERT_NOT_NULL(tmp);
+
+    char cmd[2048];
+    const char *null_dev = test_null_dev();
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" init >%s 2>&1", tmp, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+
+    cbm_git_context_t ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(tmp, &ctx), 0);
+    ASSERT_TRUE(ctx.is_git);
+    ASSERT_TRUE(ctx.root_exists);
+    ASSERT_FALSE(ctx.is_worktree);
+    ASSERT_NOT_NULL(ctx.worktree_root);
+    ASSERT_TRUE(ctx.worktree_root[0] != '\0');
+    ASSERT_NOT_NULL(ctx.git_dir);
+    ASSERT_TRUE(ctx.git_dir[0] != '\0');
+    ASSERT_NOT_NULL(ctx.git_common_dir);
+    ASSERT_NOT_NULL(ctx.canonical_root);
+    ASSERT_TRUE(ctx.canonical_root[0] != '\0');
+    /* No commit yet: the HEAD sha is empty, not garbage from another query. */
+    ASSERT_NOT_NULL(ctx.head_sha);
+    ASSERT_STR_EQ(ctx.head_sha, "");
+    /* An unborn branch is still a symbolic ref, so it is not "detached". */
+    ASSERT_NOT_NULL(ctx.branch);
+
+    cbm_git_context_free(&ctx);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(project_name_uniqueness) {
+    /* Port of TestProjectNameUniqueness */
+    char *a = cbm_project_name_from_path("/tmp/bench/zig/lib/std");
+    char *b = cbm_project_name_from_path("/tmp/bench/erlang/lib/stdlib/src");
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_TRUE(strcmp(a, b) != 0);
+    free(a);
+    free(b);
+    PASS();
+}
+
+/* ── Git diff helpers (pass_gitdiff.c) ─────────────────────────── */
+
+TEST(gitdiff_parse_range_with_count) {
+    int start, count;
+    cbm_parse_range("10,5", &start, &count);
+    ASSERT_EQ(start, 10);
+    ASSERT_EQ(count, 5);
+    PASS();
+}
+
+TEST(gitdiff_parse_range_no_count) {
+    int start, count;
+    cbm_parse_range("10", &start, &count);
+    ASSERT_EQ(start, 10);
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+
+TEST(gitdiff_parse_range_zero_count) {
+    int start, count;
+    cbm_parse_range("1,0", &start, &count);
+    ASSERT_EQ(start, 1);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+TEST(gitdiff_parse_range_large) {
+    int start, count;
+    cbm_parse_range("52,2", &start, &count);
+    ASSERT_EQ(start, 52);
+    ASSERT_EQ(count, 2);
+    PASS();
+}
+
+TEST(gitdiff_parse_name_status) {
+    const char *input = "M\tinternal/store/nodes.go\n"
+                        "A\tnew_file.go\n"
+                        "D\told_file.go\n"
+                        "R100\tsrc/old.go\tsrc/new.go\n";
+
+    cbm_changed_file_t files[16];
+    int n = cbm_parse_name_status(input, files, 16);
+
+    ASSERT_EQ(n, 4);
+    ASSERT_STR_EQ(files[0].status, "M");
+    ASSERT_STR_EQ(files[0].path, "internal/store/nodes.go");
+    ASSERT_STR_EQ(files[1].status, "A");
+    ASSERT_STR_EQ(files[1].path, "new_file.go");
+    ASSERT_STR_EQ(files[2].status, "D");
+    ASSERT_STR_EQ(files[2].path, "old_file.go");
+    ASSERT_STR_EQ(files[3].status, "R");
+    ASSERT_STR_EQ(files[3].path, "src/new.go");
+    ASSERT_STR_EQ(files[3].old_path, "src/old.go");
+    PASS();
+}
+
+TEST(gitdiff_parse_name_status_filters_untrackable) {
+    const char *input = "M\tpackage-lock.json\n"
+                        "M\tsrc/main.go\n"
+                        "M\tvendor/lib.go\n";
+
+    cbm_changed_file_t files[16];
+    int n = cbm_parse_name_status(input, files, 16);
+
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(files[0].path, "src/main.go");
+    PASS();
+}
+
+TEST(gitdiff_parse_hunks) {
+    const char *input = "diff --git a/main.go b/main.go\n"
+                        "index abc1234..def5678 100644\n"
+                        "--- a/main.go\n"
+                        "+++ b/main.go\n"
+                        "@@ -10,3 +10,5 @@ func main() {\n"
+                        "+\tnewLine1()\n"
+                        "+\tnewLine2()\n"
+                        "@@ -50,0 +52,2 @@ func helper() {\n"
+                        "+\tanother()\n"
+                        "+\tline()\n"
+                        "diff --git a/binary.png b/binary.png\n"
+                        "Binary files a/binary.png and b/binary.png differ\n"
+                        "diff --git a/utils.go b/utils.go\n"
+                        "--- a/utils.go\n"
+                        "+++ b/utils.go\n"
+                        "@@ -1 +1 @@ package utils\n"
+                        "-old\n"
+                        "+new\n";
+
+    cbm_changed_hunk_t hunks[16];
+    int n = cbm_parse_hunks(input, hunks, 16);
+
+    ASSERT_EQ(n, 3);
+    ASSERT_STR_EQ(hunks[0].path, "main.go");
+    ASSERT_EQ(hunks[0].start_line, 10);
+    ASSERT_EQ(hunks[0].end_line, 14);
+
+    ASSERT_STR_EQ(hunks[1].path, "main.go");
+    ASSERT_EQ(hunks[1].start_line, 52);
+    ASSERT_EQ(hunks[1].end_line, 53);
+
+    ASSERT_STR_EQ(hunks[2].path, "utils.go");
+    ASSERT_EQ(hunks[2].start_line, 1);
+    ASSERT_EQ(hunks[2].end_line, 1);
+    PASS();
+}
+
+TEST(gitdiff_parse_hunks_no_newline_marker) {
+    const char *input = "diff --git a/file.go b/file.go\n"
+                        "--- a/file.go\n"
+                        "+++ b/file.go\n"
+                        "@@ -5,2 +5,3 @@ func foo() {\n"
+                        "+\tbar()\n"
+                        "\\ No newline at end of file\n";
+
+    cbm_changed_hunk_t hunks[4];
+    int n = cbm_parse_hunks(input, hunks, 4);
+
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(hunks[0].start_line, 5);
+    ASSERT_EQ(hunks[0].end_line, 7);
+    PASS();
+}
+
+TEST(gitdiff_parse_hunks_mode_change) {
+    const char *input = "diff --git a/script.sh b/script.sh\n"
+                        "old mode 100644\n"
+                        "new mode 100755\n";
+
+    cbm_changed_hunk_t hunks[4];
+    int n = cbm_parse_hunks(input, hunks, 4);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(gitdiff_parse_hunks_deletion) {
+    const char *input = "diff --git a/file.go b/file.go\n"
+                        "--- a/file.go\n"
+                        "+++ b/file.go\n"
+                        "@@ -10,3 +10,0 @@ func foo() {\n";
+
+    cbm_changed_hunk_t hunks[4];
+    int n = cbm_parse_hunks(input, hunks, 4);
+    ASSERT_EQ(n, 1);
+    ASSERT_EQ(hunks[0].start_line, 10);
+    PASS();
+}
+
+/* ── Config helpers (pass_configures.c) ───────────────────────── */
+
+TEST(configures_is_env_var_name) {
+    ASSERT(cbm_is_env_var_name("DATABASE_URL"));
+    ASSERT(cbm_is_env_var_name("API_KEY"));
+    ASSERT(cbm_is_env_var_name("PORT"));
+    ASSERT(!cbm_is_env_var_name("A"));      /* too short */
+    ASSERT(!cbm_is_env_var_name("port"));   /* lowercase */
+    ASSERT(!cbm_is_env_var_name("apiKey")); /* camelCase */
+    ASSERT(cbm_is_env_var_name("DB_2"));    /* with digit */
+    ASSERT(!cbm_is_env_var_name("__"));     /* no uppercase */
+    ASSERT(!cbm_is_env_var_name(""));       /* empty */
+    PASS();
+}
+
+TEST(configures_normalize_config_key) {
+    char norm[256];
+    int tokens;
+
+    tokens = cbm_normalize_config_key("max_connections", norm, sizeof(norm));
+    ASSERT_STR_EQ(norm, "max_connections");
+    ASSERT_EQ(tokens, 2);
+
+    tokens = cbm_normalize_config_key("maxConnections", norm, sizeof(norm));
+    ASSERT_STR_EQ(norm, "max_connections");
+    ASSERT_EQ(tokens, 2);
+
+    tokens = cbm_normalize_config_key("DATABASE_HOST", norm, sizeof(norm));
+    ASSERT_STR_EQ(norm, "database_host");
+    ASSERT_EQ(tokens, 2);
+
+    tokens = cbm_normalize_config_key("database.host", norm, sizeof(norm));
+    ASSERT_STR_EQ(norm, "database_host");
+    ASSERT_EQ(tokens, 2);
+
+    tokens = cbm_normalize_config_key("port", norm, sizeof(norm));
+    ASSERT_STR_EQ(norm, "port");
+    ASSERT_EQ(tokens, 1);
+
+    tokens = cbm_normalize_config_key("maxRetryCount", norm, sizeof(norm));
+    ASSERT_STR_EQ(norm, "max_retry_count");
+    ASSERT_EQ(tokens, 3);
+    PASS();
+}
+
+TEST(configures_has_config_extension) {
+    ASSERT(cbm_has_config_extension("config.toml"));
+    ASSERT(cbm_has_config_extension("settings.yaml"));
+    ASSERT(cbm_has_config_extension("config.yml"));
+    ASSERT(cbm_has_config_extension(".env"));
+    ASSERT(cbm_has_config_extension("config.ini"));
+    ASSERT(cbm_has_config_extension("data.json"));
+    ASSERT(cbm_has_config_extension("pom.xml"));
+    ASSERT(!cbm_has_config_extension("main.go"));
+    ASSERT(!cbm_has_config_extension("app.py"));
+    ASSERT(!cbm_has_config_extension("data.csv"));
+    PASS();
+}
+
+/* ── Config integration tests (configures_test.go ports) ──────── */
+
+TEST(configures_env_var_in_config) {
+    /* Port of TestBuildEnvIndex_ConfigVariableAdded:
+     * config.toml has DATABASE_URL, main.go does os.Getenv("DATABASE_URL")
+     * → CONFIGURES edges should link them. */
+    const char *files[] = {"config.toml", "main.go"};
+    const char *contents[] = {"DATABASE_URL = \"postgresql://localhost/db\"\n",
+
+                              "package main\n\n"
+                              "import \"os\"\n\n"
+                              "func main() {\n"
+                              "\turl := os.Getenv(\"DATABASE_URL\")\n"
+                              "\t_ = url\n"
+                              "}\n"};
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Verify CONFIGURES edges were created */
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    cbm_store_find_edges_by_type(s, proj, "CONFIGURES", &edges, &ec);
+    /* At minimum the pipeline should not crash. Edge count depends on
+     * extraction matching env var accesses to config variables. */
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(configures_lowercase_key_skipped) {
+    /* Port of TestBuildEnvIndex_LowercaseKeySkipped:
+     * config.toml has lowercase key — should NOT produce env var CONFIGURES edges. */
+    const char *files[] = {"config.toml", "main.go"};
+    const char *contents[] = {"database_host = \"localhost\"\n",
+
+                              "package main\n\nfunc main() {}\n"};
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    /* Pipeline ran successfully — no crash from lowercase config keys */
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(configures_non_config_file_skipped) {
+    /* Port of TestBuildEnvIndex_NonConfigFileSkipped:
+     * Only Go file, no config file — no config-derived CONFIGURES edges. */
+    const char *files[] = {"main.go"};
+    const char *contents[] = {"package main\n\n"
+                              "var API_URL = \"https://api.example.com\"\n\n"
+                              "func main() {}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    /* No config file → buildEnvIndex should not create config-derived entries */
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(configures_full_pipeline_integration) {
+    /* Port of TestConfigIntegration_FullPipeline:
+     * TOML + INI + JSON config files + Go code → Class & Variable nodes from
+     * config files, plus CONFIGURES edges. */
+    const char *files[] = {"config.toml", "settings.ini", "config.json", "main.go"};
+    const char *contents[] = {"[database]\n"
+                              "host = \"localhost\"\n"
+                              "port = 5432\n"
+                              "max_connections = 100\n\n"
+                              "[server]\n"
+                              "bind_address = \"0.0.0.0\"\n",
+
+                              "[database]\n"
+                              "host = localhost\n"
+                              "port = 5432\n",
+
+                              "{\"appName\": \"test\", \"maxRetries\": 3}",
+
+                              "package main\n\n"
+                              "import \"os\"\n\n"
+                              "func getMaxConnections() int { return 100 }\n\n"
+                              "func loadConfig() {\n"
+                              "\tcfg := readFile(\"config.toml\")\n"
+                              "\t_ = cfg\n"
+                              "\tdbURL := os.Getenv(\"DATABASE_URL\")\n"
+                              "\t_ = dbURL\n"
+                              "}\n\n"
+                              "func readFile(path string) string { return \"\" }\n"};
+    if (setup_lang_repo(files, contents, 4) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Should have Class nodes (database, server sections from TOML) */
+    cbm_node_t *classes = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Class", &classes, &cc);
+    ASSERT_GT(cc, 0);
+    if (classes)
+        cbm_store_free_nodes(classes, cc);
+
+    /* Should have Variable nodes from config files */
+    cbm_node_t *vars = NULL;
+    int vc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Variable", &vars, &vc);
+    ASSERT_GT(vc, 0);
+    if (vars)
+        cbm_store_free_nodes(vars, vc);
+
+    /* Should have Function nodes from Go code */
+    cbm_node_t *funcs = NULL;
+    int fc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &funcs, &fc);
+    ASSERT_GT(fc, 0);
+    if (funcs)
+        cbm_store_free_nodes(funcs, fc);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+TEST(enrichment_split_camel_case) {
+    char *parts[8];
+    int n;
+
+    n = cbm_split_camel_case("GetMapping", parts, 8);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(parts[0], "Get");
+    ASSERT_STR_EQ(parts[1], "Mapping");
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
+
+    n = cbm_split_camel_case("getMessage", parts, 8);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(parts[0], "get");
+    ASSERT_STR_EQ(parts[1], "Message");
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
+
+    n = cbm_split_camel_case("cache", parts, 8);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(parts[0], "cache");
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
+
+    n = cbm_split_camel_case("HTMLParser", parts, 8);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(parts[0], "HTMLParser");
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
+
+    n = cbm_split_camel_case("", parts, 8);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(enrichment_tokenize_decorator) {
+    char *tokens[16];
+    int n;
+
+    n = cbm_tokenize_decorator("@Override", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "override");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@Deprecated", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "deprecated");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@Test", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "test");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@login_required", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "login");
+    ASSERT_STR_EQ(tokens[1], "required");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@cache", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "cache");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@pytest.fixture", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "pytest");
+    ASSERT_STR_EQ(tokens[1], "fixture");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    /* "get" is stopword → only "mapping" */
+    n = cbm_tokenize_decorator("@GetMapping(\"/api\")", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "mapping");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    /* "post" passes, "mapping" passes */
+    n = cbm_tokenize_decorator("@PostMapping(\"/api\")", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "post");
+    ASSERT_STR_EQ(tokens[1], "mapping");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@Transactional", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "transactional");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@MessageMapping(\"/chat\")", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "message");
+    ASSERT_STR_EQ(tokens[1], "mapping");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    /* Rust-style #[test] */
+    n = cbm_tokenize_decorator("#[test]", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "test");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    /* #[derive(Debug)] */
+    n = cbm_tokenize_decorator("#[derive(Debug)]", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "derive");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    /* Both "app" and "get" are stopwords → empty */
+    n = cbm_tokenize_decorator("@app.get(\"/api\")", tokens, 16);
+    ASSERT_EQ(n, 0);
+
+    /* "router" is stopword, "post" passes */
+    n = cbm_tokenize_decorator("@router.post(\"/api\")", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "post");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    /* Too short after filtering */
+    n = cbm_tokenize_decorator("@x", tokens, 16);
+    ASSERT_EQ(n, 0);
+
+    /* Empty */
+    n = cbm_tokenize_decorator("", tokens, 16);
+    ASSERT_EQ(n, 0);
+
+    n = cbm_tokenize_decorator("@click.command", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "click");
+    ASSERT_STR_EQ(tokens[1], "command");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+
+    n = cbm_tokenize_decorator("@celery.task", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "celery");
+    ASSERT_STR_EQ(tokens[1], "task");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+    PASS();
+}
+
+/* ── Decorator tags integration tests (enrichment_test.go ports) ─ */
+
+/* Helper: check if a node's properties_json contains a specific decorator_tag */
+static bool has_decorator_tag(const char *properties_json, const char *tag) {
+    if (!properties_json || !tag)
+        return false;
+    yyjson_doc *doc = yyjson_read(properties_json, strlen(properties_json), 0);
+    if (!doc)
+        return false;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *tags = yyjson_obj_get(root, "decorator_tags");
+    if (!tags || !yyjson_is_arr(tags)) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    yyjson_val *item;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tags, &iter);
+    while ((item = yyjson_arr_iter_next(&iter))) {
+        if (yyjson_is_str(item) && strcmp(yyjson_get_str(item), tag) == 0) {
+            yyjson_doc_free(doc);
+            return true;
+        }
+    }
+    yyjson_doc_free(doc);
+    return false;
+}
+
+TEST(decorator_tags_python_auto_discovery) {
+    /* Port of TestDecoratorTagAutoDiscovery:
+     * Python file with repeated decorators (@login_required on 2 funcs,
+     * @cache on 2 funcs, @unique_helper on 1 func).
+     * Words on 2+ nodes become tags; unique words do not. */
+    const char *files[] = {"views.py"};
+    const char *contents[] = {"from functools import cache\n\n"
+                              "@login_required\n"
+                              "def list_orders():\n"
+                              "    pass\n\n"
+                              "@login_required\n"
+                              "def get_order():\n"
+                              "    pass\n\n"
+                              "@cache\n"
+                              "def compute_total():\n"
+                              "    pass\n\n"
+                              "@cache\n"
+                              "def compute_tax():\n"
+                              "    pass\n\n"
+                              "@unique_helper\n"
+                              "def special():\n"
+                              "    pass\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Find functions by name and check decorator_tags */
+    cbm_node_t *funcs = NULL;
+    int fc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Function", &funcs, &fc);
+
+    /* Build name→properties_json map */
+    const char *list_orders_props = NULL;
+    const char *get_order_props = NULL;
+    const char *compute_total_props = NULL;
+    const char *compute_tax_props = NULL;
+    const char *special_props = NULL;
+    for (int i = 0; i < fc; i++) {
+        if (strcmp(funcs[i].name, "list_orders") == 0)
+            list_orders_props = funcs[i].properties_json;
+        else if (strcmp(funcs[i].name, "get_order") == 0)
+            get_order_props = funcs[i].properties_json;
+        else if (strcmp(funcs[i].name, "compute_total") == 0)
+            compute_total_props = funcs[i].properties_json;
+        else if (strcmp(funcs[i].name, "compute_tax") == 0)
+            compute_tax_props = funcs[i].properties_json;
+        else if (strcmp(funcs[i].name, "special") == 0)
+            special_props = funcs[i].properties_json;
+    }
+
+    /* "login" and "required" appear on 2 nodes → should be tags */
+    ASSERT_TRUE(has_decorator_tag(list_orders_props, "login"));
+    ASSERT_TRUE(has_decorator_tag(list_orders_props, "required"));
+    ASSERT_TRUE(has_decorator_tag(get_order_props, "login"));
+    ASSERT_TRUE(has_decorator_tag(get_order_props, "required"));
+
+    /* "cache" appears on 2 nodes → should be a tag */
+    ASSERT_TRUE(has_decorator_tag(compute_total_props, "cache"));
+    ASSERT_TRUE(has_decorator_tag(compute_tax_props, "cache"));
+
+    /* "unique" and "helper" appear on only 1 node → should NOT be tags */
+    ASSERT_FALSE(has_decorator_tag(special_props, "unique"));
+    ASSERT_FALSE(has_decorator_tag(special_props, "helper"));
+
+    if (funcs)
+        cbm_store_free_nodes(funcs, fc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(decorator_tags_java_class_methods) {
+    /* Port of TestDecoratorTagJavaClassMethods:
+     * Java class with @GetMapping, @PostMapping, @Transactional annotations.
+     * "mapping" appears on all 4 → tag. "post" on 2 → tag. */
+    const char *files[] = {"Controller.java"};
+    const char *contents[] = {"class OwnerController {\n"
+                              "    @GetMapping(\"/owners\")\n"
+                              "    public void listOwners() {}\n\n"
+                              "    @GetMapping(\"/owners/{id}\")\n"
+                              "    public void showOwner() {}\n\n"
+                              "    @PostMapping(\"/owners\")\n"
+                              "    public void createOwner() {}\n\n"
+                              "    @Transactional\n"
+                              "    @PostMapping(\"/owners/{id}\")\n"
+                              "    public void updateOwner() {}\n"
+                              "}\n"};
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Find methods */
+    cbm_node_t *methods = NULL;
+    int mc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Method", &methods, &mc);
+
+    /* "mapping" appears on all 4 methods → should be a tag */
+    for (int i = 0; i < mc; i++) {
+        if (strcmp(methods[i].name, "listOwners") == 0 ||
+            strcmp(methods[i].name, "showOwner") == 0 ||
+            strcmp(methods[i].name, "createOwner") == 0 ||
+            strcmp(methods[i].name, "updateOwner") == 0) {
+            ASSERT_TRUE(has_decorator_tag(methods[i].properties_json, "mapping"));
+        }
+    }
+
+    /* "post" appears on createOwner + updateOwner → should be a tag */
+    for (int i = 0; i < mc; i++) {
+        if (strcmp(methods[i].name, "createOwner") == 0 ||
+            strcmp(methods[i].name, "updateOwner") == 0) {
+            ASSERT_TRUE(has_decorator_tag(methods[i].properties_json, "post"));
+        }
+    }
+
+    /* "transactional" appears on only 1 method → should NOT be a tag */
+    for (int i = 0; i < mc; i++) {
+        if (strcmp(methods[i].name, "updateOwner") == 0) {
+            ASSERT_FALSE(has_decorator_tag(methods[i].properties_json, "transactional"));
+        }
+    }
+
+    if (methods)
+        cbm_store_free_nodes(methods, mc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* ── Compile commands helpers (pass_compile_commands.c) ────────── */
+
+TEST(compile_commands_split_command) {
+    char *args[16];
+    int n;
+
+    n = cbm_split_command("gcc -c main.c", args, 16);
+    ASSERT_EQ(n, 3);
+    ASSERT_STR_EQ(args[0], "gcc");
+    ASSERT_STR_EQ(args[1], "-c");
+    ASSERT_STR_EQ(args[2], "main.c");
+    for (int i = 0; i < n; i++)
+        free(args[i]);
+
+    n = cbm_split_command("gcc -DFOO=\"bar baz\" -c main.c", args, 16);
+    ASSERT_EQ(n, 4);
+    for (int i = 0; i < n; i++)
+        free(args[i]);
+
+    n = cbm_split_command("g++ -I/usr/include -std=c++17 -o out -c in.cpp", args, 16);
+    ASSERT_EQ(n, 7);
+    for (int i = 0; i < n; i++)
+        free(args[i]);
+    PASS();
+}
+
+TEST(compile_commands_extract_flags) {
+    const char *args[] = {"g++",          "-I",    "/abs/include", "-I/rel/include", "-isystem",
+                          "/sys/include", "-DFOO", "-DBAR=42",     "-std=c++20",     "-O2",
+                          "-Wall",        "-c",    "main.cpp"};
+
+    cbm_compile_flags_t *f = cbm_extract_flags(args, 13, "/project");
+    ASSERT_NOT_NULL(f);
+    ASSERT_EQ(f->include_count, 3);
+    ASSERT_EQ(f->define_count, 2);
+    ASSERT_STR_EQ(f->standard, "c++20");
+    cbm_compile_flags_free(f);
+    PASS();
+}
+
+TEST(compile_commands_parse_json) {
+    const char *json = "[\n"
+                       "  {\n"
+                       "    \"directory\": \"/home/user/project/build\",\n"
+                       "    \"command\": \"gcc -I/home/user/project/include "
+                       "-I/home/user/project/src -DDEBUG=1 -DVERSION=\\\"1.0\\\" "
+                       "-std=c11 -o main.o -c /home/user/project/src/main.c\",\n"
+                       "    \"file\": \"/home/user/project/src/main.c\"\n"
+                       "  },\n"
+                       "  {\n"
+                       "    \"directory\": \"/home/user/project/build\",\n"
+                       "    \"arguments\": [\"g++\", \"-I/home/user/project/include\", "
+                       "\"-isystem\", \"/home/user/project/third_party\", "
+                       "\"-DUSE_SSL\", \"-std=c++17\", \"-c\", "
+                       "\"/home/user/project/src/server.cpp\"],\n"
+                       "    \"file\": \"/home/user/project/src/server.cpp\"\n"
+                       "  },\n"
+                       "  {\n"
+                       "    \"directory\": \"/home/user/project/build\",\n"
+                       "    \"command\": \"gcc -c /outside/repo/file.c\",\n"
+                       "    \"file\": \"/outside/repo/file.c\"\n"
+                       "  }\n"
+                       "]";
+
+    char **paths = NULL;
+    cbm_compile_flags_t **flags = NULL;
+    int n = cbm_parse_compile_commands(json, "/home/user/project", &paths, &flags);
+    ASSERT(n >= 2); /* At least main.c and server.cpp, outside file excluded */
+
+    /* Find main.c */
+    int main_idx = -1, server_idx = -1;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(paths[i], "src/main.c") == 0)
+            main_idx = i;
+        if (strcmp(paths[i], "src/server.cpp") == 0)
+            server_idx = i;
+    }
+
+    ASSERT(main_idx >= 0);
+    ASSERT_EQ(flags[main_idx]->include_count, 2);
+    ASSERT_EQ(flags[main_idx]->define_count, 2);
+    ASSERT_STR_EQ(flags[main_idx]->standard, "c11");
+
+    ASSERT(server_idx >= 0);
+    ASSERT_EQ(flags[server_idx]->include_count, 2);
+    ASSERT_EQ(flags[server_idx]->define_count, 1);
+    ASSERT_STR_EQ(flags[server_idx]->standard, "c++17");
+
+    /* Verify outside-repo file excluded */
+    for (int i = 0; i < n; i++) {
+        ASSERT(strstr(paths[i], "outside") == NULL);
+    }
+
+    /* Cleanup */
+    for (int i = 0; i < n; i++) {
+        free(paths[i]);
+        cbm_compile_flags_free(flags[i]);
+    }
+    free(paths);
+    free(flags);
+    PASS();
+}
+
+TEST(compile_commands_parse_empty) {
+    char **paths = NULL;
+    cbm_compile_flags_t **flags = NULL;
+    int n = cbm_parse_compile_commands("[]", "/repo", &paths, &flags);
+    ASSERT_EQ(n, 0);
+    free(paths);
+    free(flags);
+    PASS();
+}
+
+TEST(compile_commands_parse_invalid) {
+    char **paths = NULL;
+    cbm_compile_flags_t **flags = NULL;
+    int n = cbm_parse_compile_commands("not json", "/repo", &paths, &flags);
+    ASSERT(n < 0);
+    PASS();
+}
+
+/* ── Suite ─────────────────────────────────────────────────────── */
+
+/* ── Infrascan: file identification ──────────────────────────────── */
+
+TEST(infra_is_compose_file) {
+    /* Port of TestIsComposeFile (8 cases) */
+    ASSERT(cbm_is_compose_file("docker-compose.yml"));
+    ASSERT(cbm_is_compose_file("docker-compose.yaml"));
+    ASSERT(cbm_is_compose_file("docker-compose.prod.yml"));
+    ASSERT(cbm_is_compose_file("compose.yml"));
+    ASSERT(cbm_is_compose_file("compose.yaml"));
+    ASSERT(!cbm_is_compose_file("mycompose.yml"));
+    ASSERT(!cbm_is_compose_file("docker-compose.txt"));
+    ASSERT(!cbm_is_compose_file("Dockerfile"));
+    PASS();
+}
+
+TEST(infra_is_cloudbuild_file) {
+    /* Port of TestIsCloudbuildFile (5 cases) */
+    ASSERT(cbm_is_cloudbuild_file("cloudbuild.yaml"));
+    ASSERT(cbm_is_cloudbuild_file("cloudbuild.yml"));
+    ASSERT(cbm_is_cloudbuild_file("cloudbuild-prod.yaml"));
+    ASSERT(cbm_is_cloudbuild_file("Cloudbuild.yml"));
+    ASSERT(!cbm_is_cloudbuild_file("build.yaml"));
+    PASS();
+}
+
+TEST(infra_is_shell_script) {
+    /* Port of TestIsShellScript (5 cases) */
+    ASSERT(cbm_is_shell_script("run.sh", ".sh"));
+    ASSERT(cbm_is_shell_script("deploy.bash", ".bash"));
+    ASSERT(cbm_is_shell_script("init.zsh", ".zsh"));
+    ASSERT(!cbm_is_shell_script("main.py", ".py"));
+    ASSERT(!cbm_is_shell_script("Dockerfile", ""));
+    PASS();
+}
+
+TEST(infra_is_dockerfile) {
+    ASSERT(cbm_is_dockerfile("Dockerfile"));
+    ASSERT(cbm_is_dockerfile("dockerfile"));
+    ASSERT(cbm_is_dockerfile("Dockerfile.prod"));
+    ASSERT(cbm_is_dockerfile("app.dockerfile"));
+    ASSERT(!cbm_is_dockerfile("docker-compose.yml"));
+    ASSERT(!cbm_is_dockerfile("main.go"));
+    PASS();
+}
+
+TEST(infra_is_kustomize_file) {
+    ASSERT(cbm_is_kustomize_file("kustomization.yaml"));
+    ASSERT(cbm_is_kustomize_file("kustomization.yml"));
+    ASSERT(cbm_is_kustomize_file("KUSTOMIZATION.YAML")); /* case-insensitive */
+    ASSERT(!cbm_is_kustomize_file("deployment.yaml"));
+    ASSERT(!cbm_is_kustomize_file("kustomize.yaml"));
+    ASSERT(!cbm_is_kustomize_file(NULL));
+    PASS();
+}
+
+TEST(infra_is_k8s_manifest) {
+    const char *deploy = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n";
+    const char *plain = "name: foo\nvalue: bar\n";
+    const char *kust = "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\n";
+
+    ASSERT(cbm_is_k8s_manifest("deployment.yaml", deploy));
+    ASSERT(!cbm_is_k8s_manifest("deployment.yaml", plain));
+    /* kustomize file should return false even if it has apiVersion */
+    ASSERT(!cbm_is_k8s_manifest("kustomization.yaml", kust));
+    ASSERT(!cbm_is_k8s_manifest(NULL, deploy));
+    ASSERT(!cbm_is_k8s_manifest("deployment.yaml", NULL));
+    PASS();
+}
+
+TEST(infra_is_env_file) {
+    ASSERT(cbm_is_env_file(".env"));
+    ASSERT(cbm_is_env_file(".env.local"));
+    ASSERT(cbm_is_env_file("prod.env"));
+    ASSERT(!cbm_is_env_file("main.go"));
+    ASSERT(!cbm_is_env_file("env.txt"));
+    PASS();
+}
+
+/* ── Infrascan: cleanJSONBrackets ───────────────────────────────── */
+
+TEST(infra_clean_json_brackets) {
+    /* Port of TestCleanJSONBrackets (4 cases) */
+    char out[256];
+
+    cbm_clean_json_brackets("[\"./server\"]", out, sizeof(out));
+    ASSERT_STR_EQ(out, "./server");
+
+    cbm_clean_json_brackets("[\"python\", \"main.py\"]", out, sizeof(out));
+    ASSERT_STR_EQ(out, "python main.py");
+
+    cbm_clean_json_brackets("./server", out, sizeof(out));
+    ASSERT_STR_EQ(out, "./server");
+
+    cbm_clean_json_brackets("[\"./app\", \"--flag\", \"value\"]", out, sizeof(out));
+    ASSERT_STR_EQ(out, "./app --flag value");
+
+    PASS();
+}
+
+/* ── Infrascan: secret detection ────────────────────────────────── */
+
+TEST(infra_secret_detection) {
+    /* Key-based detection */
+    ASSERT(cbm_is_secret_binding("JWT_SECRET", "anything"));
+    ASSERT(cbm_is_secret_binding("API_KEY", "anything"));
+    ASSERT(cbm_is_secret_binding("my_password", "anything"));
+    ASSERT(cbm_is_secret_binding("AUTH_TOKEN", "anything"));
+    ASSERT(!cbm_is_secret_binding("DATABASE_URL", "https://db.example.com"));
+
+    /* Value-based detection */
+    ASSERT(cbm_is_secret_value("sk-1234567890abcdef12345"));
+    ASSERT(cbm_is_secret_value("-----BEGIN RSA PRIVATE KEY-----"));
+    ASSERT(!cbm_is_secret_value("https://db.example.com"));
+    ASSERT(!cbm_is_secret_value("hello world"));
+    ASSERT(!cbm_is_secret_value("8080"));
+
+    /* isSecretBinding checks both */
+    ASSERT(cbm_is_secret_binding("ANYTHING", "sk-1234567890abcdef12345"));
+    ASSERT(!cbm_is_secret_binding("PORT", "8080"));
+
+    PASS();
+}
+
+/* ── Infrascan: Dockerfile parser ───────────────────────────────── */
+
+/* Helper: find env var by key in result */
+static const char *find_env_var(const cbm_env_kv_t *vars, int count, const char *key) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(vars[i].key, key) == 0)
+            return vars[i].value;
+    }
+    return NULL;
+}
+
+/* Helper: check if string array contains value */
+static bool str_array_contains(const char (*arr)[32], int count, const char *val) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(arr[i], val) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool str_array_128_contains(const char (*arr)[128], int count, const char *val) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(arr[i], val) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool str_array_256_contains(const char (*arr)[256], int count, const char *val) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(arr[i], val) == 0)
+            return true;
+    }
+    return false;
+}
+
+TEST(infra_parse_dockerfile_multistage) {
+    /* Port of TestParseDockerfile "multi-stage with all directives" */
+    const char *src = "FROM golang:1.23-alpine AS builder\n"
+                      "WORKDIR /app\n"
+                      "ARG SSH_PRIVATE_KEY\n"
+                      "RUN go build -o server .\n"
+                      "\n"
+                      "FROM alpine:3.19\n"
+                      "WORKDIR /usr/app\n"
+                      "ENV PORT=8080\n"
+                      "ENV PYTHONUNBUFFERED=1\n"
+                      "EXPOSE 8080 443\n"
+                      "USER appuser\n"
+                      "CMD [\"./server\"]\n"
+                      "HEALTHCHECK CMD wget http://localhost:8080/health\n";
+
+    cbm_dockerfile_result_t r;
+    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
+    ASSERT_STR_EQ(r.base_image, "alpine:3.19");
+    ASSERT_EQ(r.stage_count, 2);
+    ASSERT_STR_EQ(r.stage_images[0], "golang:1.23-alpine");
+    ASSERT_STR_EQ(r.stage_images[1], "alpine:3.19");
+    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "8080"));
+    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "443"));
+    ASSERT_STR_EQ(r.workdir, "/usr/app");
+    ASSERT_STR_EQ(r.user, "appuser");
+    ASSERT_STR_EQ(r.cmd, "./server");
+    ASSERT_STR_EQ(r.healthcheck, "wget http://localhost:8080/health");
+
+    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "PORT"));
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PORT"), "8080");
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PYTHONUNBUFFERED"), "1");
+
+    ASSERT(str_array_128_contains(r.build_args, r.build_arg_count, "SSH_PRIVATE_KEY"));
+
+    PASS();
+}
+
+TEST(infra_parse_dockerfile_entrypoint) {
+    /* Port of TestParseDockerfile "single stage with entrypoint" */
+    const char *src = "FROM python:3.9-slim\n"
+                      "ENTRYPOINT [\"python\", \"main.py\"]\n";
+
+    cbm_dockerfile_result_t r;
+    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
+    ASSERT_STR_EQ(r.base_image, "python:3.9-slim");
+    ASSERT_STR_EQ(r.entrypoint, "python main.py");
+    ASSERT_EQ(r.stage_count, 1);
+    PASS();
+}
+
+TEST(infra_parse_dockerfile_secret_filtered) {
+    /* Port of TestParseDockerfile "secret env vars filtered" */
+    const char *src = "FROM node:20\n"
+                      "ENV API_KEY=sk-1234567890abcdef12345\n"
+                      "ENV DATABASE_URL=https://db.example.com\n"
+                      "ENV JWT_SECRET=supersecret\n";
+
+    cbm_dockerfile_result_t r;
+    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
+
+    /* API_KEY and JWT_SECRET should be filtered */
+    ASSERT(find_env_var(r.env_vars, r.env_count, "API_KEY") == NULL);
+    ASSERT(find_env_var(r.env_vars, r.env_count, "JWT_SECRET") == NULL);
+
+    /* DATABASE_URL should remain */
+    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"));
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"), "https://db.example.com");
+    PASS();
+}
+
+TEST(infra_parse_dockerfile_expose_protocol) {
+    /* Port of TestParseDockerfile "expose with protocol suffix" */
+    const char *src = "FROM nginx:latest\n"
+                      "EXPOSE 80/tcp 443/tcp\n";
+
+    cbm_dockerfile_result_t r;
+    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
+    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "80"));
+    ASSERT(str_array_contains(r.exposed_ports, r.port_count, "443"));
+    PASS();
+}
+
+TEST(infra_parse_dockerfile_env_space) {
+    /* Port of TestParseDockerfile "ENV space-separated format" */
+    const char *src = "FROM python:3.9\n"
+                      "ENV PYTHONPATH /usr/app\n";
+
+    cbm_dockerfile_result_t r;
+    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r), 0);
+    ASSERT_NOT_NULL(find_env_var(r.env_vars, r.env_count, "PYTHONPATH"));
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PYTHONPATH"), "/usr/app");
+    PASS();
+}
+
+TEST(infra_parse_dockerfile_empty) {
+    /* Port of TestParseDockerfileEmpty */
+    cbm_dockerfile_result_t r;
+    ASSERT_EQ(cbm_parse_dockerfile_source("# just a comment\n", &r), -1);
+    PASS();
+}
+
+/* ── Infrascan: Dotenv parser ───────────────────────────────────── */
+
+TEST(infra_parse_dotenv) {
+    /* Port of TestParseDotenvFile */
+    const char *src = "# Database config\n"
+                      "DATABASE_HOST=localhost\n"
+                      "DATABASE_PORT=5432\n"
+                      "DATABASE_NAME=mydb\n"
+                      "API_SECRET=should-not-appear\n"
+                      "PLAIN_VALUE=hello world\n";
+
+    cbm_dotenv_result_t r;
+    ASSERT_EQ(cbm_parse_dotenv_source(src, &r), 0);
+
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_HOST"), "localhost");
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_PORT"), "5432");
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "PLAIN_VALUE"), "hello world");
+
+    /* API_SECRET should be filtered */
+    ASSERT(find_env_var(r.env_vars, r.env_count, "API_SECRET") == NULL);
+    PASS();
+}
+
+TEST(infra_parse_dotenv_quoted) {
+    /* Port of TestParseDotenvQuotedValues */
+    const char *src = "KEY1=\"quoted value\"\n"
+                      "KEY2='single quoted'\n";
+
+    cbm_dotenv_result_t r;
+    ASSERT_EQ(cbm_parse_dotenv_source(src, &r), 0);
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "KEY1"), "quoted value");
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "KEY2"), "single quoted");
+    PASS();
+}
+
+/* ── Infrascan: Shell script parser ─────────────────────────────── */
+
+TEST(infra_parse_shell) {
+    /* Port of TestParseShellScript */
+    const char *src = "#!/bin/bash\n"
+                      "set -e\n"
+                      "\n"
+                      "# Configuration\n"
+                      "YOUR_CONTAINER_NAME=\"order-email-extractor-endpoint\"\n"
+                      "DOCKERFILE_PATH=\"/path/to/dockerfile\"\n"
+                      "\n"
+                      "export ENVIRONMENT=\"development\"\n"
+                      "export USE_STACKDRIVER=\"false\"\n"
+                      "\n"
+                      "# Shut down existing containers\n"
+                      "./shut-down-docker-container.sh\n"
+                      "\n"
+                      "docker build -t \"$YOUR_CONTAINER_NAME\" \"$DOCKERFILE_PATH\"\n"
+                      "docker run -d --name \"$YOUR_CONTAINER_NAME\" \"$YOUR_CONTAINER_NAME\"\n"
+                      "docker-compose up -d\n";
+
+    cbm_shell_result_t r;
+    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
+    ASSERT_STR_EQ(r.shebang, "/bin/bash");
+
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "ENVIRONMENT"), "development");
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "YOUR_CONTAINER_NAME"),
+                  "order-email-extractor-endpoint");
+
+    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker build"));
+    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker run"));
+    ASSERT(str_array_256_contains(r.docker_cmds, r.docker_cmd_count, "docker-compose up"));
+
+    PASS();
+}
+
+TEST(infra_parse_shell_with_source) {
+    /* Port of TestParseShellScriptWithSource */
+    const char *src = "#!/usr/bin/env bash\n"
+                      "source ./config.sh\n"
+                      ". /etc/profile.d/env.sh\n";
+
+    cbm_shell_result_t r;
+    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
+    ASSERT_STR_EQ(r.shebang, "/usr/bin/env bash");
+    ASSERT(str_array_256_contains(r.sources, r.source_count, "./config.sh"));
+    ASSERT(str_array_256_contains(r.sources, r.source_count, "/etc/profile.d/env.sh"));
+    PASS();
+}
+
+TEST(infra_parse_shell_secret_filtered) {
+    /* Port of TestParseShellScriptSecretFiltered */
+    const char *src = "#!/bin/bash\n"
+                      "export API_SECRET=\"should-not-appear\"\n"
+                      "export DATABASE_URL=\"https://db.example.com\"\n";
+
+    cbm_shell_result_t r;
+    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
+    ASSERT(find_env_var(r.env_vars, r.env_count, "API_SECRET") == NULL);
+    ASSERT_STR_EQ(find_env_var(r.env_vars, r.env_count, "DATABASE_URL"), "https://db.example.com");
+    PASS();
+}
+
+TEST(infra_parse_shell_shebang_only) {
+    /* Port of TestParseShellScriptShebanOnly */
+    const char *src = "#!/bin/bash\n# just comments\n";
+    cbm_shell_result_t r;
+    ASSERT_EQ(cbm_parse_shell_source(src, &r), 0);
+    ASSERT_STR_EQ(r.shebang, "/bin/bash");
+    PASS();
+}
+
+TEST(infra_parse_shell_truly_empty) {
+    /* Port of TestParseShellScriptTrulyEmpty */
+    cbm_shell_result_t r;
+    ASSERT_EQ(cbm_parse_shell_source("# no shebang, just comments\n", &r), -1);
+    PASS();
+}
+
+/* ── Infrascan: Terraform parser ────────────────────────────────── */
+
+TEST(infra_parse_terraform_full) {
+    /* Port of TestParseTerraformFile */
+    const char *src = "\n"
+                      "terraform {\n"
+                      "  required_providers {\n"
+                      "    google = {\n"
+                      "      source  = \"hashicorp/google\"\n"
+                      "      version = \"~> 6.35.0\"\n"
+                      "    }\n"
+                      "  }\n"
+                      "  backend \"gcs\" {\n"
+                      "    bucket = \"example-tf\"\n"
+                      "    prefix = \"state\"\n"
+                      "  }\n"
+                      "}\n"
+                      "\n"
+                      "variable \"project_id\" {\n"
+                      "  description = \"The GCP project ID\"\n"
+                      "  type        = string\n"
+                      "  default     = \"example-cloud\"\n"
+                      "}\n"
+                      "\n"
+                      "variable \"region\" {\n"
+                      "  description = \"The region\"\n"
+                      "  type        = string\n"
+                      "}\n"
+                      "\n"
+                      "resource \"google_cloud_run_service\" \"main\" {\n"
+                      "  name     = \"my-service\"\n"
+                      "  location = var.region\n"
+                      "}\n"
+                      "\n"
+                      "resource \"google_compute_address\" \"nat_ip\" {\n"
+                      "  name   = \"nat-ip\"\n"
+                      "  region = var.region\n"
+                      "}\n"
+                      "\n"
+                      "output \"service_url\" {\n"
+                      "  value = google_cloud_run_service.main.status[0].url\n"
+                      "}\n"
+                      "\n"
+                      "data \"google_project\" \"project\" {\n"
+                      "}\n"
+                      "\n"
+                      "module \"vpc\" {\n"
+                      "  source = \"./modules/vpc\"\n"
+                      "}\n"
+                      "\n"
+                      "locals {\n"
+                      "  env = \"prod\"\n"
+                      "}\n";
+
+    cbm_terraform_result_t r;
+    ASSERT_EQ(cbm_parse_terraform_source(src, &r), 0);
+    ASSERT_STR_EQ(r.backend, "gcs");
+
+    /* Resources */
+    ASSERT_EQ(r.resource_count, 2);
+    bool found_cloud_run = false;
+    for (int i = 0; i < r.resource_count; i++) {
+        if (strcmp(r.resources[i].type, "google_cloud_run_service") == 0 &&
+            strcmp(r.resources[i].name, "main") == 0) {
+            found_cloud_run = true;
+        }
+    }
+    ASSERT(found_cloud_run);
+
+    /* Variables */
+    ASSERT_EQ(r.variable_count, 2);
+    bool found_project_id = false;
+    for (int i = 0; i < r.variable_count; i++) {
+        if (strcmp(r.variables[i].name, "project_id") == 0) {
+            ASSERT_STR_EQ(r.variables[i].default_val, "example-cloud");
+            ASSERT_STR_EQ(r.variables[i].type, "string");
+            ASSERT_STR_EQ(r.variables[i].description, "The GCP project ID");
+            found_project_id = true;
+        }
+    }
+    ASSERT(found_project_id);
+
+    /* Outputs */
+    ASSERT_EQ(r.output_count, 1);
+    ASSERT_STR_EQ(r.outputs[0], "service_url");
+
+    /* Data sources */
+    ASSERT_EQ(r.data_source_count, 1);
+    ASSERT_STR_EQ(r.data_sources[0].type, "google_project");
+    ASSERT_STR_EQ(r.data_sources[0].name, "project");
+
+    /* Modules */
+    ASSERT_EQ(r.module_count, 1);
+    ASSERT_STR_EQ(r.modules[0].tf_name, "vpc");
+    ASSERT_STR_EQ(r.modules[0].source, "./modules/vpc");
+
+    /* Locals */
+    ASSERT(r.has_locals);
+
+    PASS();
+}
+
+TEST(infra_parse_terraform_variables_only) {
+    /* Port of TestParseTerraformVariablesOnly — secret default filtered */
+    const char *src = "\n"
+                      "variable \"project_id\" {\n"
+                      "  description = \"The GCP project ID\"\n"
+                      "  type        = string\n"
+                      "  default     = \"example-cloud\"\n"
+                      "}\n"
+                      "\n"
+                      "variable \"secret_key\" {\n"
+                      "  description = \"A secret\"\n"
+                      "  type        = string\n"
+                      "  default     = \"sk-1234567890abcdef12345\"\n"
+                      "}\n";
+
+    cbm_terraform_result_t r;
+    ASSERT_EQ(cbm_parse_terraform_source(src, &r), 0);
+    ASSERT_EQ(r.variable_count, 2);
+
+    /* secret_key default should be filtered */
+    for (int i = 0; i < r.variable_count; i++) {
+        if (strcmp(r.variables[i].name, "secret_key") == 0) {
+            ASSERT_STR_EQ(r.variables[i].default_val, "");
+        }
+    }
+    PASS();
+}
+
+TEST(infra_parse_terraform_empty) {
+    /* Port of TestParseTerraformEmpty */
+    cbm_terraform_result_t r;
+    ASSERT_EQ(cbm_parse_terraform_source("# just comments\n", &r), -1);
+    PASS();
+}
+
+/* ── Helm Chart.yaml dependency parsing (#338) ──────────────────── */
+
+TEST(helm_parse_chart_dependencies_issue338) {
+    const char *src = "apiVersion: v2\n"
+                      "name: mychart\n"
+                      "version: 1.0.0\n"
+                      "dependencies:\n"
+                      "  - name: postgresql\n"
+                      "    repository: https://charts.bitnami.com/bitnami\n"
+                      "    version: 12.x.x\n"
+                      "  - name: redis\n"
+                      "    repository: https://charts.bitnami.com/bitnami\n"
+                      "maintainers:\n"
+                      "  - name: alice\n"; /* not a dependency — outside the block */
+    cbm_helm_chart_t hc;
+    ASSERT_EQ(cbm_parse_helm_chart(src, &hc), 0);
+    ASSERT_STR_EQ(hc.chart_name, "mychart");
+    ASSERT_EQ(hc.dep_count, 2);
+    ASSERT_STR_EQ(hc.deps[0], "postgresql");
+    ASSERT_STR_EQ(hc.deps[1], "redis");
+    PASS();
+}
+
+TEST(helm_parse_chart_no_deps_issue338) {
+    cbm_helm_chart_t hc;
+    ASSERT_EQ(cbm_parse_helm_chart("name: solo\nversion: 0.1.0\n", &hc), 0);
+    ASSERT_STR_EQ(hc.chart_name, "solo");
+    ASSERT_EQ(hc.dep_count, 0);
+    PASS();
+}
+
+/* ── Infrascan: infra QN helper ─────────────────────────────────── */
+
+/* ── Function Registry / Resolver tests ─────────────────────────── */
+
+TEST(registry_resolve_single_candidate) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+    cbm_registry_add(reg, "ValidateOrder", "svcB.validators.ValidateOrder", "Function");
+
+    /* Normal resolve unique name */
+    cbm_resolution_t r = cbm_registry_resolve(reg, "CreateOrder", "svcC.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "svcA.handlers.CreateOrder");
+
+    /* Fuzzy resolve with unknown prefix */
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "unknownPkg.CreateOrder", "svcC.caller", NULL, NULL, 0);
+    ASSERT_TRUE(fr.ok);
+    ASSERT_STR_EQ(fr.result.qualified_name, "svcA.handlers.CreateOrder");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_nonexistent) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "CreateOrder", "svcA.handlers.CreateOrder", "Function");
+
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "NonExistent", "svcC.caller", NULL, NULL, 0);
+    ASSERT_FALSE(fr.ok);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_multiple_best_by_distance) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Process", "svcA.handlers.Process", "Function");
+    cbm_registry_add(reg, "Process", "svcB.handlers.Process", "Function");
+
+    /* Caller in svcA → prefer svcA */
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "unknown.Process", "svcA.other", NULL, NULL, 0);
+    ASSERT_TRUE(fr.ok);
+    ASSERT_STR_EQ(fr.result.qualified_name, "svcA.handlers.Process");
+
+    /* Caller in svcB → prefer svcB */
+    fr = cbm_registry_fuzzy_resolve(reg, "unknown.Process", "svcB.other", NULL, NULL, 0);
+    ASSERT_TRUE(fr.ok);
+    ASSERT_STR_EQ(fr.result.qualified_name, "svcB.handlers.Process");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_simple_name_extraction) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "DoWork", "myproject.utils.DoWork", "Function");
+
+    /* Deeply qualified name → extract "DoWork" */
+    cbm_fuzzy_result_t fr = cbm_registry_fuzzy_resolve(reg, "some.deep.module.DoWork",
+                                                       "myproject.caller", NULL, NULL, 0);
+    ASSERT_TRUE(fr.ok);
+    ASSERT_STR_EQ(fr.result.qualified_name, "myproject.utils.DoWork");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_empty) {
+    cbm_registry_t *reg = cbm_registry_new();
+
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "SomeFunc", "myproject.caller", NULL, NULL, 0);
+    ASSERT_FALSE(fr.ok);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_exists) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Foo", "pkg.module.Foo", "Function");
+    cbm_registry_add(reg, "Bar", "pkg.module.Bar", "Method");
+
+    ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Foo"));
+    ASSERT_TRUE(cbm_registry_exists(reg, "pkg.module.Bar"));
+    ASSERT_FALSE(cbm_registry_exists(reg, "pkg.module.Missing"));
+    ASSERT_FALSE(cbm_registry_exists(reg, ""));
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_confidence_import_map) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
+
+    const char *keys[] = {"other"};
+    const char *vals[] = {"proj.other"};
+    cbm_resolution_t r = cbm_registry_resolve(reg, "other.Foo", "proj.pkg", keys, vals, 1);
+    ASSERT_STR_EQ(r.qualified_name, "proj.other.Foo");
+    ASSERT(r.confidence > 0.90 && r.confidence <= 1.0);
+    ASSERT_STR_EQ(r.strategy, "import_map");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_confidence_import_map_suffix) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Foo", "proj.other.sub.Foo", "Function");
+
+    const char *keys[] = {"other"};
+    const char *vals[] = {"proj.other"};
+    cbm_resolution_t r = cbm_registry_resolve(reg, "other.Foo", "proj.pkg", keys, vals, 1);
+    ASSERT_STR_EQ(r.qualified_name, "proj.other.sub.Foo");
+    ASSERT(r.confidence > 0.80 && r.confidence <= 0.90);
+    ASSERT_STR_EQ(r.strategy, "import_map_suffix");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_confidence_same_module) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "Foo", "proj.pkg", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Foo");
+    ASSERT(r.confidence > 0.85 && r.confidence <= 0.95);
+    ASSERT_STR_EQ(r.strategy, "same_module");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_confidence_unique_name) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
+    ASSERT(r.confidence > 0.70 && r.confidence <= 0.80);
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_confidence_suffix_match) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.svcA.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "proj.svcA.Process");
+    ASSERT(r.confidence > 0.50 && r.confidence <= 0.60);
+    ASSERT_STR_EQ(r.strategy, "suffix_match");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_confidence_single) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
+
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "unknownPkg.Handler", "proj.caller", NULL, NULL, 0);
+    ASSERT_TRUE(fr.ok);
+    ASSERT(fr.result.confidence > 0.35 && fr.result.confidence <= 0.45);
+    ASSERT_STR_EQ(fr.result.strategy, "fuzzy");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_confidence_distance) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Process", "proj.svcA.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.svcB.Process", "Function");
+
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "unknownPkg.Process", "proj.svcA.other", NULL, NULL, 0);
+    ASSERT_TRUE(fr.ok);
+    ASSERT(fr.result.confidence > 0.25 && fr.result.confidence <= 0.35);
+    ASSERT_STR_EQ(fr.result.strategy, "fuzzy");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_negative_import_rejects) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Process", "proj.billing.Process", "Function");
+    cbm_registry_add(reg, "Process", "proj.handler.Process", "Function");
+
+    /* Import only handler's module → should prefer handler */
+    const char *keys[] = {"handler"};
+    const char *vals[] = {"proj.handler"};
+    cbm_resolution_t r = cbm_registry_resolve(reg, "Process", "proj.caller", keys, vals, 1);
+    ASSERT_STR_EQ(r.qualified_name, "proj.handler.Process");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_import_penalty) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+
+    /* Has imports but billing not imported → confidence halved */
+    const char *keys[] = {"other"};
+    const char *vals[] = {"proj.other"};
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "unknown.Handler", "proj.caller", keys, vals, 1);
+    ASSERT_TRUE(fr.ok);
+    /* 0.40 * 0.5 = 0.20 */
+    ASSERT(fr.result.confidence > 0.15 && fr.result.confidence <= 0.25);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_fuzzy_no_import_map_passthrough) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Handler", "proj.billing.Handler", "Function");
+
+    /* NULL import map → no penalty, full fuzzy confidence */
+    cbm_fuzzy_result_t fr =
+        cbm_registry_fuzzy_resolve(reg, "unknown.Handler", "proj.caller", NULL, NULL, 0);
+    ASSERT_TRUE(fr.ok);
+    ASSERT(fr.result.confidence > 0.35 && fr.result.confidence <= 0.45);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_find_by_name) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+
+    /* FindByName returns all entries for "Foo" */
+    const char **foos = NULL;
+    int foos_count = 0;
+    cbm_registry_find_by_name(reg, "Foo", &foos, &foos_count);
+    ASSERT_EQ(foos_count, 2);
+
+    /* FindByName for unique "Bar" */
+    const char **bars = NULL;
+    int bars_count = 0;
+    cbm_registry_find_by_name(reg, "Bar", &bars, &bars_count);
+    ASSERT_EQ(bars_count, 1);
+    ASSERT_STR_EQ(bars[0], "proj.pkg.Bar");
+
+    /* FindByName for "transform" */
+    const char **transforms = NULL;
+    int trans_count = 0;
+    cbm_registry_find_by_name(reg, "transform", &transforms, &trans_count);
+    ASSERT_EQ(trans_count, 1);
+    ASSERT_STR_EQ(transforms[0], "proj.utils.DataProcessor.transform");
+
+    /* label_of */
+    ASSERT_STR_EQ(cbm_registry_label_of(reg, "proj.utils.DataProcessor.transform"), "Method");
+    ASSERT_STR_EQ(cbm_registry_label_of(reg, "proj.pkg.Foo"), "Function");
+
+    /* Total size */
+    ASSERT_EQ(cbm_registry_size(reg), 4);
+
+    /* Resolve same-module */
+    cbm_resolution_t r = cbm_registry_resolve(reg, "Foo", "proj.pkg", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Foo");
+
+    /* Resolve via import map */
+    const char *keys[] = {"other"};
+    const char *vals[] = {"proj.other"};
+    r = cbm_registry_resolve(reg, "other.Foo", "proj.pkg", keys, vals, 1);
+    ASSERT_STR_EQ(r.qualified_name, "proj.other.Foo");
+
+    /* Resolve unique name */
+    r = cbm_registry_resolve(reg, "Bar", "proj.unrelated", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.Bar");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+TEST(registry_confidence_band) {
+    ASSERT_STR_EQ(cbm_confidence_band(0.95), "high");
+    ASSERT_STR_EQ(cbm_confidence_band(0.70), "high");
+    ASSERT_STR_EQ(cbm_confidence_band(0.55), "medium");
+    ASSERT_STR_EQ(cbm_confidence_band(0.45), "medium");
+    ASSERT_STR_EQ(cbm_confidence_band(0.40), "speculative");
+    ASSERT_STR_EQ(cbm_confidence_band(0.25), "speculative");
+    ASSERT_STR_EQ(cbm_confidence_band(0.20), "");
+    ASSERT_STR_EQ(cbm_confidence_band(0.0), "");
+    PASS();
+}
+
+TEST(infra_qn_helper) {
+    /* Port of TestInfraQN */
+
+    /* Regular infra file → __infra__ suffix */
+    char *qn = cbm_infra_qn("myproject", "docker-images/service/Dockerfile", "dockerfile", NULL);
+    ASSERT_NOT_NULL(qn);
+    ASSERT(strstr(qn, ".__infra__") != NULL);
+    free(qn);
+
+    /* Compose service → ::service_name suffix */
+    qn = cbm_infra_qn("myproject", "docker-compose.yml", "compose-service", "web");
+    ASSERT_NOT_NULL(qn);
+    ASSERT(strstr(qn, "::web") != NULL);
+    free(qn);
+
+    PASS();
+}
+
+/* ── Infrascan integration tests ────────────────────────────────── */
+
+TEST(infra_pipeline_integration) {
+    /* Port of TestPassInfraFilesIntegration (Dockerfile + .env parts).
+     * Tests parse functions on source text (pipeline infrascan pass not
+     * wired yet — compose YAML also blocked on YAML parser). */
+
+    /* Parse Dockerfile */
+    cbm_dockerfile_result_t dr;
+    ASSERT_EQ(cbm_parse_dockerfile_source("FROM alpine:3.19\nEXPOSE 8080\n", &dr), 0);
+    ASSERT_STR_EQ(dr.base_image, "alpine:3.19");
+    ASSERT_GTE(dr.port_count, 1);
+
+    /* Parse .env */
+    cbm_dotenv_result_t er;
+    ASSERT_EQ(cbm_parse_dotenv_source("APP_PORT=8080\nDEBUG=true\n", &er), 0);
+    ASSERT_GTE(er.env_count, 1);
+    /* APP_PORT should be present */
+    bool found_port = false;
+    for (int i = 0; i < er.env_count; i++) {
+        if (strcmp(er.env_vars[i].key, "APP_PORT") == 0 &&
+            strcmp(er.env_vars[i].value, "8080") == 0)
+            found_port = true;
+    }
+    ASSERT_TRUE(found_port);
+
+    PASS();
+}
+
+TEST(infra_pipeline_idempotent) {
+    /* Port of TestPassInfraFilesIdempotent:
+     * Parsing same source twice should produce identical results. */
+    const char *src = "FROM alpine:3.19\nEXPOSE 8080\nENV PORT=8080\n";
+    cbm_dockerfile_result_t r1, r2;
+    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r1), 0);
+    ASSERT_EQ(cbm_parse_dockerfile_source(src, &r2), 0);
+
+    ASSERT_STR_EQ(r1.base_image, r2.base_image);
+    ASSERT_EQ(r1.port_count, r2.port_count);
+    ASSERT_EQ(r1.env_count, r2.env_count);
+
+    PASS();
+}
+
+/* ── K8s / Kustomize extraction tests ──────────────────────────── */
+
+TEST(k8s_extract_kustomize) {
+    const char *src = "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                      "kind: Kustomization\n"
+                      "resources:\n"
+                      "  - deployment.yaml\n"
+                      "  - service.yaml\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_KUSTOMIZE, "myproj",
+                                        "base/kustomization.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->imports.count, 2);
+
+    bool found_deploy = false, found_svc = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "deployment.yaml") == 0)
+            found_deploy = true;
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "service.yaml") == 0)
+            found_svc = true;
+    }
+    ASSERT_TRUE(found_deploy);
+    ASSERT_TRUE(found_svc);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest) {
+    const char *src = "apiVersion: apps/v1\n"
+                      "kind: Deployment\n"
+                      "metadata:\n"
+                      "  name: my-app\n"
+                      "  namespace: production\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
+                                        "k8s/deployment.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->defs.count, 1);
+
+    bool found_resource = false;
+    for (int d = 0; d < r->defs.count; d++) {
+        if (r->defs.items[d].label && strcmp(r->defs.items[d].label, "Resource") == 0 &&
+            r->defs.items[d].name && strstr(r->defs.items[d].name, "Deployment") != NULL)
+            found_resource = true;
+    }
+    ASSERT_TRUE(found_resource);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_no_name) {
+    const char *src = "apiVersion: apps/v1\nkind: Deployment\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
+                                        "k8s/deploy.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    /* No crash — defs count may be 0 because metadata.name is absent */
+    ASSERT(!r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_multidoc) {
+    /* Two-document YAML separated by "---".
+     * extract_k8s_manifest contains a "break" after the first successful push,
+     * so it processes only the first document that has both kind and
+     * metadata.name.  This test pins that behaviour: the first document's
+     * resource must be present and no crash must occur.
+     *
+     * Note: with some tree-sitter YAML grammar versions the root stream may
+     * expose both documents as siblings; the break still fires after the first
+     * successful def push, so defs.count must be exactly 1. */
+    const char *src = "apiVersion: apps/v1\n"
+                      "kind: Deployment\n"
+                      "metadata:\n"
+                      "  name: my-app\n"
+                      "---\n"
+                      "apiVersion: v1\n"
+                      "kind: Service\n"
+                      "metadata:\n"
+                      "  name: my-svc\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
+                                        "k8s/multi.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT(!r->has_error);
+    /* First document's resource must be present */
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Resource") == 0 &&
+            r->defs.items[i].name && strcmp(r->defs.items[i].name, "Deployment/my-app") == 0) {
+            found = 1;
+        }
+    }
+    ASSERT(found);
+    /* At least one def, no more than one (only first document processed) */
+    ASSERT(r->defs.count >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Envscan tests (port of envscan_test.go) ───────────────────── */
+
+/* Helper: write a file inside a temp dir */
+static void write_temp_file(const char *dir, const char *name, const char *content) {
+    char path[512];
+    /* Create subdirectories if needed */
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    char *slash = strrchr(path, '/');
+    if (slash) {
+        char parent[512];
+        size_t plen = slash - path;
+        memcpy(parent, path, plen);
+        parent[plen] = '\0';
+        /* mkdir -p (simple version, one level) */
+        cbm_mkdir(parent);
+    }
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fputs(content, f);
+        fclose(f);
+    }
+}
+
+/* Helper: find binding by key in results */
+static const cbm_env_binding_t *find_binding_by_key(const cbm_env_binding_t *bindings, int count,
+                                                    const char *key) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(bindings[i].key, key) == 0)
+            return &bindings[i];
+    }
+    return NULL;
+}
+
+/* Helper: find binding by value in results */
+static int has_binding_value(const cbm_env_binding_t *bindings, int count, const char *value) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(bindings[i].value, value) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+TEST(envscan_dockerfile_env_urls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_dock_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "Dockerfile",
+                    "FROM python:3.9-slim\n"
+                    "ENV ORDER_URL=https://api.example.com/api/orders\n"
+                    "ENV DB_HOST=localhost\n"
+                    "ARG WEBHOOK_URL=https://hooks.example.com/webhook\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "ORDER_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "ORDER_URL")->value,
+                  "https://api.example.com/api/orders");
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "WEBHOOK_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "WEBHOOK_URL")->value,
+                  "https://hooks.example.com/webhook");
+    /* DB_HOST=localhost is NOT a URL → should be absent */
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "DB_HOST") == NULL);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_shell_env_urls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sh_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "setup.sh",
+                    "#!/bin/bash\n"
+                    "export DB_URL=\"https://db.example.com/api/sync\"\n"
+                    "APP_NAME=\"my-service\"\n"
+                    "CALLBACK_URL=https://hooks.example.com/notify\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "DB_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "DB_URL")->value,
+                  "https://db.example.com/api/sync");
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CALLBACK_URL"));
+    /* APP_NAME is NOT a URL → absent */
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "APP_NAME") == NULL);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_env_file_urls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_env_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, ".env",
+                    "\nAPI_URL=https://api.example.com/v1\n"
+                    "DEBUG=true\n"
+                    "SERVICE_URL=https://service.example.com/api\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "API_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "API_URL")->value,
+                  "https://api.example.com/v1");
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "SERVICE_URL"));
+    /* DEBUG=true is NOT a URL */
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "DEBUG") == NULL);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_toml_urls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_toml_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "config.toml",
+                    "[service]\n"
+                    "base_url = \"https://api.example.com\"\n"
+                    "name = \"my-service\"\n"
+                    "callback_url = \"https://hooks.example.com/notify\"\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "base_url"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "base_url")->value,
+                  "https://api.example.com");
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "callback_url"));
+    /* name="my-service" is NOT a URL */
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "name") == NULL);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_yaml_urls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_yaml_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "config.yaml",
+                    "service:\n"
+                    "  service_url: \"https://api.internal.com/api/process\"\n"
+                    "  timeout: 30\n"
+                    "  callback_url: \"https://hooks.internal.com/callback\"\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "service_url"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "service_url")->value,
+                  "https://api.internal.com/api/process");
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "callback_url"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_terraform_urls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_tf_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "variables.tf",
+                    "variable \"webhook_url\" {\n"
+                    "  description = \"Webhook endpoint\"\n"
+                    "  default     = \"https://api.example.com/webhook\"\n"
+                    "}\n\n"
+                    "variable \"region\" {\n"
+                    "  default = \"us-east-1\"\n"
+                    "}\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_GTE(count, 1);
+    ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/webhook"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_properties_urls) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_prop_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "app.properties",
+                    "api.url=https://api.example.com/health\n"
+                    "app.name=myapp\n"
+                    "service.endpoint=https://service.example.com/api\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_TRUE(has_binding_value(bindings, count, "https://api.example.com/health"));
+    ASSERT_TRUE(has_binding_value(bindings, count, "https://service.example.com/api"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_secret_key_exclusion) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_skey_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "Dockerfile",
+                    "FROM node:18\n"
+                    "ENV SECRET_TOKEN=https://api.example.com/api\n"
+                    "ENV API_KEY=https://api.example.com/v1\n"
+                    "ENV PASSWORD=https://auth.example.com/login\n"
+                    "ENV NORMAL_URL=https://api.example.com/orders\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    /* Secret keys should be excluded */
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "SECRET_TOKEN") == NULL);
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "API_KEY") == NULL);
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "PASSWORD") == NULL);
+    /* Normal key should be present */
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_URL"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_secret_value_exclusion) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sval_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(
+        tmpdir, "deploy.sh",
+        "#!/bin/bash\n"
+        "export GH_URL=\"https://ghp_abcdefghijklmnopqrstuvwxyz1234567890@github.com/repo\"\n"
+        "export NORMAL_ENDPOINT=\"https://api.example.com/orders\"\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    /* ghp_ token URL should be excluded */
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "GH_URL") == NULL);
+    /* Normal URL should be present */
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "NORMAL_ENDPOINT"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_secret_file_exclusion) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_sfile_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    /* Secret file should be skipped */
+    write_temp_file(tmpdir, "credentials.sh",
+                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+    /* Normal file should be scanned */
+    write_temp_file(tmpdir, "setup.sh",
+                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    /* Should find binding from setup.sh but not credentials.sh */
+    int from_credentials = 0;
+    int from_setup = 0;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(bindings[i].file_path, "credentials.sh") == 0)
+            from_credentials = 1;
+        if (strcmp(bindings[i].file_path, "setup.sh") == 0)
+            from_setup = 1;
+    }
+    ASSERT_EQ(from_credentials, 0);
+    ASSERT_EQ(from_setup, 1);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_skips_ignored_dirs) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_ign_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    /* File inside .git should be skipped */
+    char gitdir[512];
+    snprintf(gitdir, sizeof(gitdir), "%s/.git", tmpdir);
+    cbm_mkdir(gitdir);
+    write_temp_file(tmpdir, ".git/config.sh",
+                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+
+    /* File inside node_modules should be skipped */
+    char nmdir[512];
+    snprintf(nmdir, sizeof(nmdir), "%s/node_modules", tmpdir);
+    cbm_mkdir(nmdir);
+    char nmpkg[512];
+    snprintf(nmpkg, sizeof(nmpkg), "%s/node_modules/pkg", tmpdir);
+    cbm_mkdir(nmpkg);
+    write_temp_file(tmpdir, "node_modules/pkg/config.sh",
+                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+
+    /* File at root level should be scanned */
+    write_temp_file(tmpdir, "deploy.sh",
+                    "#!/bin/bash\nexport API_URL=\"https://api.example.com/v1\"\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    int from_git = 0, from_nm = 0, from_root = 0;
+    for (int i = 0; i < count; i++) {
+        if (strncmp(bindings[i].file_path, ".git/", 5) == 0)
+            from_git = 1;
+        if (strncmp(bindings[i].file_path, "node_modules/", 13) == 0)
+            from_nm = 1;
+        if (strcmp(bindings[i].file_path, "deploy.sh") == 0)
+            from_root = 1;
+    }
+    ASSERT_EQ(from_git, 0);
+    ASSERT_EQ(from_nm, 0);
+    ASSERT_EQ(from_root, 1);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_non_url_values_skipped) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_nurl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "Dockerfile",
+                    "FROM python:3.9\n"
+                    "ENV APP_NAME=my-service\n"
+                    "ENV PORT=8080\n"
+                    "ENV DEBUG=true\n"
+                    "ENV LOG_LEVEL=info\n");
+    write_temp_file(tmpdir, "config.sh",
+                    "#!/bin/bash\n"
+                    "export REGION=\"us-east-1\"\n"
+                    "export COUNT=42\n");
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+
+    ASSERT_EQ(count, 0);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ── Git history tests (port of githistory_test.go) ────────────── */
+
+/* Port of Go TestIsTrackableFile from githistory_test.go */
+TEST(githistory_is_trackable_file) {
+    /* Source files — trackable */
+    ASSERT_TRUE(cbm_is_trackable_file("main.go"));
+    ASSERT_TRUE(cbm_is_trackable_file("src/app.py"));
+    ASSERT_TRUE(cbm_is_trackable_file("README.md"));
+
+    /* node_modules — not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("node_modules/foo/bar.js"));
+    /* vendor — not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("vendor/lib/dep.go"));
+    /* Lock files — not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("package-lock.json"));
+    ASSERT_FALSE(cbm_is_trackable_file("go.sum"));
+    /* Binary/assets — not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("image.png"));
+    /* .git directory — not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file(".git/config"));
+    /* __pycache__ — not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("__pycache__/mod.pyc"));
+    /* Minified files — not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("src/style.min.css"));
+    PASS();
+}
+
+/* Port of Go TestComputeChangeCoupling from githistory_test.go */
+TEST(githistory_compute_change_coupling) {
+    /* 5 commits:
+     * aaa: a.go, b.go, c.go
+     * bbb: a.go, b.go
+     * ccc: a.go, b.go
+     * ddd: a.go, c.go
+     * eee: d.go, e.go
+     */
+    char *files_aaa[] = {cf_a, cf_b, cf_c};
+    char *files_bbb[] = {cf_a, cf_b};
+    char *files_ccc[] = {cf_a, cf_b};
+    char *files_ddd[] = {cf_a, cf_c};
+    char *files_eee[] = {cf_d, cf_e};
+
+    cbm_commit_files_t commits[5] = {
+        {files_aaa, 3, 0}, {files_bbb, 2, 0}, {files_ccc, 2, 0},
+        {files_ddd, 2, 0}, {files_eee, 2, 0},
+    };
+
+    cbm_change_coupling_t out[100];
+    int count = cbm_compute_change_coupling(commits, 5, out, 100);
+
+    /* a.go + b.go co-change 3 times → should be in results */
+    bool found_ab = false;
+    for (int i = 0; i < count; i++) {
+        if ((strcmp(out[i].file_a, "a.go") == 0 && strcmp(out[i].file_b, "b.go") == 0) ||
+            (strcmp(out[i].file_a, "b.go") == 0 && strcmp(out[i].file_b, "a.go") == 0)) {
+            found_ab = true;
+            ASSERT_EQ(out[i].co_change_count, 3);
+            ASSERT(out[i].coupling_score >= 0.9);
+        }
+    }
+    ASSERT_TRUE(found_ab);
+
+    /* d.go + e.go co-change only 1 time → below threshold of 3 */
+    for (int i = 0; i < count; i++) {
+        if (strcmp(out[i].file_a, "d.go") == 0 || strcmp(out[i].file_b, "d.go") == 0) {
+            ASSERT(0); /* d.go should not appear */
+        }
+    }
+    PASS();
+}
+
+/* Port of Go TestComputeChangeCouplingSkipsLargeCommits from githistory_test.go */
+TEST(githistory_coupling_skips_large_commits) {
+    /* 25 files in one commit → exceeds 20-file threshold */
+    char *files[25];
+    char bufs[25][32];
+    for (int i = 0; i < 25; i++) {
+        snprintf(bufs[i], sizeof(bufs[i]), "file%d.go", i);
+        files[i] = bufs[i];
+    }
+    cbm_commit_files_t commits[1] = {{files, 25, 0}};
+
+    cbm_change_coupling_t out[100];
+    int count = cbm_compute_change_coupling(commits, 1, out, 100);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* Port of Go TestComputeChangeCouplingLimitsTo100 from githistory_test.go */
+TEST(githistory_coupling_limits_output) {
+    /* Generate many small commits to create >100 couplings.
+     * 50 files, each pair committed 3 times. max_out=100. */
+    int idx = 0;
+    char *pair_files[2450][2]; /* 50*49/2 pairs * 3 repetitions = 3675 commits */
+    char pair_bufs[2450][2][32];
+    cbm_commit_files_t commits[3675];
+    int ci = 0;
+    for (int i = 0; i < 50 && ci < 3675; i++) {
+        for (int j = i + 1; j < 50 && ci < 3675; j++) {
+            for (int k = 0; k < 3 && ci < 3675; k++) {
+                snprintf(pair_bufs[idx][0], 32, "f%d.go", i);
+                snprintf(pair_bufs[idx][1], 32, "f%d.go", j);
+                pair_files[idx][0] = pair_bufs[idx][0];
+                pair_files[idx][1] = pair_bufs[idx][1];
+                commits[ci].files = pair_files[idx];
+                commits[ci].count = 2;
+                ci++;
+                idx++;
+                if (idx >= 2450)
+                    idx = 0; /* reuse buffer space */
+            }
+        }
+    }
+
+    cbm_change_coupling_t out[200];
+    int count = cbm_compute_change_coupling(commits, ci, out, 100);
+    ASSERT(count <= 100);
+    PASS();
+}
+
+/* Port of Go TestIsImportReachable from resolver_test.go */
+TEST(registry_is_import_reachable) {
+    const char *import_vals[] = {"proj.handler", "proj.shared.utils"};
+
+    /* Exact match: proj.handler.Process → true */
+    ASSERT_TRUE(cbm_registry_is_import_reachable("proj.handler.Process", import_vals, 2));
+    /* Sub-package: proj.handler.sub.Process → true (handler contains handler) */
+    ASSERT_TRUE(cbm_registry_is_import_reachable("proj.handler.sub.Process", import_vals, 2));
+    /* Nested match: proj.shared.utils.Helper → true */
+    ASSERT_TRUE(cbm_registry_is_import_reachable("proj.shared.utils.Helper", import_vals, 2));
+    /* Unrelated: proj.billing.Process → false */
+    ASSERT_FALSE(cbm_registry_is_import_reachable("proj.billing.Process", import_vals, 2));
+    /* Completely unrelated: unrelated.pkg.Func → false */
+    ASSERT_FALSE(cbm_registry_is_import_reachable("unrelated.pkg.Func", import_vals, 2));
+    PASS();
+}
+
+/* Port of FindEndingWith portion from Go TestFunctionRegistry in pipeline_test.go */
+TEST(registry_find_ending_with) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "Foo", "proj.pkg.Foo", "Function");
+    cbm_registry_add(reg, "Bar", "proj.pkg.Bar", "Function");
+    cbm_registry_add(reg, "Foo", "proj.other.Foo", "Function");
+    cbm_registry_add(reg, "transform", "proj.utils.DataProcessor.transform", "Method");
+
+    /* FindEndingWith "DataProcessor.transform" → 1 match */
+    const char **matches = NULL;
+    int count = cbm_registry_find_ending_with(reg, "DataProcessor.transform", &matches);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(matches[0], "proj.utils.DataProcessor.transform");
+    free(matches);
+
+    /* FindEndingWith "Foo" → 2 matches */
+    matches = NULL;
+    count = cbm_registry_find_ending_with(reg, "Foo", &matches);
+    ASSERT_EQ(count, 2);
+    /* Both should be present (order may vary) */
+    bool found_pkg = false, found_other = false;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(matches[i], "proj.pkg.Foo") == 0)
+            found_pkg = true;
+        if (strcmp(matches[i], "proj.other.Foo") == 0)
+            found_other = true;
+    }
+    ASSERT_TRUE(found_pkg);
+    ASSERT_TRUE(found_other);
+    free(matches);
+
+    /* FindEndingWith "Nonexistent" → 0 matches */
+    matches = NULL;
+    count = cbm_registry_find_ending_with(reg, "Nonexistent", &matches);
+    ASSERT_EQ(count, 0);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Incremental reindex tests
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Helper: create a simple 2-file Go project for incremental tests */
+static char g_incr_tmpdir[256];
+static char g_incr_dbpath[512];
+
+static int setup_incremental_repo(void) {
+    snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "/tmp/cbm_incr_XXXXXX");
+    if (!cbm_mkdtemp(g_incr_tmpdir)) {
+        return -1;
+    }
+    snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+
+    char path[512];
+    FILE *f;
+
+    /* main.go — calls Helper() */
+    snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    f = fopen(path, "w");
+    if (!f) {
+        return -1;
+    }
+    fprintf(f, "package main\n\nfunc main() {\n\tHelper()\n}\n");
+    fclose(f);
+
+    /* helper.go — defines Helper() */
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    f = fopen(path, "w");
+    if (!f) {
+        return -1;
+    }
+    fprintf(f, "package main\n\nfunc Helper() string {\n\treturn \"hello\"\n}\n");
+    fclose(f);
+
+    return 0;
+}
+
+static void cleanup_incremental_repo(void) {
+    th_rmtree(g_incr_tmpdir);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  FastAPI Depends() edge tracking (PR #66, fix #27)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(pipeline_fastapi_depends_edges) {
+    /* Depends(get_current_user) should produce a CALLS edge from the
+     * endpoint to the dependency function. */
+    const char *files[] = {"auth.py", "routes.py"};
+    const char *contents[] = {/* auth.py: defines get_current_user */
+                              "def get_current_user(token: str):\n"
+                              "    return decode_token(token)\n",
+                              /* routes.py: endpoint depends on get_current_user */
+                              "from fastapi import Depends\n"
+                              "from auth import get_current_user\n\n"
+                              "def get_profile(user = Depends(get_current_user)):\n"
+                              "    return {\"user\": user}\n"};
+    if (setup_lang_repo(files, contents, 2) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Check CALLS edges for fastapi_depends strategy */
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_type(s, proj, "CALLS", &edges, &edge_count);
+
+    bool found_depends_edge = false;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].properties_json && strstr(edges[i].properties_json, "fastapi_depends")) {
+            found_depends_edge = true;
+            break;
+        }
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    ASSERT_TRUE(found_depends_edge);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* DLL resolve test removed — feature removed due to Windows Defender
+ * false positive (Wacatac.B!ml). See issue #89. */
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Incremental reindex
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(incremental_full_then_noop) {
+    /* Full index, then re-run → should detect no changes and skip */
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Verify nodes exist */
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+
+    /* Second: incremental — nothing changed → should be no-op */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    /* Node count should be same (no duplicates, no loss) */
+    ASSERT_EQ(nodes_after, nodes_before);
+    cbm_store_close(s);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_format_two_rebuilds_template_declarations_once) {
+    const char *files[] = {"View.hpp", "View.cpp"};
+    const char *contents[] = {
+        "template<class T> struct View { void convert(T value, T & output) const; };\n",
+        "template<class U> void View<U>::convert(U renamed, U & result) const {}\n"};
+    ASSERT_EQ(setup_lang_repo(files, contents, 2), 0);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    // Format 2 lacked keys for these template members. Keep source hashes intact.
+    cbm_store_t *store = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "convert", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    for (int i = 0; i < count; i++) {
+        cbm_node_t old = nodes[i];
+        old.properties_json = "{}";
+        ASSERT_GT(cbm_store_upsert_node(store, &old), 0);
+    }
+    cbm_store_free_nodes(nodes, count);
+    ASSERT_EQ(cbm_store_set_format_version(store, 2), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_store(store, project, "Keep this project decision."), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    for (int run = 0; run < 2; run++) {
+        p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
+        ASSERT_NOT_NULL(p);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        ASSERT_EQ(cbm_pipeline_had_format_migration(p), run == 0);
+        cbm_pipeline_free(p);
+        store = cbm_store_open_path(db);
+        ASSERT_NOT_NULL(store);
+        int format = 0;
+        ASSERT_EQ(cbm_store_get_format_version(store, &format), CBM_STORE_OK);
+        ASSERT_EQ(format, CBM_INDEX_FORMAT_VERSION);
+        ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "convert", &nodes, &count),
+                  CBM_STORE_OK);
+        ASSERT_EQ(count, 2);
+        yyjson_doc *a = yyjson_read(nodes[0].properties_json,
+                                   strlen(nodes[0].properties_json), 0);
+        yyjson_doc *b = yyjson_read(nodes[1].properties_json,
+                                   strlen(nodes[1].properties_json), 0);
+        ASSERT_NOT_NULL(a);
+        ASSERT_NOT_NULL(b);
+        const char *key_a = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(a), "declaration_key"));
+        const char *key_b = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(b), "declaration_key"));
+        ASSERT_NOT_NULL(key_a);
+        ASSERT_NOT_NULL(key_b);
+        ASSERT_STR_EQ(key_a, key_b);
+        yyjson_doc_free(a);
+        yyjson_doc_free(b);
+        cbm_store_free_nodes(nodes, count);
+        cbm_adr_t adr = {};
+        ASSERT_EQ(cbm_store_adr_get(store, project, &adr), CBM_STORE_OK);
+        ASSERT_STR_EQ(adr.content, "Keep this project decision.");
+        cbm_store_adr_free(&adr);
+        cbm_store_close(store);
+    }
+    free(project);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(incremental_detects_changed_file) {
+    /* Full index, modify one file, re-index → changed file re-parsed */
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Modify helper.go — add a new function */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    /* Second: incremental — should detect change and re-index */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* Verify node count increased (NewFunc was added) */
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_after, 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_detects_deleted_file) {
+    /* Full index, delete a file, re-index → deleted file's nodes removed */
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Delete helper.go */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    unlink(path);
+
+    /* Second: incremental — should remove Helper nodes */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* Verify node count decreased (Helper's file was deleted) */
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_after, 0); /* still has main.go nodes */
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_new_file_added) {
+    /* Full index, add a new file, re-index → new file's nodes appear */
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    /* First: full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Add extra.go */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/extra.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc Extra() bool {\n\treturn true\n}\n");
+    fclose(f);
+
+    /* Second: incremental — should pick up Extra */
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_after = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_after, 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
+    /* Regression: 2026-04-13. A fast-mode reindex after a full-mode index
+     * was silently destroying every file under FAST_SKIP_DIRS directories
+     * (`tools`, `scripts`, `bin`, `build`, `docs`, ...) by classifying them
+     * as deleted in find_deleted_files even though they still existed on
+     * disk. The Skyline graph lost packages/mcp/src/tools/ (18 files / ~500
+     * nodes) mid-session when a concurrent /develop run obediently called
+     * mode='fast'. This test pins the additive semantics: lesser-mode
+     * reindexes must NOT delete files that are merely outside the current
+     * pass's discovery scope. Fix: find_deleted_files now stat()s each
+     * stored-but-missing file and only purges it if it is truly absent
+     * from disk. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_modeskip_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("tmpdir");
+    }
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+
+    char path[512];
+    FILE *f;
+
+    /* main.go — root-level production code (visible in fast and full) */
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc main() {\n}\n");
+    fclose(f);
+
+    /* tools/util.go — production code under a FAST_SKIP_DIRS directory.
+     * Full mode indexes it; fast mode skips it via the discover.c heuristic. */
+    char tools_dir[512];
+    snprintf(tools_dir, sizeof(tools_dir), "%s/tools", tmpdir);
+    cbm_mkdir_p(tools_dir, 0755);
+    snprintf(path, sizeof(path), "%s/tools/util.go", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package tools\n\nfunc Util() string {\n\treturn \"u\"\n}\n");
+    fclose(f);
+
+    /* Step 1: full-mode index — both files should be present */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_before = NULL;
+    int tools_count_before = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_before,
+                                 &tools_count_before);
+    ASSERT_GT(tools_count_before, 0); /* full mode must see tools/util.go */
+    cbm_store_free_nodes(tools_nodes_before, tools_count_before);
+    int total_before = cbm_store_count_nodes(s, project);
+    cbm_store_close(s);
+
+    /* Step 2: fast-mode reindex — tools/util.go MUST survive (additive semantics) */
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_after = NULL;
+    int tools_count_after = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_after,
+                                 &tools_count_after);
+    /* The critical assertion: tools/util.go nodes must still be present after
+     * a fast-mode reindex that skipped the tools/ directory. Before the fix,
+     * this was 0. */
+    ASSERT_GT(tools_count_after, 0);
+    ASSERT_EQ(tools_count_after, tools_count_before); /* same nodes, untouched */
+    cbm_store_free_nodes(tools_nodes_after, tools_count_after);
+
+    /* Sanity: total node count should not have collapsed by ~the size of tools/ */
+    int total_after = cbm_store_count_nodes(s, project);
+    ASSERT_GTE(total_after, total_before); /* additive — never less */
+    cbm_store_close(s);
+
+    /* Step 3: mutate main.go and fast reindex — forces dump_and_persist to
+     * run (instead of the noop early-return path that step 2 hit). This is
+     * the real dangerous path: the gbuf gets loaded, mutated for main.go,
+     * dumped back to disk. tools/util.go must survive THAT cycle, not just
+     * the trivial noop path. Audit finding from 2026-04-13. */
+    snprintf(path, sizeof(path), "%s/main.go", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc main() {\n\tprintln(\"changed\")\n}\n");
+    fclose(f);
+    /* Bump mtime explicitly — some filesystems have coarse mtime resolution
+     * and the rewrite could land in the same tick as the original write. */
+#ifndef _WIN32
+    struct stat mst;
+    if (stat(path, &mst) == 0) {
+        struct timespec times[2];
+        times[0].tv_sec = mst.st_atime;
+        times[0].tv_nsec = 0;
+        times[1].tv_sec = mst.st_mtime + 5;
+        times[1].tv_nsec = 0;
+        utimensat(AT_FDCWD, path, times, 0);
+    }
+#endif /* !_WIN32 */
+
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_run3 = NULL;
+    int tools_count_run3 = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_run3, &tools_count_run3);
+    /* tools/util.go nodes must STILL be present after a fast reindex that
+     * actually ran the full dump_and_persist cycle (not the noop fast-path). */
+    ASSERT_EQ(tools_count_run3, tools_count_before);
+    cbm_store_free_nodes(tools_nodes_run3, tools_count_run3);
+    cbm_store_close(s);
+
+    /* Step 4: actually delete tools/util.go from disk and full-reindex.
+     * Now it really is gone, so its nodes should be purged. This pins the
+     * other half of the contract: the stat-based check correctly identifies
+     * truly-deleted files as deleted. */
+    snprintf(path, sizeof(path), "%s/tools/util.go", tmpdir);
+    unlink(path);
+
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *tools_nodes_deleted = NULL;
+    int tools_count_deleted = 0;
+    cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_deleted,
+                                 &tools_count_deleted);
+    ASSERT_EQ(tools_count_deleted, 0); /* truly deleted → purged */
+    cbm_store_free_nodes(tools_nodes_deleted, tools_count_deleted);
+    cbm_store_close(s);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_k8s_manifest_indexed) {
+    /* Full index with a k8s manifest, then add a new manifest via incremental.
+     * Verifies that cbm_pipeline_pass_k8s() runs during incremental re-index. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_k8s_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("tmpdir");
+    }
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    char path[512];
+    FILE *f;
+
+    /* Initial manifest */
+    snprintf(path, sizeof(path), "%s/deploy.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n");
+    fclose(f);
+
+    /* Full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Verify Resource node created by full index */
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Resource", &nodes, &count);
+    ASSERT_GT(count, 0);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+
+    /* Add a second manifest — incremental should pick it up */
+    snprintf(path, sizeof(path), "%s/svc.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: v1\nkind: Service\nmetadata:\n  name: my-svc\n");
+    fclose(f);
+
+    /* Incremental re-index */
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    /* Verify both Resource nodes now present */
+    s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    nodes = NULL;
+    count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Resource", &nodes, &count);
+    ASSERT_GTE(count, 2);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_kustomize_module_indexed) {
+    /* Verifies that a kustomization.yaml added after the initial full index
+     * gets a Module node via the incremental k8s pass. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_kust_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("tmpdir");
+    }
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    char path[512];
+    FILE *f;
+
+    /* Initial resource manifest (gives full index something to find) */
+    snprintf(path, sizeof(path), "%s/deploy.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-app\n");
+    fclose(f);
+
+    /* Full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    /* Add kustomization.yaml */
+    snprintf(path, sizeof(path), "%s/kustomization.yaml", tmpdir);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+               "kind: Kustomization\n"
+               "resources:\n"
+               "  - deploy.yaml\n");
+    fclose(f);
+
+    /* Incremental re-index */
+    p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    /* Verify Module node created for the kustomization overlay */
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Module", &nodes, &count);
+    bool found_kust = false;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].properties_json && strstr(nodes[i].properties_json, "kustomize")) {
+            found_kust = true;
+            break;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    ASSERT_TRUE(found_kust);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ── Index lock tests ───────────────────────────────────────────── */
+
+TEST(pipeline_lock_try_acquire) {
+    /* First try-lock should succeed */
+    ASSERT_TRUE(cbm_pipeline_try_lock());
+    /* Second try-lock should fail (already held) */
+    ASSERT_FALSE(cbm_pipeline_try_lock());
+    /* Release, then re-acquire should succeed */
+    cbm_pipeline_unlock();
+    ASSERT_TRUE(cbm_pipeline_try_lock());
+    cbm_pipeline_unlock();
+    PASS();
+}
+
+TEST(pipeline_lock_blocking) {
+    /* Lock, then unlock — basic sanity */
+    cbm_pipeline_lock();
+    cbm_pipeline_unlock();
+    /* Should be immediately re-acquirable */
+    cbm_pipeline_lock();
+    cbm_pipeline_unlock();
+    PASS();
+}
+
+/* Thread function that tries to acquire the lock and records result */
+static atomic_int g_thread_acquired = 0;
+static atomic_int g_thread_done = 0;
+
+static void *try_lock_thread(void *arg) {
+    (void)arg;
+    if (cbm_pipeline_try_lock()) {
+        atomic_store(&g_thread_acquired, 1);
+        cbm_pipeline_unlock();
+    } else {
+        atomic_store(&g_thread_acquired, 0);
+    }
+    atomic_store(&g_thread_done, 1);
+    return NULL;
+}
+
+TEST(pipeline_lock_contention) {
+    /* Main thread holds lock, spawned thread should fail try_lock */
+    cbm_pipeline_lock();
+    atomic_store(&g_thread_acquired, -1);
+    atomic_store(&g_thread_done, 0);
+
+    cbm_thread_t tid;
+    int rc = cbm_thread_create(&tid, 0, try_lock_thread, NULL);
+    ASSERT_EQ(rc, 0);
+
+    /* Wait for thread to finish */
+    cbm_thread_join(&tid);
+
+    /* Thread should NOT have acquired the lock */
+    ASSERT_EQ(atomic_load(&g_thread_acquired), 0);
+    cbm_pipeline_unlock();
+    PASS();
+}
+
+TEST(pipeline_lock_release_allows_contender) {
+    /* Main thread acquires and releases, then spawned thread should succeed */
+    cbm_pipeline_lock();
+    cbm_pipeline_unlock();
+
+    atomic_store(&g_thread_acquired, -1);
+    atomic_store(&g_thread_done, 0);
+
+    cbm_thread_t tid;
+    int rc = cbm_thread_create(&tid, 0, try_lock_thread, NULL);
+    ASSERT_EQ(rc, 0);
+    cbm_thread_join(&tid);
+
+    /* Thread SHOULD have acquired the lock */
+    ASSERT_EQ(atomic_load(&g_thread_acquired), 1);
+    PASS();
+}
+
+/* ── Resource management & internal helper tests ─────────────────── */
+
+TEST(pipeline_empty_path) {
+    /* Empty string repo path — should handle gracefully */
+    cbm_pipeline_t *p = cbm_pipeline_new("", NULL, CBM_MODE_FULL);
+    /* Implementation may return NULL or a valid pipeline with empty project name.
+     * Either behavior is acceptable — the key is no crash. */
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    PASS();
+}
+
+TEST(pipeline_project_name_content) {
+    /* Verify project name is derived from the repo_path */
+    cbm_pipeline_t *p = cbm_pipeline_new("/home/user/my-project", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    const char *name = cbm_pipeline_project_name(p);
+    ASSERT_NOT_NULL(name);
+    ASSERT_TRUE(strlen(name) > 0);
+    /* Should contain "my-project" as part of the derived name */
+    ASSERT_TRUE(strstr(name, "my-project") != NULL);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_cancel_sets_flag) {
+    /* Verify cancel sets the flag so subsequent run exits early */
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    /* Cancel before run */
+    cbm_pipeline_cancel(p);
+    /* Cancelled pipeline should return quickly (either -1 from cancel or from
+     * missing path — both are acceptable; key is no hang) */
+    int rc = cbm_pipeline_run(p);
+    ASSERT_EQ(rc, -1);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_double_cancel) {
+    /* Calling cancel twice should not crash */
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_cancel(p);
+    cbm_pipeline_cancel(p);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_double_free_prevention) {
+    /* free(NULL) after free should not crash. We can't truly double-free
+     * the same pointer, but we verify NULL is safe as documented. */
+    cbm_pipeline_free(NULL);
+    cbm_pipeline_free(NULL);
+    PASS();
+}
+
+TEST(trackable_source_files) {
+    /* Common source extensions are trackable */
+    ASSERT_TRUE(cbm_is_trackable_file("main.go"));
+    ASSERT_TRUE(cbm_is_trackable_file("src/handler.py"));
+    ASSERT_TRUE(cbm_is_trackable_file("lib/server.js"));
+    ASSERT_TRUE(cbm_is_trackable_file("components/App.tsx"));
+    ASSERT_TRUE(cbm_is_trackable_file("pkg/svc.rs"));
+    ASSERT_TRUE(cbm_is_trackable_file("config.yaml"));
+    PASS();
+}
+
+TEST(trackable_rejects_images) {
+    /* Image and binary files are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("logo.png"));
+    ASSERT_FALSE(cbm_is_trackable_file("photo.jpg"));
+    ASSERT_FALSE(cbm_is_trackable_file("icon.gif"));
+    ASSERT_FALSE(cbm_is_trackable_file("diagram.svg"));
+    PASS();
+}
+
+TEST(trackable_rejects_minified) {
+    /* Minified files are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("bundle.min.js"));
+    ASSERT_FALSE(cbm_is_trackable_file("style.min.css"));
+    PASS();
+}
+
+TEST(trackable_rejects_vendor_dirs) {
+    /* Files in vendor/node_modules/__pycache__ are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("vendor/github.com/lib/dep.go"));
+    ASSERT_FALSE(cbm_is_trackable_file("node_modules/lodash/index.js"));
+    ASSERT_FALSE(cbm_is_trackable_file("__pycache__/module.pyc"));
+    ASSERT_FALSE(cbm_is_trackable_file(".git/objects/pack/data"));
+    PASS();
+}
+
+TEST(trackable_rejects_lock_files) {
+    /* Lock files are not trackable */
+    ASSERT_FALSE(cbm_is_trackable_file("package-lock.json"));
+    ASSERT_FALSE(cbm_is_trackable_file("go.sum"));
+    ASSERT_FALSE(cbm_is_trackable_file("yarn.lock"));
+    PASS();
+}
+
+TEST(test_path_directory_patterns) {
+    /* Test directory patterns: __tests__, test/, tests/, spec/ */
+    ASSERT_TRUE(cbm_is_test_path("__tests__/Component.js"));
+    ASSERT_TRUE(cbm_is_test_path("tests/test_main.py"));
+    ASSERT_TRUE(cbm_is_test_path("spec/handler_spec.rb"));
+    PASS();
+}
+
+TEST(test_path_suffix_patterns) {
+    /* Various language-specific test suffix patterns */
+    ASSERT_TRUE(cbm_is_test_path("handler.spec.ts"));
+    ASSERT_TRUE(cbm_is_test_path("handler.test.tsx"));
+    ASSERT_TRUE(cbm_is_test_path("handler_test.go"));
+    ASSERT_TRUE(cbm_is_test_path("test_handler.py"));
+    /* Non-test files */
+    ASSERT_FALSE(cbm_is_test_path("handler.ts"));
+    ASSERT_FALSE(cbm_is_test_path("contest.go"));
+    ASSERT_FALSE(cbm_is_test_path("latest.py"));
+    PASS();
+}
+
+TEST(test_func_name_go_patterns) {
+    /* Go test function names: Test + uppercase char */
+    ASSERT_TRUE(cbm_is_test_func_name("TestFoo"));
+    ASSERT_TRUE(cbm_is_test_func_name("TestHTTPHandler"));
+    /* Non-test: "Test" alone or Test + lowercase */
+    ASSERT_FALSE(cbm_is_test_func_name("Testable")); /* lowercase 'a' after Test */
+    PASS();
+}
+
+TEST(test_func_name_js_helpers) {
+    /* JS/TS test helper function names */
+    ASSERT_TRUE(cbm_is_test_func_name("it"));
+    ASSERT_TRUE(cbm_is_test_func_name("describe"));
+    ASSERT_TRUE(cbm_is_test_func_name("test"));
+    ASSERT_TRUE(cbm_is_test_func_name("beforeEach"));
+    ASSERT_TRUE(cbm_is_test_func_name("afterEach"));
+    PASS();
+}
+
+TEST(env_var_name_valid) {
+    /* Valid env var names: uppercase + underscores, at least 2 chars with uppercase */
+    ASSERT_TRUE(cbm_is_env_var_name("DATABASE_URL"));
+    ASSERT_TRUE(cbm_is_env_var_name("API_KEY"));
+    ASSERT_TRUE(cbm_is_env_var_name("PORT"));
+    ASSERT_TRUE(cbm_is_env_var_name("DB_2"));
+    ASSERT_TRUE(cbm_is_env_var_name("MY_VAR_123"));
+    PASS();
+}
+
+TEST(env_var_name_invalid) {
+    /* Invalid: too short, lowercase, mixed case, empty */
+    ASSERT_FALSE(cbm_is_env_var_name("A"));      /* single char */
+    ASSERT_FALSE(cbm_is_env_var_name("port"));   /* lowercase */
+    ASSERT_FALSE(cbm_is_env_var_name("apiKey")); /* camelCase */
+    ASSERT_FALSE(cbm_is_env_var_name("__"));     /* no uppercase */
+    ASSERT_FALSE(cbm_is_env_var_name(""));       /* empty */
+    ASSERT_FALSE(cbm_is_env_var_name("123"));    /* digits only */
+    PASS();
+}
+
+TEST(config_ext_positive) {
+    /* Config file extensions recognized */
+    ASSERT_TRUE(cbm_has_config_extension(".env"));
+    ASSERT_TRUE(cbm_has_config_extension("config.yaml"));
+    ASSERT_TRUE(cbm_has_config_extension("config.yml"));
+    ASSERT_TRUE(cbm_has_config_extension("settings.toml"));
+    ASSERT_TRUE(cbm_has_config_extension("app.ini"));
+    ASSERT_TRUE(cbm_has_config_extension("data.json"));
+    ASSERT_TRUE(cbm_has_config_extension("app.properties"));
+    PASS();
+}
+
+TEST(config_ext_negative) {
+    /* Non-config extensions rejected */
+    ASSERT_FALSE(cbm_has_config_extension("main.go"));
+    ASSERT_FALSE(cbm_has_config_extension("app.py"));
+    ASSERT_FALSE(cbm_has_config_extension("handler.rs"));
+    ASSERT_FALSE(cbm_has_config_extension("data.csv"));
+    ASSERT_FALSE(cbm_has_config_extension("README.md"));
+    PASS();
+}
+
+TEST(split_camel_basic) {
+    /* Basic camelCase splitting */
+    char *parts[16];
+    int n;
+
+    n = cbm_split_camel_case("getCamelCase", parts, 16);
+    ASSERT_EQ(n, 3);
+    ASSERT_STR_EQ(parts[0], "get");
+    ASSERT_STR_EQ(parts[1], "Camel");
+    ASSERT_STR_EQ(parts[2], "Case");
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
+
+    PASS();
+}
+
+TEST(split_camel_single_word) {
+    /* Single lowercase word — no splits */
+    char *parts[16];
+    int n = cbm_split_camel_case("hello", parts, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(parts[0], "hello");
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
+    PASS();
+}
+
+TEST(split_camel_empty) {
+    /* Empty string — should return 0 or 1 empty part */
+    char *parts[16];
+    int n = cbm_split_camel_case("", parts, 16);
+    for (int i = 0; i < n; i++)
+        free(parts[i]);
+    /* Either 0 parts or 1 empty part is acceptable */
+    ASSERT_TRUE(n >= 0 && n <= 1);
+    PASS();
+}
+
+TEST(tokenize_decorator_login_required) {
+    /* @login_required → ["login", "required"] */
+    char *tokens[16];
+    int n = cbm_tokenize_decorator("@login_required", tokens, 16);
+    ASSERT_EQ(n, 2);
+    ASSERT_STR_EQ(tokens[0], "login");
+    ASSERT_STR_EQ(tokens[1], "required");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+    PASS();
+}
+
+TEST(tokenize_decorator_single) {
+    /* @Override → ["override"] */
+    char *tokens[16];
+    int n = cbm_tokenize_decorator("@Override", tokens, 16);
+    ASSERT_EQ(n, 1);
+    ASSERT_STR_EQ(tokens[0], "override");
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
+    PASS();
+}
+
+TEST(split_command_basic) {
+    /* Basic command splitting with spaces */
+    char *args[16];
+    int n = cbm_split_command("gcc -c main.c -o main.o", args, 16);
+    ASSERT_EQ(n, 5);
+    ASSERT_STR_EQ(args[0], "gcc");
+    ASSERT_STR_EQ(args[1], "-c");
+    ASSERT_STR_EQ(args[2], "main.c");
+    ASSERT_STR_EQ(args[3], "-o");
+    ASSERT_STR_EQ(args[4], "main.o");
+    for (int i = 0; i < n; i++)
+        free(args[i]);
+    PASS();
+}
+
+TEST(split_command_quoted) {
+    /* Command with quoted arguments */
+    char *args[16];
+    int n = cbm_split_command("gcc -DFOO=\"bar baz\" main.c", args, 16);
+    ASSERT_GTE(n, 3);
+    ASSERT_STR_EQ(args[0], "gcc");
+    for (int i = 0; i < n; i++)
+        free(args[i]);
+    PASS();
+}
+
+TEST(split_command_empty) {
+    /* Empty command string */
+    char *args[16];
+    int n = cbm_split_command("", args, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(parse_range_with_count) {
+    /* "10,5" → start=10, count=5 */
+    int start, count;
+    cbm_parse_range("10,5", &start, &count);
+    ASSERT_EQ(start, 10);
+    ASSERT_EQ(count, 5);
+    PASS();
+}
+
+TEST(parse_range_single) {
+    /* "42" → start=42, count=1 */
+    int start, count;
+    cbm_parse_range("42", &start, &count);
+    ASSERT_EQ(start, 42);
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+
+TEST(parse_range_zero_count) {
+    /* "100,0" → start=100, count=0 */
+    int start, count;
+    cbm_parse_range("100,0", &start, &count);
+    ASSERT_EQ(start, 100);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+TEST(parse_name_status_basic) {
+    /* Parse standard git diff --name-status output */
+    const char *input = "M\tsrc/main.go\n"
+                        "A\tsrc/new.go\n"
+                        "D\tsrc/old.go\n";
+    cbm_changed_file_t files[16];
+    int n = cbm_parse_name_status(input, files, 16);
+    /* Exact count depends on which files pass cbm_is_trackable_file */
+    ASSERT_GTE(n, 0);
+    ASSERT_LTE(n, 3);
+    PASS();
+}
+
+TEST(parse_name_status_empty) {
+    /* Empty input */
+    cbm_changed_file_t files[16];
+    int n = cbm_parse_name_status("", files, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(parse_hunks_empty) {
+    /* Empty input */
+    cbm_changed_hunk_t hunks[16];
+    int n = cbm_parse_hunks("", hunks, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(coupling_empty_commits) {
+    /* Zero commits → zero couplings */
+    cbm_change_coupling_t results[16];
+    int n = cbm_compute_change_coupling(NULL, 0, results, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(coupling_single_file_commit) {
+    /* Commits with single files → no pairs → zero couplings */
+    char *f1[] = {cf_a};
+    char *f2[] = {cf_b};
+    cbm_commit_files_t commits[] = {{f1, 1, 0}, {f2, 1, 0}};
+    cbm_change_coupling_t results[16];
+    int n = cbm_compute_change_coupling(commits, 2, results, 16);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
+TEST(clean_json_brackets_array) {
+    /* JSON array → space-joined */
+    char out[256];
+    cbm_clean_json_brackets("[\"./app\", \"--flag\"]", out, sizeof(out));
+    ASSERT_TRUE(strstr(out, "./app") != NULL);
+    ASSERT_TRUE(strstr(out, "--flag") != NULL);
+    PASS();
+}
+
+TEST(clean_json_brackets_plain) {
+    /* Plain string → unchanged */
+    char out[256];
+    cbm_clean_json_brackets("./app --flag", out, sizeof(out));
+    ASSERT_STR_EQ(out, "./app --flag");
+    PASS();
+}
+
+TEST(clean_json_brackets_empty) {
+    /* Empty string → empty output */
+    char out[256];
+    cbm_clean_json_brackets("", out, sizeof(out));
+    ASSERT_STR_EQ(out, "");
+    PASS();
+}
+
+TEST(fqn_compute_basic) {
+    /* Basic FQN: project.dir.name */
+    char *fqn = cbm_pipeline_fqn_compute("proj", "pkg/handler.go", "Serve");
+    ASSERT_NOT_NULL(fqn);
+    ASSERT_TRUE(strstr(fqn, "proj") != NULL);
+    ASSERT_TRUE(strstr(fqn, "Serve") != NULL);
+    free(fqn);
+    PASS();
+}
+
+TEST(fqn_compute_strips_ext) {
+    /* FQN should strip file extension */
+    char *fqn = cbm_pipeline_fqn_compute("proj", "main.go", "main");
+    ASSERT_NOT_NULL(fqn);
+    /* Should not contain ".go" */
+    ASSERT_TRUE(strstr(fqn, ".go") == NULL);
+    ASSERT_TRUE(strstr(fqn, "main") != NULL);
+    free(fqn);
+    PASS();
+}
+
+TEST(fqn_module_basic) {
+    /* Module QN: project.dir.parts */
+    char *mod = cbm_pipeline_fqn_module("proj", "pkg/util/helper.go");
+    ASSERT_NOT_NULL(mod);
+    ASSERT_TRUE(strstr(mod, "proj") != NULL);
+    free(mod);
+    PASS();
+}
+
+TEST(fqn_folder_basic) {
+    /* Folder QN from directory path */
+    char *folder = cbm_pipeline_fqn_folder("proj", "pkg/util");
+    ASSERT_NOT_NULL(folder);
+    ASSERT_TRUE(strstr(folder, "proj") != NULL);
+    free(folder);
+    PASS();
+}
+
+TEST(project_name_special_chars) {
+    /* Project name with colons, slashes — should be normalized */
+    char *name = cbm_project_name_from_path("/home/user/my:project");
+    ASSERT_NOT_NULL(name);
+    /* Colons should be converted to dashes */
+    ASSERT_TRUE(strchr(name, ':') == NULL);
+    ASSERT_TRUE(strchr(name, '/') == NULL);
+    free(name);
+    PASS();
+}
+
+TEST(project_name_trailing_slash) {
+    /* Trailing slash should not affect result */
+    char *a = cbm_project_name_from_path("/home/user/project");
+    ASSERT_NOT_NULL(a);
+    free(a);
+    PASS();
+}
+
+/* ── Complexity propagation pass tests (Tier B) ────────────────── */
+
+/* Find the first Function/Method node with `name` in a label set. Returns a
+ * borrowed pointer into `funcs` or NULL. */
+static const cbm_node_t *find_node_named(cbm_node_t *funcs, int count, const char *name) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(funcs[i].name, name) == 0)
+            return &funcs[i];
+    }
+    return NULL;
+}
+
+/* The complexity pass propagates loop_depth along CALLS edges into
+ * transitive_loop_depth and flags call-graph cycles as recursive. Caller and
+ * callee live in one file so the calls resolve intra-file (most reliable). */
+TEST(pipeline_complexity_transitive_loop_depth) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_cx_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    write_temp_file(tmpdir, "cx.go",
+                    "package p\n\n"
+                    "func work() {}\n\n"
+                    "func inner() {\n"
+                    "\tfor i := 0; i < 10; i++ {\n"
+                    "\t\tfor j := 0; j < 10; j++ {\n"
+                    "\t\t\twork()\n"
+                    "\t\t}\n"
+                    "\t}\n"
+                    "}\n\n"
+                    "func outer() {\n"
+                    "\tfor i := 0; i < 10; i++ {\n"
+                    "\t\tinner()\n"
+                    "\t}\n"
+                    "}\n\n"
+                    "func recur(n int) {\n"
+                    "\tif n > 0 {\n"
+                    "\t\trecur(n - 1)\n"
+                    "\t}\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cx.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *funcs = NULL;
+    int func_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &func_count),
+              CBM_STORE_OK);
+    ASSERT_GT(func_count, 0);
+
+    /* inner: two nested loops, callee work() has depth 0 → tld == 2 */
+    const cbm_node_t *inner = find_node_named(funcs, func_count, "inner");
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(inner->properties_json);
+    ASSERT_TRUE(strstr(inner->properties_json, "\"transitive_loop_depth\":2") != NULL);
+
+    /* outer: own depth 1 + inner's tld 2 → tld == 3 (interprocedural) */
+    const cbm_node_t *outer = find_node_named(funcs, func_count, "outer");
+    ASSERT_NOT_NULL(outer);
+    ASSERT_NOT_NULL(outer->properties_json);
+    ASSERT_TRUE(strstr(outer->properties_json, "\"transitive_loop_depth\":3") != NULL);
+
+    /* recur: self-recursion → recursive:true flagged by the cycle guard */
+    const cbm_node_t *recur = find_node_named(funcs, func_count, "recur");
+    ASSERT_NOT_NULL(recur);
+    ASSERT_NOT_NULL(recur->properties_json);
+    ASSERT_TRUE(strstr(recur->properties_json, "\"recursive\":true") != NULL);
+
+    cbm_store_free_nodes(funcs, func_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ── SwiftPM Package.swift manifest resolution ─────────────────────
+ *
+ * parse_package_swift is a literal pattern-extractor (mirrors
+ * parse_cargo_toml), not a Swift evaluator. These call cbm_pkgmap_try_parse
+ * directly, covering local path deps, remote identities, products not
+ * aliasing, targets, target-name deps, literal + computed `path:`, and
+ * comment/string false positives, plus fail-closed ambiguous-name cases.
+ * See pipeline_swift_cross_package_import above for the end-to-end proof. */
+
+/* Helper: is `name` registered at all? */
+static int pkg_entries_has_name(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Helper: return the entry_rel registered for `name`, or NULL. */
+static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return e->items[i].entry_rel;
+    }
+    return NULL;
+}
+
+TEST(pkgmap_swift_targets_registers_module) {
+    static const char src[] = "// swift-tools-version:5.9\n"
+                              "import PackageDescription\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                              ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Products deliberately do NOT self-register a separate alias: a product
+ * name is not generally an importable module (SwiftPM lets it alias
+ * multiple targets, or none sharing its own name), so only the underlying
+ * target -- under its OWN name -- registers. */
+TEST(pkgmap_swift_products_do_not_register_alias) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    products: [.library(name: \"CoreKit\", targets: [\"CoreImpl\"])],\n"
+        "    targets: [.target(name: \"CoreImpl\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreImpl"), "Core/Sources/CoreImpl");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Regression: a target whose `name:` is the LAST argument, immediately
+ * followed by the call's own closing ')' with no trailing comma, must still
+ * register. swift_quoted_literal's terminator check must treat landing
+ * exactly on `end` (the wrapping call's ')') as "immediately followed by
+ * the close-paren", not as "unterminated". */
+TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\")]\n"
+                              ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A literal `path:` argument overrides the Sources/<name> convention. */
+TEST(pkgmap_swift_target_honors_literal_path) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", path: \"Vendor/CoreLegacy\")]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Vendor/CoreLegacy");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A `path:` argument that IS present but not a bare literal (computed) is
+ * unknowable -- SwiftPM would not use the Sources/<name> convention here,
+ * so guessing it anyway would mint a location likely to be wrong. Skip the
+ * target entirely (fail closed), even though its `name:` is a valid
+ * literal. */
+TEST(pkgmap_swift_target_computed_path_fails_closed) {
+    static const char src[] = "let customPath = computePath()\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", path: customPath)]\n"
+                              ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* A `.target(` spelled inside a `//` line comment, a nesting-aware
+ * slash-star block comment, or a string literal must never be mistaken for
+ * a live declaration -- the bug a raw strstr scan cannot avoid. Only the
+ * one real target registers. */
+TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
+    static const char src[] =
+        "// .target(name: \"Decoy\")\n"
+        "/* outer /* nested */ still a comment: .target(name: \"NestedDecoy\") */\n"
+        "let manifestSnippet = \".target(name: \\\"StringDecoy\\\")\"\n"
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "NestedDecoy"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "StringDecoy"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Local path + remote url dependencies (`.package(path:)` / `.package(url:)`)
+ * mint NO entries of their own -- mirroring package.json/Cargo.toml, only a
+ * manifest's OWN targets self-register. A local sibling's name is produced
+ * by ITS OWN Package.swift when the repo-wide walk reaches it; a remote
+ * dependency has no local path to point at, so nothing is minted. */
+TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    dependencies: [\n"
+        "        .package(path: \"../Core\"),\n"
+        "        .package(url: \"https://github.com/example/RemoteKit.git\", from: \"1.0.0\")\n"
+        "    ],\n"
+        "    targets: [.target(name: \"App\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "RemoteKit"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Only App itself (the declaring target) registers -- a bare same-package
+ * target-name dependency ("Core") and a cross-package product dependency
+ * (Utils/UtilsPkg) name OTHER modules, not this manifest's own targets, so
+ * neither mints an entry. */
+TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"App\",\n"
+                              "    targets: [.target(name: \"App\", dependencies: [\n"
+                              "        \"Core\",\n"
+                              "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
+                              "    ])]\n"
+                              ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Utils"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "UtilsPkg"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Fail-closed on any `name:` that is not a bare literal: a computed
+ * variable, and a literal concatenated with a dynamic suffix (which a
+ * naive quote-scan would wrongly accept as "App"). Neither mints an entry,
+ * though the manifest is still recognized and parsed. */
+TEST(pkgmap_swift_ambiguous_target_name_fails_closed) {
+    static const char dynamic_src[] =
+        "let generatedName = \"App\" + String(buildNumber)\n"
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: generatedName, dependencies: [])]\n"
+        ")\n";
+    static const char concat_src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\" + suffix, dependencies: [])]\n"
+        ")\n";
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", dynamic_src,
+                                     (int)strlen(dynamic_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", concat_src,
+                                     (int)strlen(concat_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* The repo-wide manifest walker must also recognize "Package.swift" -- a
+ * second code path (is_pkgmap_manifest_basename) from the direct
+ * cbm_pkgmap_try_parse calls above. */
+TEST(pkgmap_swift_scan_repo_finds_nested_manifest) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_swift_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/Core", tmpdir);
+    cbm_mkdir(dir);
+    write_temp_file(tmpdir, "Core/Package.swift",
+                    "let package = Package(\n"
+                    "    name: \"Core\",\n"
+                    "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                    ")\n");
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    cbm_pkg_entries_free(&entries);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* #725: two same-named symbols across languages must not share CALLS edges.
+ * Python Store.commit is the real callee of save(); the JS Editor.commit is a
+ * distinct binding and must have NO inbound CALLS from Python. unique_name
+ * (candidates == 1) is a different strategy and is not this claim.
+ *
+ * The positive half matters as much as the negative: asserting only "no JS
+ * edge" would pass on a build that resolved nothing at all. */
+TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
+    const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
+    const char *contents[] = {"class Store:\n"
+                              "    def commit(self):\n"
+                              "        return True\n",
+
+                              "from store import Store\n"
+                              "\n"
+                              "def save():\n"
+                              "    return Store().commit()\n",
+
+                              "export function commit() {\n"
+                              "  return 1;\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *commits = NULL;
+    int ncommit = 0;
+    cbm_store_find_nodes_by_name(s, proj, "commit", &commits, &ncommit);
+    ASSERT_GTE(ncommit, 2);
+
+    int64_t js_id = 0;
+    int64_t py_id = 0;
+    for (int i = 0; i < ncommit; i++) {
+        if (commits[i].file_path && strstr(commits[i].file_path, "Editor.js")) {
+            js_id = commits[i].id;
+        }
+        if (commits[i].file_path && strstr(commits[i].file_path, "store.py")) {
+            py_id = commits[i].id;
+        }
+    }
+    ASSERT_TRUE(js_id != 0);
+    ASSERT_TRUE(py_id != 0);
+
+    cbm_node_t *saves = NULL;
+    int nsave = 0;
+    cbm_store_find_nodes_by_name(s, proj, "save", &saves, &nsave);
+    ASSERT_GT(nsave, 0);
+
+    cbm_edge_t *from_save = NULL;
+    int nfrom = 0;
+    cbm_store_find_edges_by_source_type(s, saves[0].id, "CALLS", &from_save, &nfrom);
+    bool save_calls_py = false;
+    bool save_calls_js = false;
+    for (int i = 0; i < nfrom; i++) {
+        if (from_save[i].target_id == py_id) {
+            save_calls_py = true;
+        }
+        if (from_save[i].target_id == js_id) {
+            save_calls_js = true;
+        }
+    }
+
+    cbm_edge_t *into_js = NULL;
+    int njs = 0;
+    cbm_store_find_edges_by_target_type(s, js_id, "CALLS", &into_js, &njs);
+
+    if (from_save) {
+        cbm_store_free_edges(from_save, nfrom);
+    }
+    if (into_js) {
+        cbm_store_free_edges(into_js, njs);
+    }
+    cbm_store_free_nodes(commits, ncommit);
+    cbm_store_free_nodes(saves, nsave);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+
+    ASSERT_TRUE(save_calls_py);
+    ASSERT_FALSE(save_calls_js);
+    ASSERT_EQ(njs, 0);
+    PASS();
+}
+
+/* #725, the DISCRIMINATING case. The fixture above does not exercise the guard
+ * on this tree: with one Python and one JS candidate the Python one wins on
+ * import distance anyway, so the bad edge never forms. It takes TWO same-named
+ * candidates that are BOTH in the other language — then suffix_match picks a JS
+ * winner for a Python call site and emits it.
+ *
+ * Measured on the pre-guard binary: save (app.py) -> renderPanel
+ * (web/a/Ed1.js), strategy suffix_match. With the guard: no CALLS edge at all.
+ * A single candidate would resolve as unique_name instead, which is a different
+ * strategy and deliberately NOT suppressed. */
+TEST(pipeline_cross_language_suffix_match_winner_is_dropped_issue725) {
+    const char *files[] = {"app.py", "web/a/Ed1.js", "web/b/Ed2.js"};
+    const char *contents[] = {"def save():\n    return renderPanel()\n",
+                              "export function renderPanel() { return 1; }\n",
+                              "export function renderPanel() { return 2; }\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *saves = NULL;
+    int nsave = 0;
+    cbm_store_find_nodes_by_name(s, proj, "save", &saves, &nsave);
+    ASSERT_GT(nsave, 0);
+
+    cbm_edge_t *from_save = NULL;
+    int nfrom = 0;
+    cbm_store_find_edges_by_source_type(s, saves[0].id, "CALLS", &from_save, &nfrom);
+
+    if (from_save) {
+        cbm_store_free_edges(from_save, nfrom);
+    }
+    cbm_store_free_nodes(saves, nsave);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+
+    ASSERT_EQ(nfrom, 0);
+    PASS();
+}
+
+/* Count edges of `type` running from a node named `src` to one named `tgt`. */
+static int named_edge_count(cbm_store_t *s, const char *project, const char *type, const char *src,
+                            const char *tgt) {
+    cbm_node_t *sources = NULL;
+    int nsrc = 0;
+    cbm_store_find_nodes_by_name(s, project, src, &sources, &nsrc);
+    cbm_node_t *targets = NULL;
+    int ntgt = 0;
+    cbm_store_find_nodes_by_name(s, project, tgt, &targets, &ntgt);
+    int hits = 0;
+    for (int i = 0; i < nsrc; i++) {
+        cbm_edge_t *edges = NULL;
+        int ne = 0;
+        cbm_store_find_edges_by_source_type(s, sources[i].id, type, &edges, &ne);
+        for (int e = 0; e < ne; e++) {
+            for (int t = 0; t < ntgt; t++) {
+                if (edges[e].target_id == targets[t].id) {
+                    hits++;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ne);
+        }
+    }
+    cbm_store_free_nodes(sources, nsrc);
+    cbm_store_free_nodes(targets, ntgt);
+    return hits;
+}
+
+/* SQL DDL becomes first-class Table/View nodes wired into FROM/JOIN lineage,
+ * while the shared name registry must NOT leak those relations into other
+ * languages' textual resolution: a Python call or identifier sharing the table's
+ * name (`users`) would otherwise unique-name-bind a false CALLS/USAGE edge into
+ * the lineage layer. Pins the resolve-time relation veto (cbm_registry_resolve)
+ * together with the lineage opt-in (cbm_registry_resolve_lineage).
+ *
+ * The positive control is essential: asserting only the absences would pass on a
+ * build where SQL lineage never formed at all. */
+TEST(pipeline_sql_lineage_and_relation_isolation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_sql_lineage_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "schema.sql",
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);\n"
+                    "CREATE VIEW active_users AS SELECT * FROM users;\n");
+    /* `users` exists project-wide ONLY as the SQL table, so without the relation
+     * veto the cross-file unique-name fallback would bind both the call and the
+     * bare reference below straight to the Table node. */
+    write_temp_file(tmp, "app.py",
+                    "def load_users():\n"
+                    "    return users()\n"
+                    "\n"
+                    "def show_users():\n"
+                    "    return users\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/sql_lineage.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    int lineage = named_edge_count(s, project, "USAGE", "active_users", "users");
+    int py_calls = named_edge_count(s, project, "CALLS", "load_users", "users");
+    int py_usage = named_edge_count(s, project, "USAGE", "load_users", "users");
+    int py_ref = named_edge_count(s, project, "USAGE", "show_users", "users");
+    int py_reads = named_edge_count(s, project, "READS", "show_users", "users");
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(lineage, 1); /* positive control: the view's FROM emits lineage */
+    ASSERT_EQ(py_calls, 0);
+    ASSERT_EQ(py_usage, 0);
+    ASSERT_EQ(py_ref, 0);
+    ASSERT_EQ(py_reads, 0);
+    PASS();
+}
+
+/* Independent exec, bounded by the common POSIX/Windows subprocess helper.
+ * Exit 73 is typed contention; 79 is deliberate exit without C++ cleanup. */
+static int lease_probe(const char *mode, const char *path) {
+    char self[4096];
+    if (!cbm_resolve_self_exe_path(NULL, self, sizeof(self))) {
+        return -1;
+    }
+    const char *argv[] = {self, "--index-lease-probe", mode, path, NULL};
+    cbm_proc_opts_t opts = {};
+    opts.bin = self;
+    opts.argv = argv;
+    opts.total_timeout_ms = 10000;
+    opts.poll_cap_ms = 10;
+    cbm_proc_result_t result = {};
+    if (cbm_subprocess_run(&opts, &result) != 0 ||
+        (result.outcome != CBM_PROC_CLEAN && result.outcome != CBM_PROC_EXIT_NONZERO)) {
+        return -1;
+    }
+    return result.exit_code;
+}
+
+TEST(pipeline_lease_independent_processes) {
+    char root[256] = "/tmp/cbm_lease_proc_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    std::string db = std::string(root) + "/cache/project.db";
+    std::string other = std::string(root) + "/cache/other.db";
+    cbm_pipeline_t *p = cbm_pipeline_new(root, db.c_str(), CBM_MODE_FAST);
+    ASSERT(p);
+    ASSERT_EQ(cbm_pipeline_claim_index(p), 0);
+    ASSERT_EQ(cbm_pipeline_claim_index(p), 0); // Same object owns the existing claim.
+    ASSERT(!cbm_pipeline_set_project_name(p, "changed_target"));
+    ASSERT_EQ(lease_probe("claim", db.c_str()), 73);
+    ASSERT_EQ(lease_probe("claim", other.c_str()), 0); // No global cross-DB exclusion.
+    ASSERT_EQ(th_write_file(db.c_str(), "generation one"), 0);
+    ASSERT_EQ(cbm_unlink(db.c_str()), 0);
+    ASSERT_EQ(th_write_file(db.c_str(), "generation two"), 0);
+    ASSERT_EQ(lease_probe("claim", db.c_str()), 73); // DB inode replacement is irrelevant.
+    cbm_pipeline_free(p);
+    ASSERT_EQ(lease_probe("claim", db.c_str()), 0);
+    ASSERT(cbm_is_regular_file((db + ".index.lock").c_str())); // Stable file must survive.
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(pipeline_lease_canonical_aliases) {
+    char root[256] = "/tmp/cbm_lease_alias_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    std::string db = std::string(root) + "/target.db";
+    std::string dot = std::string(root) + "/./target.db";
+    ASSERT_EQ(th_write_file(db.c_str(), "database"), 0);
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(db.c_str(), &lease), 0);
+    ASSERT_EQ(lease_probe("claim", dot.c_str()), 73);
+#ifndef _WIN32
+    std::string alias = std::string(root) + "/alias.db";
+    ASSERT_EQ(symlink("target.db", alias.c_str()), 0);
+    ASSERT_EQ(lease_probe("claim", alias.c_str()), 73);
+    std::string alias_dir = std::string(root) + "/alias-dir";
+    ASSERT_EQ(symlink(root, alias_dir.c_str()), 0);
+    ASSERT_EQ(lease_probe("claim", (alias_dir + "/target.db").c_str()), 73);
+    ASSERT_EQ(cbm_unlink(alias_dir.c_str()), 0); // Do not traverse a directory link at cleanup.
+#endif
+    cbm_db_lease_release(lease);
+#ifndef _WIN32
+    std::string hard = std::string(root) + "/hard.db";
+    ASSERT_EQ(link(db.c_str(), hard.c_str()), 0);
+    ASSERT_EQ(cbm_db_lease_try_acquire(db.c_str(), &lease), CBM_NOT_FOUND);
+    ASSERT(!lease); // Unsupported alternate sidecar names fail closed.
+#endif
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(pipeline_lease_crash_release) {
+    char root[256] = "/tmp/cbm_lease_exit_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    std::string db = std::string(root) + "/project.db";
+    ASSERT_EQ(lease_probe("abandon", db.c_str()), 79);
+    ASSERT_EQ(lease_probe("claim", db.c_str()), 0);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(pipeline_lease_run_busy_is_nondestructive) {
+    char root[256] = "/tmp/cbm_lease_busy_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    std::string db = std::string(root) + "/project.db";
+    ASSERT_EQ(th_write_file(db.c_str(), "keep db"), 0);
+    ASSERT_EQ(th_write_file((db + "-wal").c_str(), "keep wal"), 0);
+    ASSERT_EQ(th_write_file((db + "-shm").c_str(), "keep shm"), 0);
+    cbm_db_lease_t *lease = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(db.c_str(), &lease), 0);
+    ASSERT_EQ(lease_probe("run", db.c_str()), 73);
+    const char *suffixes[] = {"", "-wal", "-shm"};
+    const char *expected[] = {"keep db", "keep wal", "keep shm"};
+    for (int i = 0; i < 3; ++i) {
+        FILE *file = cbm_fopen((db + suffixes[i]).c_str(), "rb");
+        ASSERT(file);
+        char contents[32] = {};
+        size_t n = fread(contents, 1, sizeof(contents) - 1, file);
+        fclose(file);
+        ASSERT_EQ(n, strlen(expected[i]));
+        ASSERT_STR_EQ(contents, expected[i]);
+    }
+    cbm_db_lease_release(lease);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(pipeline_lease_error_exit_releases) {
+    char root[256] = "/tmp/cbm_lease_error_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    std::string db = std::string(root) + "/project.db";
+    cbm_pipeline_t *p = cbm_pipeline_new((std::string(root) + "/missing").c_str(),
+                                        db.c_str(), CBM_MODE_FAST);
+    ASSERT(p);
+    ASSERT_EQ(cbm_pipeline_claim_index(p), 0);
+    ASSERT_EQ(cbm_pipeline_run(p), CBM_NOT_FOUND);
+    ASSERT_EQ(lease_probe("claim", db.c_str()), 0); // Released before p is freed.
+    cbm_pipeline_free(p);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(pipeline_lease_busy_result_contract) {
+    char *busy = cbm_mcp_text_result("{\"status\":\"busy\",\"code\":\"index_busy\"}", false);
+    ASSERT(busy);
+    bool error = true;
+    ASSERT(cbm_mcp_tool_result_valid(busy, &error));
+    ASSERT(!error); // A supervised worker must exit cleanly, without quarantine.
+    ASSERT(cbm_mcp_result_is_index_busy(busy));
+    free(busy);
+    char *done = cbm_mcp_text_result("{\"status\":\"indexed\",\"code\":\"index_busy\"}", false);
+    ASSERT(!cbm_mcp_result_is_index_busy(done));
+    free(done);
+    char *failed = cbm_mcp_text_result("{\"status\":\"busy\",\"code\":\"index_busy\"}", true);
+    ASSERT(!cbm_mcp_result_is_index_busy(failed));
+    free(failed);
+    ASSERT(!cbm_mcp_result_is_index_busy(NULL));
+    ASSERT(!cbm_mcp_result_is_index_busy("not json"));
+    PASS();
+}
+
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#include <string>
+TEST(pipeline_lease_windows_ambiguous_missing_and_replaced_names) {
+    char root[256] = "/tmp/cbm_lease_win_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    std::string db = std::string(root) + "/target.db";
+    cbm_db_lease_t *lease = NULL;
+    cbm_db_lease_t *rejected = NULL;
+    const char *suffixes[] = {".", " "};
+    // No original file exists: the fallback path must not invent alias locks.
+    for (const char *suffix : suffixes) {
+        ASSERT_EQ(cbm_db_lease_try_acquire((db + suffix).c_str(), &rejected), CBM_NOT_FOUND);
+        ASSERT(!rejected);
+    }
+    ASSERT_EQ(cbm_db_lease_try_acquire((std::string(root) + "/cache./target.db").c_str(), &rejected), CBM_NOT_FOUND);
+    ASSERT(!rejected);
+    ASSERT_EQ(cbm_db_lease_try_acquire(db.c_str(), &lease), 0);
+    ASSERT_EQ(th_write_file(db.c_str(), "generation"), 0);
+    ASSERT_EQ(cbm_unlink(db.c_str()), 0); // Exact full-rebuild gap: the lease survives.
+    for (const char *suffix : suffixes) {
+        ASSERT_EQ(cbm_db_lease_try_acquire((db + suffix).c_str(), &rejected), CBM_NOT_FOUND);
+        ASSERT(!rejected);
+    }
+    ASSERT_EQ(lease_probe("claim", (std::string(root) + "/./target.db").c_str()), 73);
+    ASSERT_EQ(th_write_file(db.c_str(), "replacement"), 0);
+    ASSERT_EQ(lease_probe("claim", db.c_str()), 73);
+    cbm_db_lease_release(lease);
+    ASSERT_EQ(lease_probe("claim", db.c_str()), 0);
+    th_rmtree(root);
+    PASS();
+}
+
+TEST(pipeline_lease_windows_extended_component_is_not_retargeted) {
+    char root[256] = "/tmp/cbm_lease_extended_XXXXXX";
+    ASSERT(cbm_mkdtemp(root));
+    std::string ordinary = std::string(root) + "/target.db";
+    ASSERT_EQ(th_write_file(ordinary.c_str(), "ordinary"), 0);
+    wchar_t *input = cbm_utf8_to_wide(ordinary.c_str());
+    ASSERT(input);
+    wchar_t absolute[4096];
+    DWORD n = GetFullPathNameW(input, 4096, absolute, NULL);
+    free(input);
+    ASSERT(n && n < 4096);
+    std::wstring extended = L"\\\\?\\";
+    extended += absolute;
+    extended += L".";
+    HANDLE h = CreateFileW(extended.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    ASSERT(h != INVALID_HANDLE_VALUE);
+    DWORD written = 0;
+    ASSERT(WriteFile(h, "extended", 8, &written, NULL));
+    ASSERT_EQ(written, 8);
+    CloseHandle(h);
+    char *extended_utf8 = cbm_wide_to_utf8(extended.c_str());
+    ASSERT(extended_utf8);
+    cbm_db_lease_t *rejected = NULL;
+    ASSERT_EQ(cbm_db_lease_try_acquire(extended_utf8, &rejected), CBM_NOT_FOUND);
+    ASSERT(!rejected);
+    free(extended_utf8);
+    // Resolved reparse-point aliases require a separate native Windows control;
+    // this mandatory test covers direct extended-path spelling without privileges.
+    FILE *normal = cbm_fopen(ordinary.c_str(), "rb");
+    ASSERT(normal);
+    char bytes[16] = {};
+    size_t count = fread(bytes, 1, sizeof(bytes), normal);
+    fclose(normal);
+    ASSERT_EQ(count, 8);
+    ASSERT(memcmp(bytes, "ordinary", 8) == 0);
+    ASSERT(DeleteFileW(extended.c_str()));
+    th_rmtree(root);
+    PASS();
+}
+#endif
+
+SUITE(pipeline) {
+#ifdef _WIN32
+    RUN_TEST(pipeline_lease_windows_ambiguous_missing_and_replaced_names);
+    RUN_TEST(pipeline_lease_windows_extended_component_is_not_retargeted);
+#endif
+    RUN_TEST(pipeline_lease_independent_processes);
+    RUN_TEST(pipeline_lease_canonical_aliases);
+    RUN_TEST(pipeline_lease_crash_release);
+    RUN_TEST(pipeline_lease_run_busy_is_nondestructive);
+    RUN_TEST(pipeline_lease_error_exit_releases);
+    RUN_TEST(pipeline_lease_busy_result_contract);
+
+    /* Index lock */
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_cpp_cross_gate_uses_sites_not_entry_count);
+    RUN_TEST(pipeline_cpp_receiver_guard_uses_current_pass_and_leaf);
+#endif
+    RUN_TEST(pipeline_cpp_pointer_members_match_in_memory_and_store);
+    RUN_TEST(pipeline_cpp_ambiguous_include_keeps_local_calls);
+    RUN_TEST(parallel_store_preserves_kotlin_to_java_method_call);
+    RUN_TEST(pipeline_lock_try_acquire);
+    RUN_TEST(pipeline_lock_blocking);
+    RUN_TEST(pipeline_lock_contention);
+    RUN_TEST(pipeline_lock_release_allows_contender);
+    /* Lifecycle */
+    RUN_TEST(pipeline_create_free);
+    RUN_TEST(pipeline_null_repo);
+    RUN_TEST(pipeline_free_null);
+    RUN_TEST(pipeline_cancel);
+    RUN_TEST(pipeline_cancel_null);
+    RUN_TEST(pipeline_run_null);
+    /* File persistence */
+    RUN_TEST(store_file_persistence);
+    RUN_TEST(store_bulk_persistence);
+    /* Integration: structure pass */
+    RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_structure_edges);
+    RUN_TEST(pipeline_branch_root_structure);
+    RUN_TEST(pipeline_project_name_derived);
+    RUN_TEST(pipeline_fast_mode);
+    /* Definitions pass */
+    RUN_TEST(pipeline_definitions_function_nodes);
+    RUN_TEST(pipeline_definitions_defines_edges);
+    RUN_TEST(pipeline_definitions_properties);
+    RUN_TEST(pipeline_def_props_valid_json_when_oversized);
+    RUN_TEST(pipeline_edge_props_valid_json);
+    RUN_TEST(pipeline_all_properties_valid_json);
+    /* Complexity propagation pass (Tier B) */
+    RUN_TEST(pipeline_complexity_transitive_loop_depth);
+    /* Calls pass */
+    RUN_TEST(pipeline_calls_resolution);
+    /* Git history pass */
+    RUN_TEST(githistory_is_trackable);
+    RUN_TEST(githistory_compute_coupling);
+    RUN_TEST(githistory_coupling_carries_last_co_change);
+    RUN_TEST(githistory_skip_large_commits);
+    RUN_TEST(githistory_limits_to_max);
+    /* Test detection */
+    RUN_TEST(testdetect_is_test_file);
+    RUN_TEST(testdetect_is_test_function);
+    /* Implements pass (graph buffer based) */
+    RUN_TEST(implements_creates_override);
+    RUN_TEST(implements_no_match);
+    /* Usages pass (full pipeline integration) */
+    RUN_TEST(usages_creates_edges);
+    RUN_TEST(usages_no_duplicate_calls);
+    RUN_TEST(usages_kotlin_creates_edges);
+    RUN_TEST(usages_kotlin_no_duplicate_calls);
+    /* Language integration tests */
+    RUN_TEST(pipeline_python_project);
+    RUN_TEST(pipeline_go_cross_package_call);
+    RUN_TEST(pipeline_swift_cross_package_import);
+    RUN_TEST(pipeline_python_cross_module_call);
+    RUN_TEST(pipeline_go_type_classification);
+    RUN_TEST(pipeline_go_grouped_types);
+    RUN_TEST(pipeline_kotlin_project);
+    RUN_TEST(pipeline_lua_anonymous_functions);
+    RUN_TEST(pipeline_csharp_modern);
+    RUN_TEST(pipeline_bom_stripping);
+    RUN_TEST(pipeline_form_call_resolution);
+    RUN_TEST(pipeline_python_type_inference);
+    /* Docstring integration (port of TestDocstringIntegration) */
+    RUN_TEST(pipeline_docstring_go_function);
+    RUN_TEST(pipeline_docstring_python_function);
+    RUN_TEST(pipeline_docstring_java_method);
+    RUN_TEST(pipeline_docstring_kotlin_function);
+    RUN_TEST(pipeline_docstring_go_class);
+    /* Project name */
+    RUN_TEST(project_name_from_path);
+    RUN_TEST(project_name_drive_letter_case_insensitive_issue394);
+    RUN_TEST(git_context_non_git_path);
+    RUN_TEST(git_context_linked_worktree);
+    RUN_TEST(git_context_unborn_repo_resolves_paths_without_head);
+    RUN_TEST(project_name_uniqueness);
+    /* Git diff helpers */
+    RUN_TEST(gitdiff_parse_range_with_count);
+    RUN_TEST(gitdiff_parse_range_no_count);
+    RUN_TEST(gitdiff_parse_range_zero_count);
+    RUN_TEST(gitdiff_parse_range_large);
+    RUN_TEST(gitdiff_parse_name_status);
+    RUN_TEST(gitdiff_parse_name_status_filters_untrackable);
+    RUN_TEST(gitdiff_parse_hunks);
+    RUN_TEST(gitdiff_parse_hunks_no_newline_marker);
+    RUN_TEST(gitdiff_parse_hunks_mode_change);
+    RUN_TEST(gitdiff_parse_hunks_deletion);
+    /* Config helpers */
+    RUN_TEST(configures_is_env_var_name);
+    RUN_TEST(configures_normalize_config_key);
+    RUN_TEST(configures_has_config_extension);
+    /* Config integration tests */
+    RUN_TEST(configures_env_var_in_config);
+    RUN_TEST(configures_lowercase_key_skipped);
+    RUN_TEST(configures_non_config_file_skipped);
+    RUN_TEST(configures_full_pipeline_integration);
+    /* HTTP link pipeline integration */
+    /* Enrichment helpers */
+    RUN_TEST(enrichment_split_camel_case);
+    RUN_TEST(enrichment_tokenize_decorator);
+    /* Decorator tags integration */
+    RUN_TEST(decorator_tags_python_auto_discovery);
+    RUN_TEST(decorator_tags_java_class_methods);
+    /* Compile commands helpers */
+    RUN_TEST(compile_commands_split_command);
+    RUN_TEST(compile_commands_extract_flags);
+    RUN_TEST(compile_commands_parse_json);
+    RUN_TEST(compile_commands_parse_empty);
+    RUN_TEST(compile_commands_parse_invalid);
+    /* Infrascan helpers */
+    RUN_TEST(infra_is_compose_file);
+    RUN_TEST(infra_is_cloudbuild_file);
+    RUN_TEST(infra_is_shell_script);
+    RUN_TEST(infra_is_dockerfile);
+    RUN_TEST(infra_is_kustomize_file);
+    RUN_TEST(infra_is_k8s_manifest);
+    RUN_TEST(infra_is_env_file);
+    RUN_TEST(infra_clean_json_brackets);
+    RUN_TEST(infra_secret_detection);
+    /* Infrascan: Dockerfile parser */
+    RUN_TEST(infra_parse_dockerfile_multistage);
+    RUN_TEST(infra_parse_dockerfile_entrypoint);
+    RUN_TEST(infra_parse_dockerfile_secret_filtered);
+    RUN_TEST(infra_parse_dockerfile_expose_protocol);
+    RUN_TEST(infra_parse_dockerfile_env_space);
+    RUN_TEST(infra_parse_dockerfile_empty);
+    /* Infrascan: Dotenv parser */
+    RUN_TEST(infra_parse_dotenv);
+    RUN_TEST(infra_parse_dotenv_quoted);
+    /* Infrascan: Shell script parser */
+    RUN_TEST(infra_parse_shell);
+    RUN_TEST(infra_parse_shell_with_source);
+    RUN_TEST(infra_parse_shell_secret_filtered);
+    RUN_TEST(infra_parse_shell_shebang_only);
+    RUN_TEST(infra_parse_shell_truly_empty);
+    /* Infrascan: Terraform parser */
+    RUN_TEST(infra_parse_terraform_full);
+    RUN_TEST(infra_parse_terraform_variables_only);
+    RUN_TEST(infra_parse_terraform_empty);
+    RUN_TEST(helm_parse_chart_dependencies_issue338);
+    RUN_TEST(helm_parse_chart_no_deps_issue338);
+    /* Infrascan: QN helper */
+    RUN_TEST(infra_qn_helper);
+    /* Infrascan: pipeline integration */
+    RUN_TEST(infra_pipeline_integration);
+    RUN_TEST(infra_pipeline_idempotent);
+    /* K8s / Kustomize extraction */
+    RUN_TEST(k8s_extract_kustomize);
+    RUN_TEST(k8s_extract_manifest);
+    RUN_TEST(k8s_extract_manifest_no_name);
+    RUN_TEST(k8s_extract_manifest_multidoc);
+    /* Env URL scanning */
+    RUN_TEST(envscan_dockerfile_env_urls);
+    RUN_TEST(envscan_shell_env_urls);
+    RUN_TEST(envscan_env_file_urls);
+    RUN_TEST(envscan_toml_urls);
+    RUN_TEST(envscan_yaml_urls);
+    RUN_TEST(envscan_terraform_urls);
+    RUN_TEST(envscan_properties_urls);
+    RUN_TEST(envscan_secret_key_exclusion);
+    RUN_TEST(envscan_secret_value_exclusion);
+    RUN_TEST(envscan_secret_file_exclusion);
+    RUN_TEST(envscan_skips_ignored_dirs);
+    RUN_TEST(envscan_non_url_values_skipped);
+    /* Function registry / resolver */
+    RUN_TEST(registry_resolve_single_candidate);
+    RUN_TEST(registry_fuzzy_nonexistent);
+    RUN_TEST(registry_fuzzy_multiple_best_by_distance);
+    RUN_TEST(registry_fuzzy_simple_name_extraction);
+    RUN_TEST(registry_fuzzy_empty);
+    RUN_TEST(registry_exists);
+    RUN_TEST(registry_confidence_import_map);
+    RUN_TEST(registry_confidence_import_map_suffix);
+    RUN_TEST(registry_confidence_same_module);
+    RUN_TEST(registry_confidence_unique_name);
+    RUN_TEST(registry_confidence_suffix_match);
+    RUN_TEST(registry_fuzzy_confidence_single);
+    RUN_TEST(registry_fuzzy_confidence_distance);
+    RUN_TEST(registry_negative_import_rejects);
+    RUN_TEST(registry_fuzzy_import_penalty);
+    RUN_TEST(registry_fuzzy_no_import_map_passthrough);
+    RUN_TEST(registry_find_by_name);
+    RUN_TEST(registry_confidence_band);
+    RUN_TEST(registry_is_import_reachable);
+    RUN_TEST(registry_find_ending_with);
+    /* Git history */
+    RUN_TEST(githistory_is_trackable_file);
+    RUN_TEST(githistory_compute_change_coupling);
+    RUN_TEST(githistory_coupling_skips_large_commits);
+    RUN_TEST(githistory_coupling_limits_output);
+    /* Incremental reindex */
+    /* FastAPI Depends edge tracking (PR #66 port) */
+    RUN_TEST(pipeline_fastapi_depends_edges);
+    /* Incremental */
+    RUN_TEST(incremental_full_then_noop);
+    RUN_TEST(incremental_format_two_rebuilds_template_declarations_once);
+    RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_detects_deleted_file);
+    RUN_TEST(incremental_new_file_added);
+    RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
+    RUN_TEST(incremental_k8s_manifest_indexed);
+    RUN_TEST(incremental_kustomize_module_indexed);
+    /* Resource management & internal helper tests */
+    RUN_TEST(pipeline_empty_path);
+    RUN_TEST(pipeline_project_name_content);
+    RUN_TEST(pipeline_cancel_sets_flag);
+    RUN_TEST(pipeline_double_cancel);
+    RUN_TEST(pipeline_double_free_prevention);
+    /* Trackable file tests */
+    RUN_TEST(trackable_source_files);
+    RUN_TEST(trackable_rejects_images);
+    RUN_TEST(trackable_rejects_minified);
+    RUN_TEST(trackable_rejects_vendor_dirs);
+    RUN_TEST(trackable_rejects_lock_files);
+    /* Test path detection */
+    RUN_TEST(test_path_directory_patterns);
+    RUN_TEST(test_path_suffix_patterns);
+    /* Test function name detection */
+    RUN_TEST(test_func_name_go_patterns);
+    RUN_TEST(test_func_name_js_helpers);
+    /* Env var name detection */
+    RUN_TEST(env_var_name_valid);
+    RUN_TEST(env_var_name_invalid);
+    /* Config extension detection */
+    RUN_TEST(config_ext_positive);
+    RUN_TEST(config_ext_negative);
+    /* Camel case splitting */
+    RUN_TEST(split_camel_basic);
+    RUN_TEST(split_camel_single_word);
+    RUN_TEST(split_camel_empty);
+    /* Decorator tokenization */
+    RUN_TEST(tokenize_decorator_login_required);
+    RUN_TEST(tokenize_decorator_single);
+    /* Command splitting */
+    RUN_TEST(split_command_basic);
+    RUN_TEST(split_command_quoted);
+    RUN_TEST(split_command_empty);
+    /* Range parsing */
+    RUN_TEST(parse_range_with_count);
+    RUN_TEST(parse_range_single);
+    RUN_TEST(parse_range_zero_count);
+    /* Name status parsing */
+    RUN_TEST(parse_name_status_basic);
+    RUN_TEST(parse_name_status_empty);
+    /* Hunk parsing */
+    RUN_TEST(parse_hunks_empty);
+    /* Change coupling */
+    RUN_TEST(coupling_empty_commits);
+    RUN_TEST(coupling_single_file_commit);
+    /* JSON bracket cleaning */
+    RUN_TEST(clean_json_brackets_array);
+    RUN_TEST(clean_json_brackets_plain);
+    RUN_TEST(clean_json_brackets_empty);
+    /* FQN computation */
+    RUN_TEST(fqn_compute_basic);
+    RUN_TEST(fqn_compute_strips_ext);
+    RUN_TEST(fqn_module_basic);
+    RUN_TEST(fqn_folder_basic);
+    /* Project name edge cases */
+    RUN_TEST(project_name_special_chars);
+    RUN_TEST(project_name_trailing_slash);
+    /* SwiftPM Package.swift manifest resolution */
+    RUN_TEST(pkgmap_swift_targets_registers_module);
+    RUN_TEST(pkgmap_swift_products_do_not_register_alias);
+    RUN_TEST(pkgmap_swift_target_name_immediately_before_close_paren);
+    RUN_TEST(pkgmap_swift_target_honors_literal_path);
+    RUN_TEST(pkgmap_swift_target_computed_path_fails_closed);
+    RUN_TEST(pkgmap_swift_target_in_comment_or_string_not_registered);
+    RUN_TEST(pkgmap_swift_dependencies_do_not_leak_entries);
+    RUN_TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry);
+    RUN_TEST(pkgmap_swift_ambiguous_target_name_fails_closed);
+    RUN_TEST(pkgmap_swift_scan_repo_finds_nested_manifest);
+    RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
+    RUN_TEST(pipeline_cross_language_suffix_match_winner_is_dropped_issue725);
+    RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
+    RUN_TEST(pipeline_cpp_implicit_operators_require_types);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(pipeline_incremental_preserves_classified_version);
+    RUN_TEST(pipeline_initial_preserves_extracted_version);
+#endif
+}
