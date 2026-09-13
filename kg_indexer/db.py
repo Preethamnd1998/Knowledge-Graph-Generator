@@ -43,25 +43,132 @@ CREATE INDEX idx_nodes_name ON nodes(name);
 CREATE INDEX idx_edges_source ON edges(source_id);
 CREATE INDEX idx_edges_target ON edges(target_id);
 CREATE INDEX idx_edges_relation ON edges(relation);
+
+CREATE TABLE file_fingerprints (
+    file_path       TEXT NOT NULL,
+    service         TEXT NOT NULL,
+    mtime_ns        INTEGER NOT NULL,
+    size            INTEGER NOT NULL,
+    sha256          TEXT NOT NULL,
+    PRIMARY KEY (file_path, service)
+);
 """
 
 
 class GraphDB:
     """Populates one SQLite file with the unified node/edge graph.
 
-    A fresh run always rebuilds the schema from scratch (this is a batch
-    reindex tool, not an incremental updater), so any previous .db file at
-    `path` is replaced.
+    By default a fresh run rebuilds the schema from scratch (any previous
+    .db file at `path` is replaced) — this is the "first run = full index"
+    path. Pass incremental=True to open an existing .db in place instead:
+    callers are then responsible for deleting stale per-file node/edge data
+    themselves (see delete_nodes_for_file) before re-inserting, and for
+    only re-parsing files that actually changed (see kg_indexer.incremental).
     """
 
-    def __init__(self, path):
+    def __init__(self, path, incremental=False):
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        if os.path.exists(path):
+        is_fresh = not (incremental and os.path.exists(path))
+        if is_fresh and os.path.exists(path):
             os.remove(path)
         self.conn = sqlite3.connect(path)
-        self.conn.executescript(SCHEMA)
+        if is_fresh:
+            self.conn.executescript(SCHEMA)
+        else:
+            # Existing DB from a prior run — schema already present. Kept as
+            # a no-op executescript(CREATE TABLE IF NOT EXISTS ...) so a .db
+            # written before file_fingerprints existed still gets it added.
+            self.conn.executescript(SCHEMA.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
+                                     .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS "))
+        self.is_fresh = is_fresh
         self._qname_cache = {}  # qualified_name -> node id, this run only
+        if not is_fresh:
+            # Seed from existing nodes so cross-file reference resolution
+            # (resolve_pending_edges etc.) still sees symbols defined in
+            # unchanged files that this run never re-parses.
+            for qn, node_id in self.conn.execute(
+                "SELECT qualified_name, id FROM nodes WHERE qualified_name IS NOT NULL"
+            ):
+                self._qname_cache[qn] = node_id
+
+    def iter_name_qualified_pairs(self, project_type):
+        """(simple_name, qualified_name) for every existing node of this
+        project_type — used to seed a NameRegistry on an incremental run so
+        cross-reference resolution (extends/implements/@Autowired/...) still
+        sees symbols defined in unchanged files this run never re-parses."""
+        return self.conn.execute(
+            "SELECT name, qualified_name FROM nodes WHERE project_type = ? AND qualified_name IS NOT NULL",
+            (project_type,),
+        ).fetchall()
+
+    def get_file_fingerprint(self, file_path, service):
+        row = self.conn.execute(
+            "SELECT mtime_ns, size, sha256 FROM file_fingerprints WHERE file_path = ? AND service = ?",
+            (file_path, service),
+        ).fetchone()
+        if not row:
+            return None
+        return {"mtime_ns": row[0], "size": row[1], "sha256": row[2]}
+
+    def set_file_fingerprint(self, file_path, service, mtime_ns, size, sha256):
+        self.conn.execute(
+            "INSERT INTO file_fingerprints (file_path, service, mtime_ns, size, sha256) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(file_path, service) DO UPDATE SET mtime_ns=excluded.mtime_ns, "
+            "size=excluded.size, sha256=excluded.sha256",
+            (file_path, service, mtime_ns, size, sha256),
+        )
+
+    def delete_file_fingerprint(self, file_path, service):
+        self.conn.execute(
+            "DELETE FROM file_fingerprints WHERE file_path = ? AND service = ?",
+            (file_path, service),
+        )
+
+    def list_tracked_files(self, service):
+        return [r[0] for r in self.conn.execute(
+            "SELECT file_path FROM file_fingerprints WHERE service = ?", (service,)
+        )]
+
+    def delete_nodes_for_file(self, file_path, service):
+        """Remove a file's nodes before re-parsing it, or because it was
+        deleted from disk. Also drops the node from the in-run qname cache
+        so a changed file's stale qualified_name doesn't shadow its freshly
+        re-inserted replacement.
+
+        Outgoing edges (this file's nodes as source) are hard-deleted —
+        correct, since this same file is about to be re-parsed (or is gone
+        for good) and will recreate whatever's still true.
+
+        Incoming edges (this file's nodes as target) are reverted to
+        PENDING (target_id -> NULL) rather than deleted. target_name is
+        never cleared by resolve_pending_edges (see that method), so this
+        is not a lossy operation — it drops the edge back into the exact
+        state a never-yet-resolved edge is already in, and the resolve_*
+        passes that already run at the end of every indexing operation
+        (regardless of what changed) will re-link it to this file's
+        freshly-inserted replacement node. Deleting these outright — the
+        previous behavior — permanently lost any relationship whose SOURCE
+        lives in a different, unchanged file that this run never re-parses
+        to regenerate the edge (see angular_parser.py's TEMPLATE_EVENT
+        DECLARED_IN edges for the real incident this was found from — but
+        the bug applied to every edge type/language, not just Angular)."""
+        rows = self.conn.execute(
+            "SELECT id, qualified_name FROM nodes WHERE file_path = ? AND service = ?",
+            (file_path, service),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        for _id, qn in rows:
+            if qn in self._qname_cache:
+                del self._qname_cache[qn]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(f"DELETE FROM edges WHERE source_id IN ({placeholders})", ids)
+        self.conn.execute(f"UPDATE edges SET target_id = NULL WHERE target_id IN ({placeholders})", ids)
+        self.conn.execute(f"DELETE FROM nodes WHERE id IN ({placeholders})", ids)
+        return len(ids)
 
     def add_node(self, node_type, name, qualified_name=None, service=None,
                  project_type=None, file_path=None, start_line=None,

@@ -13,5 +13,12 @@ __pycache__/
 # MCP server local config (may contain machine-specific paths)
 mcp-config.env
 
+# Real indexer config has machine-specific paths -- kg-config.env.example
+# is the tracked template; each developer's own kg-config.env stays local.
+kg-config.env
+
+# macOS/Finder
+.DS_Store
+
 # Local-only Claude Code settings (machine-specific, not shared)
 .claude/settings.local.json

@@ -35,6 +35,7 @@ class Config:
     index_mode: str
     output_dir: str
     single_database: bool
+    incremental: bool
     backend_services: ListSetting
     angular_subprojects: ListSetting
     source_path: str
@@ -115,6 +116,12 @@ def load_config(path):
     output_dir = scalars.get("OUTPUT_DIR", "./output")
     single_database_raw = scalars.get("SINGLE_DATABASE", "true").strip().lower()
     single_database = single_database_raw in ("true", "1", "yes", "y")
+    # First run always fully indexes regardless (no prior .db to diff against).
+    # Set INCREMENTAL=false to force a full rescan even when a prior .db exists
+    # (e.g. after a schema/parser change where stale-but-fingerprint-matching
+    # nodes could otherwise linger).
+    incremental_raw = scalars.get("INCREMENTAL", "true").strip().lower()
+    incremental = incremental_raw in ("true", "1", "yes", "y")
 
     if index_mode not in VALID_MODES:
         raise ConfigError(
@@ -133,6 +140,7 @@ def load_config(path):
         index_mode=index_mode,
         output_dir=output_dir,
         single_database=single_database,
+        incremental=incremental,
         backend_services=lists.get("BACKEND_SERVICES", ListSetting()),
         angular_subprojects=lists.get("ANGULAR_SUBPROJECTS", ListSetting()),
         source_path=os.path.abspath(path),

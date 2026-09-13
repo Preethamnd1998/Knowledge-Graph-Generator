@@ -33,9 +33,17 @@ REPOSITORY_BASE_INTERFACES = {
 # RESTTEMPLATE_CALL (backend METHOD -> backend ENDPOINT) are included so
 # get_service_context/get_service_dependencies pick up UI->backend and
 # backend->backend calls for free — see kg_indexer/db.py's resolve_* methods.
+# HANDLES_EVENT/DECLARED_IN (template event -> handler / owning component)
+# and ROUTES_TO/GUARDED_BY/RESOLVED_BY/CONTAINS_ROUTE (Angular route ->
+# component/guard/resolver/child route) are Angular-semantic edges from
+# angular_parser.py's template-event and route passes — included here so
+# find_dependencies/find_callers traverse them like any other relation,
+# with zero new query code (this file's generic BFS already handles any
+# relation list, in either direction).
 DEPENDENCY_RELATIONS = (
     "DEPENDS_ON", "EXTENDS", "IMPLEMENTS", "IMPORTS",
     "CALLS_API", "FEIGN_CALL", "WEBCLIENT_CALL", "RESTTEMPLATE_CALL",
+    "HANDLES_EVENT", "DECLARED_IN", "ROUTES_TO", "GUARDED_BY", "RESOLVED_BY", "CONTAINS_ROUTE",
 )
 
 

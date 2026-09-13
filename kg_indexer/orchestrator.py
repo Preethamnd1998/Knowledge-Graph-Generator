@@ -3,9 +3,20 @@ import time
 
 from .config import Config
 from .db import GraphDB
-from .parsers.common import NameRegistry
+from . import incremental
+from .parsers.common import NameRegistry, walk_source_files
 from .parsers import angular_parser, java_parser, react_parser, spring_flow_parser
 from .parsers.angular_parser import ROOT_APP_SENTINEL
+
+# Must mirror the walk_source_files(...) call inside each parser's own
+# parse_service/parse_subproject/parse_project — see java_parser.py:538,
+# angular_parser.py:253, react_parser.py:206. Change detection happens here,
+# once per target, before either backend pass runs (see _java_only_files),
+# so it needs the same file set the parser would otherwise discover itself.
+_JAVA_EXTS, _JAVA_IGNORED = (".java",), ("Test.java", "Tests.java")
+_ANGULAR_EXTS, _ANGULAR_IGNORED = (".ts", ".html"), (".spec.ts", ".d.ts")
+_REACT_EXTS = (".jsx", ".tsx", ".js", ".ts")
+_REACT_IGNORED = (".spec.ts", ".spec.tsx", ".test.ts", ".test.tsx", ".d.ts")
 
 
 def _print(msg):
@@ -53,8 +64,9 @@ def run(config: Config):
 
     if config.single_database:
         db_path = _db_path_for(config.output_dir, "knowledge_graph")
-        db = GraphDB(db_path)
-        _print(f"Writing combined graph to: {db_path}\n")
+        db = GraphDB(db_path, incremental=config.incremental)
+        mode_label = "incremental" if (config.incremental and not db.is_fresh) else "full"
+        _print(f"Writing combined graph to: {db_path} ({mode_label} index)\n")
         summaries = _index_all(config, db, backend_services, angular_subprojects, react_enabled, shared=True)
         db.close()
         _print_summary("knowledge_graph.db", db_path, summaries)
@@ -69,10 +81,22 @@ def run(config: Config):
     _print("=" * 64)
 
 
+def _seeded_registry(db, project_type):
+    """A NameRegistry pre-populated from existing nodes so an incremental
+    run's cross-reference resolution can still see symbols defined in
+    unchanged files it never re-parses this run."""
+    registry = NameRegistry()
+    if db is not None:
+        for simple_name, qualified_name in db.iter_name_qualified_pairs(project_type):
+            registry.register(simple_name, qualified_name)
+    return registry
+
+
 def _index_all(config, shared_db, backend_services, angular_subprojects, react_enabled, shared):
-    java_registry = NameRegistry()
-    ng_registry = NameRegistry()
-    react_registry = NameRegistry()
+    seed_db = shared_db if (shared and config.incremental and not shared_db.is_fresh) else None
+    java_registry = _seeded_registry(seed_db, "java")
+    ng_registry = _seeded_registry(seed_db, "angular")
+    react_registry = _seeded_registry(seed_db, "react")
     per_target_summaries = []
     # {registered spring.application.name -> our service_name} — the API
     # Gateway prefix map used to resolve UI API_CONSTANT paths and backend
@@ -86,10 +110,23 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         if not os.path.isdir(service_path):
             _print(f"[skip] backend service not found on disk: {service_path}")
             continue
-        _print(f"[java] indexing {service_name} ...")
-        db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, service_name))
-        stats = java_parser.parse_service(db, java_registry, service_name, service_path, progress=_progress)
-        flow_stats = spring_flow_parser.parse_service(db, java_registry, service_name, service_path)
+        db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, service_name), incremental=config.incremental)
+
+        only_files = None
+        if config.incremental and not db.is_fresh:
+            all_java = list(walk_source_files(service_path, _JAVA_EXTS, ignored_suffixes=_JAVA_IGNORED))
+            changed, unchanged = incremental.classify_files(db, service_name, service_path, all_java)
+            removed = incremental.sweep_deleted(db, service_name, service_path, all_java)
+            only_files = set(changed)
+            _print(f"[java] indexing {service_name} (incremental: {len(changed)} changed, "
+                   f"{len(unchanged)} unchanged, {removed} removed) ...")
+        else:
+            _print(f"[java] indexing {service_name} (full) ...")
+
+        stats = java_parser.parse_service(db, java_registry, service_name, service_path,
+                                           progress=_progress, only_files=only_files)
+        flow_stats = spring_flow_parser.parse_service(db, java_registry, service_name, service_path,
+                                                       only_files=only_files)
         gateway_prefix = stats.get("gateway_prefix")
         if gateway_prefix:
             gateway_prefix_map[gateway_prefix] = service_name
@@ -124,13 +161,26 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
             if not os.path.isdir(subproject_path):
                 _print(f"[skip] angular subproject not found on disk: {subproject_path}")
                 continue
-            _print(f"[angular] indexing {subproject_name} ...")
-            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, f"{config.angular_project}_{subproject_name}"))
+            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, f"{config.angular_project}_{subproject_name}"), incremental=config.incremental)
             if not shared:
                 project_node_id = angular_parser.parse_project(db, config.angular_project, config.root_path)
+
+            only_files = None
+            if config.incremental and not db.is_fresh:
+                src_dir = os.path.join(subproject_path, "src")
+                walk_root = src_dir if os.path.isdir(src_dir) else subproject_path
+                all_ts = list(walk_source_files(walk_root, _ANGULAR_EXTS, ignored_suffixes=_ANGULAR_IGNORED))
+                changed, unchanged = incremental.classify_files(db, subproject_name, subproject_path, all_ts)
+                removed = incremental.sweep_deleted(db, subproject_name, subproject_path, all_ts)
+                only_files = set(changed)
+                _print(f"[angular] indexing {subproject_name} (incremental: {len(changed)} changed, "
+                       f"{len(unchanged)} unchanged, {removed} removed) ...")
+            else:
+                _print(f"[angular] indexing {subproject_name} (full) ...")
+
             stats = angular_parser.parse_subproject(
                 db, ng_registry, config.angular_project, project_node_id,
-                subproject_name, subproject_path, progress=_progress,
+                subproject_name, subproject_path, progress=_progress, only_files=only_files,
             )
             if not shared:
                 resolved = db.resolve_pending_edges(ng_registry.as_dict(), project_type="angular")
@@ -149,9 +199,19 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         if not os.path.isdir(react_path):
             _print(f"[skip] React project not found on disk: {react_path}")
         else:
-            _print(f"[react] indexing {react_path} ...")
-            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, "react"))
-            stats, project_name = react_parser.parse_project(db, react_registry, react_path, progress=_progress)
+            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, "react"), incremental=config.incremental)
+            only_files = None
+            if config.incremental and not db.is_fresh:
+                all_react = list(walk_source_files(react_path, _REACT_EXTS, ignored_suffixes=_REACT_IGNORED))
+                changed, unchanged = incremental.classify_files(db, "react", react_path, all_react)
+                removed = incremental.sweep_deleted(db, "react", react_path, all_react)
+                only_files = set(changed)
+                _print(f"[react] indexing {react_path} (incremental: {len(changed)} changed, "
+                       f"{len(unchanged)} unchanged, {removed} removed) ...")
+            else:
+                _print(f"[react] indexing {react_path} (full) ...")
+            stats, project_name = react_parser.parse_project(db, react_registry, react_path,
+                                                               progress=_progress, only_files=only_files)
             if not shared:
                 resolved = db.resolve_pending_edges(react_registry.as_dict(), project_type="react")
                 db.close()

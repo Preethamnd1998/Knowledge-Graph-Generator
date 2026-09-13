@@ -524,7 +524,7 @@ def _parse_feign_method(db, service_name, rel_file, full_text, body_start, mm,
     )
 
 
-def parse_service(db, registry: NameRegistry, service_name, service_path, progress=None):
+def parse_service(db, registry: NameRegistry, service_name, service_path, progress=None, only_files=None):
     stats = {"files": 0, "classes": 0, "methods": 0, "endpoints": 0, "errors": 0}
 
     gateway_prefix = _extract_gateway_prefix(service_path)
@@ -536,6 +536,8 @@ def parse_service(db, registry: NameRegistry, service_name, service_path, progre
     )
 
     for file_path in walk_source_files(service_path, (".java",), ignored_suffixes=("Test.java", "Tests.java")):
+        if only_files is not None and file_path not in only_files:
+            continue
         _parse_file(db, registry, service_name, service_path, file_path,
                     service_node_id, stats, java_api_constants)
         if progress:

@@ -409,12 +409,14 @@ def _scan_method_body(db, registry, service_name, rel_file, m, method_node_id,
         stats["RESTTEMPLATE_CALL"] = stats.get("RESTTEMPLATE_CALL", 0) + 1
 
 
-def parse_service(db, registry, service_name, service_path, progress=None):
+def parse_service(db, registry, service_name, service_path, progress=None, only_files=None):
     """Run after java_parser.parse_service() for the same service, before
     that service's resolve_pending_edges() call — see module docstring."""
     stats = {"flow_edges": 0}
 
     for file_path in walk_source_files(service_path, (".java",), ignored_suffixes=("Test.java", "Tests.java")):
+        if only_files is not None and file_path not in only_files:
+            continue
         text = read_text(file_path)
         if text is None:
             continue

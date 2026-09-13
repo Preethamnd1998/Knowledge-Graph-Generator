@@ -194,7 +194,7 @@ def _parse_api_constant_class(db, registry, project_name, rel_file, text, pm,
     stats["API_CONSTANT"] = stats.get("API_CONSTANT", 0) + count
 
 
-def parse_project(db, registry: NameRegistry, project_root, progress=None):
+def parse_project(db, registry: NameRegistry, project_root, progress=None, only_files=None):
     project_name = os.path.basename(project_root.rstrip("\\/")) or "react-app"
     stats = {"files": 0, "components": 0, "hooks": 0, "errors": 0}
 
@@ -207,6 +207,8 @@ def parse_project(db, registry: NameRegistry, project_root, progress=None):
         project_root, (".jsx", ".tsx", ".js", ".ts"),
         ignored_suffixes=(".spec.ts", ".spec.tsx", ".test.ts", ".test.tsx", ".d.ts"),
     ):
+        if only_files is not None and file_path not in only_files:
+            continue
         _parse_file(db, registry, project_name, project_root, file_path, service_node_id, stats)
         if progress:
             progress(project_name, file_path, stats)
