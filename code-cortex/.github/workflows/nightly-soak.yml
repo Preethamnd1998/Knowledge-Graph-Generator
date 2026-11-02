@@ -1,0 +1,33 @@
+# Weekly soak test: 4h sustained load + ASan leak detection
+name: Nightly Soak
+
+on:
+  schedule:
+    - cron: '0 2 * * 0' # Every Sunday at 2am UTC
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Soak duration in minutes (default: 240 = 4h)'
+        type: number
+        default: 240
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    uses: ./.github/workflows/_soak.yml
+    with:
+      # workflow_dispatch delivers every input as a STRING, whatever `type:`
+      # says, and _soak.yml declares duration_minutes as a number — so passing
+      # it straight through failed the run before a single job was created.
+      # format() then fromJSON() makes it a number on both paths: on a schedule
+      # there is no inputs context and the literal 240 is used.
+      duration_minutes: ${{ fromJSON(format('{0}', inputs.duration_minutes || 240)) }}
+      # Must clear the soak above with room for checkout, msys2 setup and the
+      # build. _soak.yml's default (40) is sized for the 10-minute dry-run soak
+      # and would cancel this one part-way through, as it did for all 13
+      # scheduled runs before this was passed. 280 leaves the 4h soak 40 minutes
+      # of headroom and stays inside the 6h hosted-runner limit.
+      quick_timeout_minutes: 280
+      run_asan: true

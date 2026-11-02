@@ -37,6 +37,27 @@ def read_text(file_path):
         return None
 
 
+_JAVA_LITERAL_OR_COMMENT_RE = re.compile(
+    r'"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*[\s\S]*?\*/'
+)
+
+
+def _blank_comment(m):
+    tok = m.group(0)
+    if tok.startswith(("//", "/*")):
+        return re.sub(r"[^\n]", " ", tok)
+    return tok   # a string / char / text-block literal is kept as is
+
+
+def mask_java_comments(text):
+    """Same-length copy of Java source with every `//` and `/* */` comment blanked to spaces (newlines
+    kept), so offsets and line numbers still index the original. String, char and text-block literals
+    are matched first, so a `//` inside "http://x" is left alone. Lets annotation regexes run over class
+    headers that carry long comment blocks between/inside annotations, whose parens and `@Names`
+    otherwise derail them."""
+    return _JAVA_LITERAL_OR_COMMENT_RE.sub(_blank_comment, text)
+
+
 def line_of(text, index):
     """1-based line number of a character offset within `text`."""
     return text.count("\n", 0, index) + 1
@@ -159,6 +180,24 @@ def is_api_constant_class_name(name):
     return lname.endswith(_API_CONSTANT_SUFFIXES)
 
 
+# UI projects also keep endpoint URLs in classes that are NOT named *ApiConstant
+# (e.g. `SystemSettingsConstant.AUTO_FOLLOW_UP_RULES_POST_GET = "core/auto-follow-up-rules"`),
+# so those endpoints had no UI caller in the graph at all. Any *Constant(s) class is
+# now scanned, but ONLY fields whose value looks like a gateway API path become
+# nodes (`PAGE_SIZE = "10"`, `LABEL = "hello world"` don't), and a constant is only
+# linked to a caller if its path resolves to a real backend endpoint.
+_CONSTANT_SUFFIXES = ("constant", "constants")
+_API_PATH_VALUE_RE = re.compile(r'^[a-z][a-z0-9_\-]*(?:/[A-Za-z0-9_\-{}.:]+)+/?$')
+
+
+def is_constant_class_name(name):
+    return name.lower().endswith(_CONSTANT_SUFFIXES)
+
+
+def looks_like_api_path(value):
+    return bool(value) and len(value) <= 200 and bool(_API_PATH_VALUE_RE.match(value.strip()))
+
+
 # Any top-level TS class (no decorator required — these are plain constant
 # holders, not @Component/@Injectable), captured generically so the caller
 # can filter by is_api_constant_class_name() before doing anything with it.
@@ -186,8 +225,64 @@ STATIC_STRING_FIELD_RE = re.compile(
 # other target_name-only edge in this codebase resolves — see
 # GraphDB.resolve_pending_edges).
 API_CONSTANT_USAGE_RE = re.compile(
-    r'\b(?P<cls>[A-Za-z_]\w*(?:ApiConstants?|APIConstants?))\.(?P<field>[A-Z][A-Z0-9_]*)\b'
+    r'\b(?P<cls>[A-Za-z_]\w*(?:Constants?))\.(?P<field>[A-Z][A-Z0-9_]*)\b'
 )
+
+
+# A call site rarely uses a base constant as-is: `${ChatApiConstant.GET_CHAT_MESSAGES_BASE}/unread-count`
+# or `SomeConstant.BASE + '/read-by'`. The literal suffix (and any `${var}` segment in it,
+# treated as a path variable) is what identifies the real endpoint, so it becomes its own
+# derived API_CONSTANT node; the resolver joins it to the base constant's value.
+_SUFFIX_CHARS = r'(?:[\w\-.:]|\$\{[^}]*\})*'
+CONSTANT_TEMPLATE_SUFFIX_RE = re.compile(
+    r'\$\{\s*(?P<cls>[A-Za-z_]\w*(?:Constants?))\.(?P<field>[A-Z][A-Z0-9_]*)\s*\}'
+    r'(?P<suffix>(?:/' + _SUFFIX_CHARS + r')+)'
+)
+CONSTANT_CONCAT_SUFFIX_RE = re.compile(
+    r'\b(?P<cls>[A-Za-z_]\w*(?:Constants?))\.(?P<field>[A-Z][A-Z0-9_]*)\s*\+\s*'
+    r'(?:"(?P<dq>/[^"]*)"|\'(?P<sq>/[^\']*)\'|`(?P<bt>/[^`]*)`)'
+)
+
+
+def _suffix_segments(raw):
+    raw = raw.split("?", 1)[0]
+    raw = re.sub(r'\$\{[^}]*\}', '{v}', raw)
+    return [s for s in raw.split("/") if s]
+
+
+def iter_constant_suffix_usages(text):
+    """Yield (class, field, suffix_segments, offset) for every constant-plus-literal-
+    suffix URL in `text`. Suffixes with no path segment (`BASE + '/'`) are skipped."""
+    for m in CONSTANT_TEMPLATE_SUFFIX_RE.finditer(text):
+        segs = _suffix_segments(m.group("suffix"))
+        if segs:
+            yield m.group("cls"), m.group("field"), segs, m.start()
+    for m in CONSTANT_CONCAT_SUFFIX_RE.finditer(text):
+        segs = _suffix_segments(m.group("dq") or m.group("sq") or m.group("bt") or "")
+        if segs:
+            yield m.group("cls"), m.group("field"), segs, m.start()
+
+
+def emit_suffix_constant_usages(db, project_type, project_name, service, rel_file, text, file_node_id):
+    """One derived API_CONSTANT per distinct (base constant, suffix) in this file, linked
+    from the file with USES_API_CONSTANT (by id — the derived node is file-local)."""
+    count, seen = 0, set()
+    for cls, field, segs, offset in iter_constant_suffix_usages(text):
+        suffix = "/".join(segs)
+        name = f"{cls}.{field} + /{suffix}"
+        if name in seen:
+            continue
+        seen.add(name)
+        qname = f"{'ng' if project_type == 'angular' else 'react'}:{project_name}:{service}:{rel_file}:{name}"
+        node_id = db.add_node(
+            "API_CONSTANT", name, qualified_name=qname, service=service, project_type=project_type,
+            file_path=rel_file, start_line=line_of(text, offset),
+            metadata={"derived_from": f"{cls}.{field}", "suffix_segments": segs,
+                      "class_name": cls, "field_name": field, "segments": []},
+        )
+        db.add_edge(file_node_id, "USES_API_CONSTANT", target_id=node_id, service=service)
+        count += 1
+    return count
 
 
 def normalize_ui_path(raw):

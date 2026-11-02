@@ -1,0 +1,213 @@
+/*
+ * platform.h — OS abstractions.
+ *
+ * Provides cross-platform wrappers for:
+ *   - Memory-mapped files (mmap / VirtualAlloc)
+ *   - High-resolution monotonic clock
+ *   - CPU core count
+ *   - File existence check
+ */
+#ifndef CBM_PLATFORM_H
+#define CBM_PLATFORM_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ── Safe memory ──────────────────────────────────────────────── */
+
+/* Safe realloc: frees old pointer on failure instead of leaking it.
+ * Returns NULL on allocation failure (old memory is freed). */
+static inline void *safe_realloc(void *ptr, size_t size) {
+    enum { SAFE_REALLOC_MIN = 1 };
+    if (size == 0) {
+        size = SAFE_REALLOC_MIN;
+    }
+    void *tmp = realloc(ptr, size);
+    if (!tmp) {
+        free(ptr);
+    }
+    return tmp;
+}
+
+/* Safe free: frees and NULLs a pointer to prevent double-free / use-after-free.
+ * Use via the safe_free() macro so the caller's pointer is actually cleared. */
+static inline void safe_free_impl(void **pp) {
+    if (pp && *pp) {
+        free(*pp);
+        *pp = NULL;
+    }
+}
+#define safe_free(ptr) safe_free_impl((void **)(void *)&(ptr))
+
+/* Safe const string free: frees a const char* and NULLs it.
+ * Casts away const so callers don't repeat the (void *) dance. */
+static inline void safe_str_free(const char **sp) {
+    if (sp && *sp) {
+        free((void *)*sp);
+        *sp = NULL;
+    }
+}
+
+/* Safe buffer free: frees a heap array and zeros its element count.
+ * Use for dynamic arrays paired with a size_t count. */
+static inline void safe_buf_free_impl(void **buf, size_t *count) {
+    if (buf && *buf) {
+        free(*buf);
+        *buf = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+}
+#define safe_buf_free(buf, countp) safe_buf_free_impl((void **)(void *)&(buf), (countp))
+
+/* Safe grow: doubles capacity and reallocs when count reaches cap.
+ * Note: uses safe_realloc which frees the old buffer on failure, so this is
+ * only appropriate for arrays whose elements don't own additional heap memory.
+ * For arrays of heap-allocated pointers, prefer a manual realloc+cleanup pattern.
+ * Usage: safe_grow(arr, count, cap, growth_factor)
+ * After the call, arr is the new buffer (NULL on OOM). */
+#define safe_grow(arr, n, cap, factor)                                                   \
+    do {                                                                                 \
+        if ((size_t)(n) >= (size_t)(cap)) {                                              \
+            (cap) *= (factor);                                                           \
+            (arr) = (grep_match_t *)safe_realloc((arr), (size_t)(cap) * sizeof(*(arr))); \
+        }                                                                                \
+    } while (0)
+
+/* ── Memory mapping ────────────────────────────────────────────── */
+
+/* Map a file read-only into memory. Returns NULL on error.
+ * *out_size is set to the file size. */
+void *cbm_mmap_read(const char *path, size_t *out_size);
+
+/* Unmap a previously mapped region. */
+void cbm_munmap(void *addr, size_t size);
+
+/* ── Timing ────────────────────────────────────────────────────── */
+
+/* Monotonic nanosecond timestamp (for elapsed time measurement). */
+uint64_t cbm_now_ns(void);
+
+/* Monotonic millisecond timestamp. */
+uint64_t cbm_now_ms(void);
+
+/* ── System info ───────────────────────────────────────────────── */
+
+/* Number of available CPU cores. */
+int cbm_nprocs(void);
+
+/* System topology: core types and RAM (only fields with production consumers). */
+typedef struct {
+    int total_cores;  /* hw.ncpu (all cores) */
+    int perf_cores;   /* P-cores (Apple) or total_cores (others) */
+    size_t total_ram; /* total physical RAM in bytes */
+} cbm_system_info_t;
+
+/* Query system information. Results are cached after first call. */
+cbm_system_info_t cbm_system_info(void);
+
+/* Recommended worker count for parallel indexing.
+ * initial=true:  all cores (user is waiting for initial index)
+ * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
+int cbm_default_worker_count(bool initial);
+
+/* ── Environment variables ──────────────────────────────────────── */
+
+/* Thread-safe getenv: copies the value into a caller-provided buffer.
+ * Returns buf on success, or fallback if the variable is unset.
+ * Returns NULL when the variable is unset and fallback is NULL. */
+const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
+
+/* ── Home directory ─────────────────────────────────────────────── */
+
+/* Cross-platform home directory: tries HOME first, then USERPROFILE (Windows).
+ * Returns NULL when neither is set. */
+const char *cbm_get_home_dir(void);
+
+/* ── App config directories ────────────────────────────────────── */
+
+/* Cross-platform app config directory (static buffer, not thread-safe).
+ * Windows: %APPDATA% (e.g. C:/Users/.../AppData/Roaming)
+ * macOS:   $HOME (callers append Library/Application Support/...)
+ * Linux:   $XDG_CONFIG_HOME or ~/.config */
+const char *cbm_app_config_dir(void);
+
+/* Windows: %LOCALAPPDATA% (e.g. C:/Users/.../AppData/Local)
+ * macOS/Linux: same as cbm_app_config_dir(). */
+const char *cbm_app_local_dir(void);
+
+/* ── Cache directory ────────────────────────────────────────────── */
+
+/* Resolve the database cache directory. All project indexes are stored here.
+ * Priority: CBM_CACHE_DIR env var > ~/.cache/code-cortex-mcp (default).
+ * Returns static buffer or NULL if home is unavailable. */
+const char *cbm_resolve_cache_dir(void);
+
+/* ── File system ───────────────────────────────────────────────── */
+
+/* Check if a path exists. */
+bool cbm_file_exists(const char *path);
+
+/* Check if path is a directory. */
+bool cbm_is_dir(const char *path);
+
+/* Get file size. Returns -1 on error. */
+int64_t cbm_file_size(const char *path);
+
+/* Last-modification time in seconds. Returns -1 on error. Paired with
+ * cbm_file_size it forms a cheap change signature for "is this the same
+ * generation of this file I already inspected?".
+ *
+ * NOTE: whole seconds. For deciding whether a file was REPLACED — as opposed
+ * to merely inspecting it twice — use cbm_file_generation below: a rewrite
+ * within the same second at the same byte size is entirely possible (SQLite
+ * sizes are page-granular) and this pair cannot see it. */
+int64_t cbm_file_mtime(const char *path);
+
+/* Identity of one generation of a file: what changes when the file is
+ * REPLACED. `size` is -1 when the file cannot be stat'ed.
+ *
+ * (size, mtime-in-seconds) alone is not enough to key a cache on: a database
+ * rebuilt in the same second at the same page count matches it exactly, so
+ * stale facts survive the very rewrite that should have invalidated them.
+ * mtime_ns adds sub-second resolution and `ino` adds file identity — a
+ * re-index unlinks and recreates, so the inode changes even when nothing else
+ * does. Fields that a platform cannot supply are 0, which is safe: they simply
+ * stop contributing. */
+typedef struct {
+    int64_t size;
+    int64_t mtime;    /* whole seconds */
+    int64_t mtime_ns; /* sub-second part, nanoseconds; 0 where unavailable */
+    uint64_t ino;     /* file identity; 0 where unavailable */
+} cbm_file_gen_t;
+
+/* Fill *out for `path`. Returns false (and zeroes *out with size = -1) when the
+ * file cannot be stat'ed. */
+bool cbm_file_generation(const char *path, cbm_file_gen_t *out);
+
+/* True when both describe the same generation. A generation with size < 0
+ * (unstattable) never equals anything, including itself. */
+bool cbm_file_gen_equal(const cbm_file_gen_t *a, const cbm_file_gen_t *b);
+
+/* Normalize path separators to forward slashes (in-place).
+ * On Windows, converts backslashes to forward slashes.
+ * On POSIX, this is a no-op. Returns the input pointer. */
+char *cbm_normalize_path_sep(char *path);
+
+/* Resolve the path to this executable into out[0..outsz). If argv0 is a usable
+ * path to an executable it is preferred; otherwise the OS self-executable path
+ * is used. Returns false on failure. Used by the crash-isolating index worker. */
+bool cbm_resolve_self_exe_path(const char *argv0, char *out, size_t outsz);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CBM_PLATFORM_H */

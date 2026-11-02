@@ -23,7 +23,7 @@ setlocal
 ::  below and put the full path to your "Knowledge Graph
 ::  Generator" folder between the quotes, for example:
 ::
-::      set "KG_ROOT=D:\GitLab-Workspace\Knowledge Graph Generator"
+::      set "KG_ROOT=<platform-repo>\shared\mcp-tools\knowledge-graph-generator"
 ::
 ::  Leave it as %~dp0 (the next line) if this file is still
 ::  sitting inside that folder.

@@ -17,7 +17,7 @@ layout. If your workspace differs, only `kg-config.env` needs to change
 — nothing else.
 
 ```
-D:\GitLab-Workspace\UI-BE                        <- ROOT_PATH (backend root)
+<PROJECTS_DIR>\BE                        <- ROOT_PATH (backend root)
 ├── appointment-service, auth-service, core-service, ...   <- each a BACKEND_SERVICES entry (Java/Maven)
 ├── lifetrenz-core                                <- ANGULAR_PROJECT (Angular monorepo root)
 │   ├── src\app\...                               <- the monorepo's own "shell" app — index via ROOT_APP
@@ -27,10 +27,10 @@ D:\GitLab-Workspace\UI-BE                        <- ROOT_PATH (backend root)
 └── (no React app in this workspace yet — REACT_PROJECT_PATH left blank)
 ```
 
-- **Backend root**: `D:\GitLab-Workspace\UI-BE` — every immediate
+- **Backend root**: `<PROJECTS_DIR>\BE` — every immediate
   sub-folder with its own `pom.xml`/`src` is a candidate for
   `BACKEND_SERVICES`.
-- **UI (Angular) root**: `D:\GitLab-Workspace\UI-BE\lifetrenz-core` —
+- **UI (Angular) root**: `<PROJECTS_DIR>\UI\lifetrenz-core` —
   the monorepo itself has a root app (`src/`, indexed via the special
   `ROOT_APP` entry) plus many feature sub-projects under
   `lifetrenz-core\projects\*`.
@@ -38,7 +38,7 @@ D:\GitLab-Workspace\UI-BE                        <- ROOT_PATH (backend root)
   `REACT_PROJECT_PATH` if/when one exists (any absolute path, doesn't
   have to live under `ROOT_PATH`).
 
-This repo (`D:\GitLab-Workspace\Knowledge Graph Generator`) is
+This repo (`<platform-repo>\shared\mcp-tools\knowledge-graph-generator`) is
 intentionally separate from the code it indexes — it never writes into
 `ROOT_PATH`, only reads from it.
 

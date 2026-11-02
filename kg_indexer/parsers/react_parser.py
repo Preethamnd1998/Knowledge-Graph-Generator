@@ -6,7 +6,7 @@ import re
 
 from .common import (
     API_CONSTANT_USAGE_RE, NameRegistry, PLAIN_CLASS_RE, STATIC_STRING_FIELD_RE,
-    find_matching, is_api_constant_class_name, line_of, normalize_ui_path,
+    emit_suffix_constant_usages, find_matching, is_api_constant_class_name, line_of, normalize_ui_path,
     read_text, walk_source_files,
 )
 
@@ -130,6 +130,8 @@ def _parse_file(db, registry, project_name, project_root, file_path, service_nod
     for um in API_CONSTANT_USAGE_RE.finditer(text):
         key = f"{um.group('cls')}.{um.group('field')}"
         db.add_edge(file_node_id, "USES_API_CONSTANT", target_name=key, service=project_name)
+    stats["API_CONSTANT"] = stats.get("API_CONSTANT", 0) + emit_suffix_constant_usages(
+        db, "react", project_name, project_name, rel_file, text, file_node_id)
 
 
 def _emit(db, registry, project_name, rel_file, text, name, start, brace_index, kind,
@@ -194,7 +196,7 @@ def _parse_api_constant_class(db, registry, project_name, rel_file, text, pm,
     stats["API_CONSTANT"] = stats.get("API_CONSTANT", 0) + count
 
 
-def parse_project(db, registry: NameRegistry, project_root, progress=None):
+def parse_project(db, registry: NameRegistry, project_root, progress=None, only_files=None):
     project_name = os.path.basename(project_root.rstrip("\\/")) or "react-app"
     stats = {"files": 0, "components": 0, "hooks": 0, "errors": 0}
 
@@ -207,6 +209,8 @@ def parse_project(db, registry: NameRegistry, project_root, progress=None):
         project_root, (".jsx", ".tsx", ".js", ".ts"),
         ignored_suffixes=(".spec.ts", ".spec.tsx", ".test.ts", ".test.tsx", ".d.ts"),
     ):
+        if only_files is not None and file_path not in only_files:
+            continue
         _parse_file(db, registry, project_name, project_root, file_path, service_node_id, stats)
         if progress:
             progress(project_name, file_path, stats)

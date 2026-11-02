@@ -1,0 +1,113 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 73a5303..28f6d3b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -372,6 +372,7 @@ cbm_add_cxx_library(cbm_pipeline  SOURCES
+     src/pipeline/pass_configures.cpp
+     src/pipeline/pass_configlink.cpp
+     src/pipeline/pass_route_nodes.cpp
++    src/pipeline/pass_orm_nodes.cpp
+     src/pipeline/pass_enrichment.cpp
+     src/pipeline/pass_envscan.cpp
+     src/pipeline/pass_compile_commands.cpp
+diff --git a/src/pipeline/pipeline.cpp b/src/pipeline/pipeline.cpp
+index fca2de6..307aeee 100644
+--- a/src/pipeline/pipeline.cpp
++++ b/src/pipeline/pipeline.cpp
+@@ -965,6 +965,12 @@ static void predump_deco(cbm_pipeline_ctx_t *ctx) {
+ static void predump_route(cbm_pipeline_ctx_t *ctx) {
+     cbm_pipeline_create_route_nodes(ctx->gbuf);
+ }
++static void predump_orm(cbm_pipeline_ctx_t *ctx) {
++    cbm_pipeline_create_orm_nodes(ctx->gbuf);
++}
++static void predump_mongo(cbm_pipeline_ctx_t *ctx) {
++    cbm_pipeline_create_mongo_nodes(ctx);
++}
+ static void predump_sim(cbm_pipeline_ctx_t *ctx) {
+     cbm_pipeline_pass_similarity(ctx);
+ }
+@@ -985,12 +991,14 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+         bool moderate_only; /* true = skip in fast mode */
+     } passes[] = {
+         {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
+-        {predump_route, "route_match", false},   {predump_sim, "similarity", true},
++        {predump_route, "route_match", false},   {predump_orm, "orm_mapping", false},
++        {predump_mongo, "mongo_mapping", false},
++        {predump_sim, "similarity", true},
+         {predump_sem, "semantic_edges", true},   {predump_complexity, "complexity", false},
+     };
+-    enum { PREDUMP_PASS_COUNT = 6 };
++    const int pass_count = (int)(sizeof(passes) / sizeof(passes[0]));
+     struct timespec t;
+-    for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
++    for (int i = 0; i < pass_count && !check_cancel(p); i++) {
+         /* "moderate_only" passes (similarity/semantic edges) run in FULL,
+          * MODERATE and ADVANCED — they are skipped only in FAST. Compare
+          * explicitly against FAST rather than `> MODERATE` so ADVANCED
+diff --git a/src/pipeline/pipeline_incremental.cpp b/src/pipeline/pipeline_incremental.cpp
+index 570bd6d..27d7304 100644
+--- a/src/pipeline/pipeline_incremental.cpp
++++ b/src/pipeline/pipeline_incremental.cpp
+@@ -623,6 +623,33 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
+     cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
+                  itoa_buf((int)elapsed_ms(t)));
+ 
++    /* #<this session>: this list had drifted from run_predump_passes (the
++     * full-index equivalent, pipeline.cpp) — route/ORM/Mongo/complexity were
++     * simply never added here, so an explicitly-requested incremental reindex
++     * silently left @Entity/@Table, @Document/@Field, and HTTP route mappings
++     * stale even for files that WERE reparsed. Not a mode-gated pass in the
++     * full list (moderate_only=false for all four), so they run here
++     * unconditionally too, matching decorator_tags/configlink above. */
++    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
++    cbm_pipeline_create_route_nodes(ctx->gbuf);
++    cbm_log_info("pass.timing", "pass", "incr_route_match", "elapsed_ms",
++                 itoa_buf((int)elapsed_ms(t)));
++
++    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
++    cbm_pipeline_create_orm_nodes(ctx->gbuf);
++    cbm_log_info("pass.timing", "pass", "incr_orm_mapping", "elapsed_ms",
++                 itoa_buf((int)elapsed_ms(t)));
++
++    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
++    cbm_pipeline_create_mongo_nodes(ctx);
++    cbm_log_info("pass.timing", "pass", "incr_mongo_mapping", "elapsed_ms",
++                 itoa_buf((int)elapsed_ms(t)));
++
++    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
++    cbm_pipeline_pass_complexity(ctx);
++    cbm_log_info("pass.timing", "pass", "incr_complexity", "elapsed_ms",
++                 itoa_buf((int)elapsed_ms(t)));
++
+     /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
+     if (ctx->mode <= CBM_MODE_MODERATE) {
+         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+diff --git a/src/pipeline/pipeline_internal.h b/src/pipeline/pipeline_internal.h
+index 4e2465d..4185d2b 100644
+--- a/src/pipeline/pipeline_internal.h
++++ b/src/pipeline/pipeline_internal.h
+@@ -577,6 +577,23 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+  * Re-targets these edges to Route nodes for cross-service traversal. */
+ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb);
+ 
++/* Post-merge: create Table nodes from @Entity/@Table annotations on Class
++ * nodes, using the "decorators" array every node already carries in its
++ * properties_json (see pass_definitions.cpp's append_json_str_array call).
++ * Purely additive — reads existing Class nodes, adds Table nodes and
++ * MAPS_TO_TABLE edges, touches nothing else. See pass_orm_nodes.cpp. */
++void cbm_pipeline_create_orm_nodes(cbm_gbuf_t *gb);
++
++/* Post-merge: create MongoCollection/MongoField nodes from Spring Data
++ * MongoDB @Document/@Field annotations, plus MongoRepository<Entity,ID> ->
++ * Entity edges from Interface base_classes. Distinct node labels from
++ * Table/Column (never merged into the SQL persistence concepts) — see
++ * pass_orm_nodes.cpp's cbm_pipeline_create_mongo_nodes doc comment. Takes
++ * the full ctx (not just gbuf) because it needs ctx->repo_path to resolve
++ * a Class node's relative file_path for the one scoped file read this pass
++ * does (field-level @Field annotations, which Field nodes don't carry). */
++void cbm_pipeline_create_mongo_nodes(cbm_pipeline_ctx_t *ctx);
++
+ /* ── Pass function prototypes ────────────────────────────────────── */
+ 
+ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,

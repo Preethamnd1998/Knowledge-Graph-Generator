@@ -1,0 +1,343 @@
+/*
+ * mem.c — Unified memory management via mimalloc.
+ *
+ * Budget tracking based on actual RSS via mi_process_info().
+ * When MI_OVERRIDE=0 (ASan builds), falls back to OS-specific
+ * RSS queries (task_info on macOS, /proc/self/statm on Linux,
+ * GetProcessMemoryInfo on Windows).
+ */
+#include "mem.h"
+#include "platform.h"
+#include "log.h"
+
+#include "foundation/constants.h"
+
+#define MAX_RAM_FRACTION 1.0
+#define DEFAULT_RAM_FRACTION 0.5
+#include <errno.h>
+#include <mimalloc.h>
+#include "foundation/cbm_atomic.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#else
+#include <unistd.h>
+#endif
+
+/* ── Static state ─────────────────────────────────────────────── */
+
+static size_t g_budget;          /* budget in bytes */
+static atomic_int g_initialized; /* init guard */
+static atomic_int g_was_over;    /* pressure hysteresis */
+
+#define MB_DIVISOR ((size_t)(CBM_SZ_1K * CBM_SZ_1K))
+
+/* ── OS fallback for RSS (ASan builds where MI_OVERRIDE=0) ──── */
+
+static size_t os_rss(void) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return (size_t)pmc.WorkingSetSize;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    struct mach_task_basic_info info = {0};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) ==
+        KERN_SUCCESS) {
+        return (size_t)info.resident_size;
+    }
+    return 0;
+#else
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (!f) {
+        return 0;
+    }
+    unsigned long pages = 0;
+    unsigned long rss_pages = 0;
+    if (fscanf(f, "%lu %lu", &pages, &rss_pages) != 2) {
+        rss_pages = 0;
+    }
+    (void)fclose(f);
+    long ps = sysconf(_SC_PAGESIZE);
+    return rss_pages * (ps > 0 ? (size_t)ps : (size_t)CBM_SZ_4K);
+#endif
+}
+
+/* ── Pressure logging (hysteresis) ────────────────────────────── */
+
+static void check_pressure(size_t rss) {
+    if (g_budget == 0) {
+        return;
+    }
+
+    bool over = rss > g_budget;
+    int was = atomic_load(&g_was_over);
+
+    if (over && !was) {
+        atomic_store(&g_was_over, 1);
+        char rss_mb[CBM_SZ_32];
+        char budget_mb[CBM_SZ_32];
+        char pct_str[CBM_SZ_16];
+        snprintf(rss_mb, sizeof(rss_mb), "%zu", rss / MB_DIVISOR);
+        snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
+        snprintf(pct_str, sizeof(pct_str), "%zu",
+                 g_budget > 0 ? (rss * CBM_PERCENT) / g_budget : 0);
+        cbm_log_warn("mem.pressure.warn", "rss_mb", rss_mb, "budget_mb", budget_mb, "pct", pct_str);
+    } else if (!over && was) {
+        atomic_store(&g_was_over, 0);
+        char rss_mb[CBM_SZ_32];
+        char budget_mb[CBM_SZ_32];
+        char pct_str[CBM_SZ_16];
+        snprintf(rss_mb, sizeof(rss_mb), "%zu", rss / MB_DIVISOR);
+        snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
+        snprintf(pct_str, sizeof(pct_str), "%zu",
+                 g_budget > 0 ? (rss * CBM_PERCENT) / g_budget : 0);
+        cbm_log_info("mem.pressure.ok", "rss_mb", rss_mb, "budget_mb", budget_mb, "pct", pct_str);
+    }
+}
+
+/* ── Public API ────────────────────────────────────────────────── */
+
+#define RAM_FRACTION_DEFAULT 0.5
+#define RAM_FRACTION_16GB 0.25
+#define RAM_FRACTION_32GB 0.35
+#define RAM_BYTES_PER_GB (1024ULL * 1024 * 1024)
+
+double cbm_mem_ram_fraction_for_total(size_t total_ram_bytes) {
+    if (total_ram_bytes <= 16ULL * RAM_BYTES_PER_GB) {
+        return RAM_FRACTION_16GB;
+    }
+    if (total_ram_bytes <= 32ULL * RAM_BYTES_PER_GB) {
+        return RAM_FRACTION_32GB;
+    }
+    return RAM_FRACTION_DEFAULT;
+}
+
+cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
+                                        const char *budget_mb) {
+    if (ram_fraction <= 0.0 || ram_fraction > MAX_RAM_FRACTION) {
+        ram_fraction = DEFAULT_RAM_FRACTION;
+    }
+    cbm_mem_budget_t result = {
+        .budget = (size_t)((double)total_ram * ram_fraction),
+        .source = "ram_fraction",
+        .clamped = false,
+        .invalid = false,
+    };
+
+    if (budget_mb == NULL || budget_mb[0] == '\0') {
+        return result; /* no override → fraction-derived budget */
+    }
+
+    /* Strict parse, matching the src/foundation/limits.c convention: reject
+     * trailing garbage (`*end`), overflow (errno==ERANGE), and non-positive
+     * values. This turns a fat-fingered value (e.g. "8GB", or a 20-digit typo)
+     * into a clean fallback-with-warning rather than a silently wrong budget. */
+    errno = 0;
+    char *end = NULL;
+    long long want_mb = strtoll(budget_mb, &end, CBM_DECIMAL_BASE);
+    if (errno != 0 || end == budget_mb || *end != '\0' || want_mb <= 0) {
+        result.invalid = true; /* keep the fraction-derived budget */
+        return result;
+    }
+
+    result.source = "CBM_MEM_BUDGET_MB";
+    size_t want = (size_t)want_mb;
+    if (total_ram > 0) {
+        /* Compare in MiB space so a valid-but-huge request (e.g. 2^44 MiB, which
+         * would overflow the ×MiB byte multiply) clamps cleanly to total_ram. */
+        if (want > total_ram / MB_DIVISOR) {
+            result.budget = total_ram;
+            result.clamped = true;
+        } else {
+            result.budget = want * MB_DIVISOR;
+        }
+    } else if (want > SIZE_MAX / MB_DIVISOR) {
+        /* RAM detection failed (no clamp target) and the request is
+         * astronomically large — cap at SIZE_MAX rather than wrap. */
+        result.budget = SIZE_MAX;
+    } else {
+        result.budget = want * MB_DIVISOR;
+    }
+    return result;
+}
+
+void cbm_mem_init(double ram_fraction) {
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_initialized, &expected, 1)) {
+        return;
+    }
+
+    if (ram_fraction <= 0.0 || ram_fraction > MAX_RAM_FRACTION) {
+        ram_fraction = DEFAULT_RAM_FRACTION;
+    }
+
+    /* Force decommit on purge (MADV_FREE_REUSABLE on macOS) so RSS drops
+     * immediately instead of staying high until memory pressure.
+     *
+     * Arena commit is a PLATFORM decision, because the two costs trade off in
+     * opposite directions. Lazy commit (0) reduces upfront memory but pays
+     * address-space FRAGMENTATION: mimalloc commits a range with
+     * mprotect(PROT_READ|PROT_WRITE) over a sub-range of a PROT_NONE
+     * reservation (vendored/mimalloc/src/prim/unix/prim.c), and each partial
+     * commit SPLITS the reserved VMA. While mimalloc served only the bound
+     * populations (sqlite, tree_sitter) that was a handful of mappings; once
+     * ordinary malloc/new routes through mimalloc, every worker thread
+     * fragments the address space independently and the mapping count tracks
+     * CONCURRENCY rather than corpus size — upstream measured an index worker
+     * at ~22k mappings against v0.9.0's 10 (Go corpus, 18 workers; 999 at 1
+     * worker, 8460 at 4, 11965 at 18).
+     *
+     * On Linux that has two consequences, both reported upstream as #1654 from
+     * a 96-CPU/376 GB host: the mmap/mprotect churn serialises on the kernel's
+     * per-process mmap_lock, and the VMA count climbs toward vm.max_map_count,
+     * after which mmap fails for ANY size — mimalloc reporting it "cannot
+     * allocate" 10 KB while `free -g` still showed 246 GB available.
+     *
+     * mimalloc's own default is 2, "eager-commit arenas only on an OS with
+     * overcommit (i.e. linux)" — precisely because commit is free there until
+     * the pages are touched. Setting 0 opted Linux out of the default written
+     * for it. Restore the default on Linux; keep the lazy setting everywhere
+     * else, where commit is NOT free and the upfront-memory reason still holds
+     * (Windows especially). Upstream measured 22450 -> 17312 mappings with wall
+     * time and peak RSS unchanged. */
+#if defined(__linux__)
+    mi_option_set(mi_option_arena_eager_commit, 2);
+#else
+    mi_option_set(mi_option_arena_eager_commit, 0);
+#endif
+    mi_option_set(mi_option_purge_decommits, SKIP_ONE);
+    mi_option_set(mi_option_purge_delay, 0); /* immediate purge, no 1s delay */
+    /* v3 (#832): reclaim abandoned pages on ANY thread's free (=1), restoring the
+     * v2 behaviour. mimalloc v3 defaults page_reclaim_on_free=0, so pages a worker
+     * thread abandons at exit are NOT reclaimed when the main thread later frees
+     * their blocks (and mi_collect cannot touch abandoned pages) — RSS then
+     * ratchets across repeated in-process index cycles. The supervised subprocess
+     * is the primary cure (the child returns 100% RSS on exit); this is the
+     * in-process fallback for any path that stays in-process (kill switch,
+     * spawn-fail degrade, embedders). */
+    mi_option_set(mi_option_page_reclaim_on_free, 1);
+
+    /* CBM_MEM_BUDGET_MB env override (memory analogue of CBM_WORKERS).
+     * Lets users cap the budget directly without an enclosing cgroup —
+     * useful on bare-metal hosts where cgroup memory limits are absent
+     * (#363). Explicit override > implicit RAM/cgroup detection. The budget
+     * math (fraction default, override, clamp-to-total) lives in the pure,
+     * testable cbm_mem_resolve_budget(); this path only reads the env and
+     * emits the log/warn lines. */
+    cbm_system_info_t info = cbm_system_info();
+
+    char env_buf[CBM_SZ_32];
+    const char *env = cbm_safe_getenv("CBM_MEM_BUDGET_MB", env_buf, sizeof(env_buf), NULL);
+    cbm_mem_budget_t resolved = cbm_mem_resolve_budget(info.total_ram, ram_fraction, env);
+    g_budget = resolved.budget;
+
+    /* The resolver is the single source of truth for the parse + clamp; this
+     * path only surfaces its outcome as log lines. */
+    if (resolved.invalid) {
+        cbm_log_warn("mem.budget.env.invalid", "value", env, "fallback", "ram_fraction");
+    } else if (resolved.clamped) {
+        char cap_mb[CBM_SZ_32];
+        snprintf(cap_mb, sizeof(cap_mb), "%zu", info.total_ram / MB_DIVISOR);
+        cbm_log_warn("mem.budget.clamped", "requested_mb", env, "cap_mb", cap_mb);
+    }
+
+    char budget_mb[CBM_SZ_32];
+    char ram_mb[CBM_SZ_32];
+    snprintf(budget_mb, sizeof(budget_mb), "%zu", g_budget / MB_DIVISOR);
+    snprintf(ram_mb, sizeof(ram_mb), "%zu", info.total_ram / MB_DIVISOR);
+    cbm_log_info("mem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb, "source",
+                 resolved.source);
+}
+
+size_t cbm_mem_rss(void) {
+#if defined(__linux__)
+    /* Linux: mimalloc's _mi_prim_process_info() (vendored/mimalloc/src/prim/
+     * unix/prim.c) never sets pinfo->current_rss on Linux — it only sets
+     * peak_rss (from getrusage's ru_maxrss). current_rss therefore keeps
+     * mi_process_info()'s default of pinfo.current_commit: mimalloc's OWN
+     * committed-page counter, which this project deliberately tunes low via
+     * purge_decommits=1 + purge_delay=0 (cbm_mem_init) so purged pages leave
+     * the count immediately. So on Linux "current_rss" is a
+     * low-biased mimalloc-internal metric, not true RSS: under concurrent
+     * large-file parsing it can read a few MB while real RSS is multiple GB,
+     * silently blinding cbm_mem_over_budget()'s backpressure to real memory
+     * pressure (small-but-nonzero, so the `current_rss > 0` guard below never
+     * catches it). os_rss() reads /proc/self/statm — authoritative OS RSS,
+     * unaffected by mimalloc's accounting — so it is the PRIMARY source on
+     * Linux, not a last-resort fallback. macOS/Windows are unaffected:
+     * mimalloc sets current_rss correctly there via task_info /
+     * GetProcessMemoryInfo. */
+    size_t proc_rss = os_rss();
+    if (proc_rss > 0) {
+        return proc_rss;
+    }
+    /* Extremely unlikely (/proc unavailable) — fall through to mimalloc. */
+#endif
+    size_t current_rss = 0;
+    size_t peak_rss = 0;
+    mi_process_info(NULL, NULL, NULL, &current_rss, &peak_rss, NULL, NULL, NULL);
+    if (current_rss > 0) {
+        return current_rss;
+    }
+    /* Fallback for ASan builds (MI_OVERRIDE=0) and any platform where
+     * mimalloc's current_rss is unavailable/zero. */
+    return os_rss();
+}
+
+size_t cbm_mem_peak_rss(void) {
+    size_t peak_rss = 0;
+    mi_process_info(NULL, NULL, NULL, NULL, &peak_rss, NULL, NULL, NULL);
+    /* Peak RSS is by definition >= current RSS. On Linux cbm_mem_rss() reads the
+     * live /proc/self/statm value (page-granular), while mimalloc's peak_rss
+     * comes from getrusage's ru_maxrss (KB-granular, and it can lag the live
+     * statm read by a few pages). Reading the two sources independently lets a
+     * fresh current read momentarily exceed the reported peak, breaking the
+     * peak >= current invariant. Reconcile them: the true peak is at least the
+     * current RSS. (Not observable on macOS, where both come from mimalloc.) */
+    size_t current = cbm_mem_rss();
+    if (current > peak_rss) {
+        peak_rss = current;
+    }
+    if (peak_rss > 0) {
+        return peak_rss;
+    }
+    /* No OS fallback for peak — return current as best approximation */
+    return os_rss();
+}
+
+size_t cbm_mem_budget(void) {
+    return g_budget;
+}
+
+void cbm_mem_set_budget_for_tests(size_t bytes) {
+    g_budget = bytes;
+}
+
+bool cbm_mem_over_budget(void) {
+    size_t rss = cbm_mem_rss();
+    check_pressure(rss);
+    return rss > g_budget;
+}
+
+size_t cbm_mem_worker_budget(int num_workers) {
+    if (num_workers <= 0) {
+        num_workers = SKIP_ONE;
+    }
+    return g_budget / (size_t)num_workers;
+}
+
+void cbm_mem_collect(void) {
+    mi_collect(true);
+}

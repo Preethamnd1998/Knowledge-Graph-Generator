@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://tigercosmos.github.io/code-cortex-mcp/sitemap.xml

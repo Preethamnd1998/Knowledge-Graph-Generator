@@ -1,0 +1,429 @@
+/*
+ * test_main.c — Test runner entry point for pure C rewrite.
+ *
+ * Includes all test suites and runs them sequentially.
+ */
+/* Global test counters (declared extern in test_framework.h) */
+int tf_pass_count = 0;
+int tf_fail_count = 0;
+int tf_skip_count = 0;
+
+#include "test_framework.h"
+#include <sqlite3.h>
+#include <string.h>
+#include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
+#include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
+#include "pipeline/pipeline.h"
+#include "foundation/constants.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include "foundation/compat.h" /* cbm_mkdtemp / cbm_setenv / cbm_mkdir — HOME isolation (all platforms) */
+#if !defined(_WIN32)
+#include "foundation/platform.h" /* cbm_resolve_self_exe_path — deleted-self probe */
+#include <unistd.h>
+#endif
+
+/* When the index supervisor spawns THIS binary as a supervised index worker,
+ * act as a faithful in-process worker instead of re-running every suite. The
+ * grammar is the one cbm_index_worker_start() produces:
+ *
+ *   <self> cli --index-worker index_repository <args_json> --response-out <p>
+ *
+ * The recovery knobs (marker/quarantine/single-thread) travel as inherited
+ * env, so nothing else needs plumbing. This is what lets the EXIT_NONZERO
+ * quarantine guards in test_mcp drive a REAL supervised run through public
+ * APIs. Returns an exit code (>=0) when it handled a worker invocation,
+ * else -1. */
+/* A freshly exec'd process is essential: a second object/thread cannot prove
+ * cross-process admission. This dispatch never indexes a real checkout. */
+static int tf_maybe_run_index_lease_probe(int argc, char **argv) {
+    if (argc != 4 || strcmp(argv[1], "--index-lease-probe") != 0) {
+        return -1;
+    }
+    char missing_repo[4096];
+    snprintf(missing_repo, sizeof(missing_repo), "%s.missing-repo", argv[3]);
+    cbm_pipeline_t *p = cbm_pipeline_new(missing_repo, argv[3], CBM_MODE_FAST);
+    if (!p) {
+        return 74;
+    }
+    int rc = strcmp(argv[2], "run") == 0 ? cbm_pipeline_run(p) : cbm_pipeline_claim_index(p);
+    if (rc == 0 && strcmp(argv[2], "abandon") == 0) {
+        // Deliberately bypass destructors/free: OS process exit must release it.
+        _Exit(79);
+    }
+    cbm_pipeline_free(p);
+    return rc == 0 ? 0 : (rc == CBM_INDEX_BUSY ? 73 : 74);
+}
+
+static int tf_maybe_run_index_worker(int argc, char **argv) {
+    if (argc < 7 || strcmp(argv[1], "cli") != 0 || strcmp(argv[2], "--index-worker") != 0 ||
+        strcmp(argv[3], "index_repository") != 0 || strcmp(argv[5], "--response-out") != 0) {
+        return -1;
+    }
+    const char *args_json = argv[4];
+    const char *response_out = argv[6];
+
+    cbm_index_set_worker_role(true, response_out);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return 1;
+    }
+    char *result = cbm_mcp_handle_tool(srv, "index_repository", args_json);
+    int rc = 0;
+    if (result) {
+        FILE *rf = fopen(response_out, "wb");
+        if (rf) {
+            (void)fputs(result, rf);
+            (void)fclose(rf);
+        } else {
+            rc = 1;
+        }
+        free(result);
+    } else {
+        rc = 1;
+    }
+    /* Mirror the production worker's fast exit: skip the multi-GB teardown the
+     * OS is about to reclaim anyway, and keep LeakSanitizer out of a path that
+     * deliberately does not free. */
+    fflush(NULL);
+    _Exit(rc);
+}
+
+/* #1204 deleted-self probe. Re-exec'd by the platform suite's driver from a
+ * COPY of this binary, so the driver can rename over / unlink that copy while
+ * this child is running and ask the resolver what it hands back. Runs before
+ * any suite and exits; returns -1 when this is an ordinary test run. */
+static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (argc != 4 || strcmp(argv[1], "__cbm_deleted_self_probe") != 0) {
+        return -1;
+    }
+    int ready_fd = atoi(argv[2]);
+    int continue_fd = atoi(argv[3]);
+    if (write(ready_fd, "R", 1) != 1) {
+        return 41;
+    }
+    char go = '\0';
+    if (read(continue_fd, &go, 1) != 1) {
+        return 42;
+    }
+    char resolved[1024];
+    bool ok = cbm_resolve_self_exe_path(NULL, resolved, sizeof(resolved));
+#if defined(__linux__)
+    /* Contract: after a rename-over the resolver hands back the
+     * /proc/self/exe magic link — the in-memory OLD build, the only spawn the
+     * worker's build-fingerprint gate accepts. Prove we really ARE in the
+     * deleted state first, or the assertions pass vacuously on an intact
+     * image. */
+    char link_target[1024];
+    ssize_t n = readlink("/proc/self/exe", link_target, sizeof(link_target) - 1);
+    if (n <= 0) {
+        return 45;
+    }
+    link_target[n] = '\0';
+    if (strstr(link_target, " (deleted)") == NULL) {
+        return 46;
+    }
+    if (!ok) {
+        return 43;
+    }
+    return strcmp(resolved, "/proc/self/exe") == 0 && access(resolved, X_OK) == 0 ? 0 : 44;
+#else
+    /* macOS has no magic link: fail closed. Success here is the resolver
+     * REFUSING, so the supervisor logs no_self_path and degrades in-process
+     * instead of spawning a missing binary. */
+    return ok ? 44 : 0;
+#endif
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
+/* Forward declarations of suite functions */
+extern void suite_arena(void);
+extern void suite_hash_table(void);
+extern void suite_dyn_array(void);
+extern void suite_str_intern(void);
+extern void suite_log(void);
+extern void suite_str_util(void);
+extern void suite_platform(void);
+extern void suite_diagnostics(void);
+extern void suite_extraction(void);
+extern void suite_extraction_inheritance(void);
+extern void suite_extraction_imports(void);
+extern void suite_grammar_regression(void);
+extern void suite_grammar_labels(void);
+extern void suite_grammar_imports(void);
+extern void suite_ac(void);
+extern void suite_store_nodes(void);
+extern void suite_store_edges(void);
+extern void suite_store_search(void);
+extern void suite_cypher(void);
+extern void suite_mcp(void);
+extern void suite_store_meta(void);
+extern void suite_hook_fastpath(void);
+extern void suite_tool_server(void);
+extern void suite_language(void);
+extern void suite_userconfig(void);
+extern void suite_gitignore(void);
+extern void suite_discover(void);
+extern void suite_graph_buffer(void);
+extern void suite_registry(void);
+extern void suite_pipeline(void);
+extern void suite_fqn(void);
+extern void suite_path_alias(void);
+extern void suite_watcher(void);
+extern void suite_lz4(void);
+extern void suite_zstd(void);
+extern void suite_artifact(void);
+extern void suite_sqlite_writer(void);
+extern void suite_go_lsp(void);
+extern void suite_c_lsp(void);
+extern void suite_php_lsp(void);
+extern void suite_cs_lsp(void);
+extern void suite_cs_lsp_bench(void);
+extern void suite_scope(void);
+extern void suite_type_rep(void);
+extern void suite_py_lsp(void);
+extern void suite_py_lsp_bench(void);
+extern void suite_py_lsp_stress(void);
+extern void suite_py_lsp_scale(void);
+extern void suite_ts_lsp(void);
+extern void suite_java_lsp(void);
+extern void suite_java_lsp_coverage(void);
+extern void suite_kotlin_lsp(void);
+extern void suite_rust_lsp(void);
+extern void suite_store_arch(void);
+extern void suite_store_bulk(void);
+extern void suite_store_pragmas(void);
+extern void suite_store_checkpoint(void);
+extern void suite_configlink(void);
+extern void suite_infrascan(void);
+extern void suite_cli(void);
+extern void suite_system_info(void);
+extern void suite_worker_pool(void);
+extern void suite_parallel(void);
+extern void suite_mem(void);
+extern void suite_security(void);
+extern void suite_yaml(void);
+extern void suite_integration(void);
+extern void suite_lang_contract(void);
+extern void suite_edge_imports(void);
+extern void suite_edge_structural(void);
+extern void suite_lsp_resolution_probe(void);
+extern void suite_node_creation_probe(void);
+extern void suite_edge_types_probe(void);
+extern void suite_convergence_probe(void);
+extern void suite_matrix_known_classes(void);
+extern void suite_matrix_new_constructs(void);
+extern void suite_grammar_probe_a(void);
+extern void suite_grammar_probe_b(void);
+extern void suite_grammar_probe_c(void);
+extern void suite_grammar_probe_d(void);
+extern void suite_grammar_probe_e(void);
+extern void suite_grammar_probe_f(void);
+extern void suite_grammar_probe_g(void);
+extern void suite_incremental(void);
+extern void suite_simhash(void);
+extern void suite_stack_overflow(void);
+
+/* Free the main thread's thread-local node-type bitset cache before exit so
+ * LeakSanitizer (Linux x64) doesn't report it. Worker threads free their own
+ * caches at thread teardown (pass_parallel.c). */
+extern "C" void cbm_kind_in_set_free_cache(void);
+
+int main(int argc, char **argv) {
+    int lease_rc = tf_maybe_run_index_lease_probe(argc, argv);
+    if (lease_rc >= 0) {
+        return lease_rc;
+    }
+    /* Both dispatches must precede every suite: this process may have been
+     * spawned as a supervised worker or as the deleted-self probe. */
+    int worker_rc = tf_maybe_run_index_worker(argc, argv);
+    if (worker_rc >= 0) {
+        return worker_rc;
+    }
+    int deleted_self_rc = tf_maybe_run_deleted_self_probe(argc, argv);
+    if (deleted_self_rc >= 0) {
+        return deleted_self_rc;
+    }
+
+    /* Isolate the suite from the developer's cache: query tools now resolve
+     * a missing or unknown project from the working directory, so a suite
+     * run inside an indexed checkout would otherwise answer "missing
+     * project" tests with the real repository. Isolation is by HOME, not
+     * CBM_CACHE_DIR: eighteen suites spell the cache path out as
+     * $HOME/.cache/code-cortex-mcp, and cbm_resolve_cache_dir derives the
+     * same path from HOME, so both stay in agreement. Suites that need a
+     * specific cache dir still set CBM_CACHE_DIR themselves. */
+    if (!getenv("CBM_CACHE_DIR") && !getenv("CBM_TEST_KEEP_HOME")) {
+        /* cbm_mkdtemp needs a CBM_SZ_256-sized template on Windows (it maps
+         * /tmp/ to %TEMP%\ in place). */
+        char home_tmp[256] = "/tmp/cbm_test_home_XXXXXX";
+        if (cbm_mkdtemp(home_tmp)) {
+            cbm_setenv("HOME", home_tmp, 1);
+#ifdef _WIN32
+            cbm_setenv("USERPROFILE", home_tmp, 1);
+#endif
+            char cache[300];
+            snprintf(cache, sizeof(cache), "%s/.cache", home_tmp);
+            cbm_mkdir(cache);
+            snprintf(cache, sizeof(cache), "%s/.cache/code-cortex-mcp", home_tmp);
+            cbm_mkdir(cache);
+        }
+    }
+
+    printf("\n  code-cortex-mcp  C test suite\n");
+
+    /* Foundation */
+    RUN_SUITE(arena);
+    RUN_SUITE(hash_table);
+    RUN_SUITE(dyn_array);
+    RUN_SUITE(str_intern);
+    RUN_SUITE(log);
+    RUN_SUITE(str_util);
+    RUN_SUITE(platform);
+    RUN_SUITE(diagnostics);
+
+    /* Existing C code regression tests */
+    RUN_SUITE(ac);
+    RUN_SUITE(extraction);
+    RUN_SUITE(extraction_inheritance);
+    RUN_SUITE(extraction_imports);
+    RUN_SUITE(grammar_regression);
+    RUN_SUITE(grammar_labels);
+    RUN_SUITE(grammar_imports);
+
+    /* Store (M5) */
+    RUN_SUITE(store_nodes);
+    RUN_SUITE(store_edges);
+    RUN_SUITE(store_search);
+    RUN_SUITE(store_bulk);
+    RUN_SUITE(store_pragmas);
+    RUN_SUITE(store_checkpoint);
+
+    /* Cypher (M6) */
+    RUN_SUITE(cypher);
+
+    /* MCP Server (M9) */
+    RUN_SUITE(mcp);
+    RUN_SUITE(store_meta);
+    RUN_SUITE(hook_fastpath);
+    RUN_SUITE(tool_server);
+
+    /* Discover (M2) */
+    RUN_SUITE(language);
+    RUN_SUITE(userconfig);
+    RUN_SUITE(gitignore);
+    RUN_SUITE(discover);
+
+    /* Graph Buffer (M7) */
+    RUN_SUITE(graph_buffer);
+
+    /* Pipeline (M8) */
+    RUN_SUITE(registry);
+    RUN_SUITE(pipeline);
+    RUN_SUITE(fqn);
+    RUN_SUITE(path_alias);
+
+    /* Watcher (M10) */
+    RUN_SUITE(watcher);
+
+    /* LZ4 + zstd + SQLite writer */
+    RUN_SUITE(lz4);
+    RUN_SUITE(zstd);
+    RUN_SUITE(sqlite_writer);
+
+    /* Persistent artifact export/import */
+    RUN_SUITE(artifact);
+
+    /* LSP resolvers */
+    RUN_SUITE(scope);
+    RUN_SUITE(type_rep);
+    RUN_SUITE(go_lsp);
+    RUN_SUITE(c_lsp);
+    RUN_SUITE(php_lsp);
+    RUN_SUITE(cs_lsp);
+    RUN_SUITE(cs_lsp_bench);
+    RUN_SUITE(py_lsp);
+    RUN_SUITE(kotlin_lsp);
+    RUN_SUITE(rust_lsp);
+    RUN_SUITE(py_lsp_bench);
+    RUN_SUITE(py_lsp_stress);
+    RUN_SUITE(py_lsp_scale);
+    RUN_SUITE(ts_lsp);
+    RUN_SUITE(java_lsp);
+    RUN_SUITE(java_lsp_coverage);
+
+    /* Architecture + ADR + Louvain */
+    RUN_SUITE(store_arch);
+
+    /* HTTP link */
+
+    /* Traces helpers */
+
+    /* Config link */
+    RUN_SUITE(configlink);
+
+    /* Infrastructure scanning */
+    RUN_SUITE(infrascan);
+
+    /* CLI (install, update, config) */
+    RUN_SUITE(cli);
+
+    /* System info + worker pool (parallelism) */
+    RUN_SUITE(system_info);
+    RUN_SUITE(worker_pool);
+
+    /* Parallel pipeline */
+    RUN_SUITE(parallel);
+
+    /* mem + arena + slab integration */
+    RUN_SUITE(mem);
+
+    /* UI (config, embedded assets, layout) */
+
+    /* UI HTTP server (transport + routing) */
+
+    /* Security defenses */
+    RUN_SUITE(security);
+
+    /* YAML parser */
+    RUN_SUITE(yaml);
+
+    /* SimHash / SIMILAR_TO */
+    RUN_SUITE(simhash);
+
+    /* Stack overflow regression (GitHub #199) */
+    RUN_SUITE(stack_overflow);
+
+    /* Integration (end-to-end) */
+    RUN_SUITE(integration);
+
+    /* Per-language graph contracts (node/edge types, attribution, no-crash) */
+    RUN_SUITE(lang_contract);
+    RUN_SUITE(edge_imports);
+    RUN_SUITE(edge_structural);
+    RUN_SUITE(lsp_resolution_probe);
+    RUN_SUITE(node_creation_probe);
+    RUN_SUITE(edge_types_probe);
+    RUN_SUITE(convergence_probe);
+    RUN_SUITE(matrix_known_classes);
+    RUN_SUITE(matrix_new_constructs);
+    RUN_SUITE(grammar_probe_a);
+    RUN_SUITE(grammar_probe_b);
+    RUN_SUITE(grammar_probe_c);
+    RUN_SUITE(grammar_probe_d);
+    RUN_SUITE(grammar_probe_e);
+    RUN_SUITE(grammar_probe_f);
+    RUN_SUITE(grammar_probe_g);
+
+    RUN_SUITE(incremental);
+
+    /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
+    cbm_kind_in_set_free_cache();
+    sqlite3_shutdown();
+    TEST_SUMMARY();
+}

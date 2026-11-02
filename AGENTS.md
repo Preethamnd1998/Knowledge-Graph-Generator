@@ -34,7 +34,7 @@ never appended to.
 ## Running it
 
 ```
-cd "D:\GitLab-Workspace\Knowledge Graph Generator"
+cd "<platform-repo>\shared\mcp-tools\knowledge-graph-generator"
 python indexer.py
 ```
 

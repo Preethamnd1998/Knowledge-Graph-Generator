@@ -1,0 +1,254 @@
+# Release pipeline: lint → test → build → smoke/soak → draft → verify → publish
+#
+# Security (security-static + codeql-gate) starts immediately and runs in
+# parallel with lint/test/build/smoke/soak. It only blocks the final verify
+# step — everything else proceeds independently.
+name: Release
+
+on:
+  # Push a version tag (e.g. `git tag v0.8.3 && git push origin v0.8.3`) to cut a
+  # release without needing workflow_dispatch (admin) rights. The version is taken
+  # from the tag name. workflow_dispatch is kept for manual runs with custom notes
+  # / replace. Jobs read `inputs.version || github.ref_name` so both paths work.
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.8.0)"
+        required: true
+        type: string
+      release_notes:
+        description: "Release notes (optional — auto-generated from commits if empty)"
+        required: false
+        type: string
+      replace:
+        description: "Replace existing release if it exists"
+        required: false
+        type: boolean
+        default: false
+      soak_level:
+        description: 'Soak: full (quick+asan), quick (10min), none'
+        type: choice
+        options: ['full', 'quick', 'none']
+        default: 'quick'
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Security (starts immediately, blocks only verify) ───────────
+  security:
+    uses: ./.github/workflows/_security.yml
+    secrets: inherit
+
+  # ── 0. Manifest gate (seconds, blocks the expensive legs) ───────
+  # server.json is the MCP Registry manifest and nothing else in the tree reads
+  # it, so a forgotten bump is invisible until a user follows a stale asset URL.
+  # It went two releases out of date exactly that way. Gate the release on it
+  # here rather than in release-draft: this runs in under a minute, where
+  # release-draft is an hour of test/build/smoke later.
+  manifest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: server.json must carry the version being released
+        env:
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: scripts/check-server-json-version.sh "$VERSION"
+
+  # ── 1. Lint (cppcheck + clang-format) ───────────────────────────
+  lint:
+    uses: ./.github/workflows/_lint.yml
+
+  # ── 2. Tests (all platforms, full suite for release) ────────────
+  test:
+    needs: [lint, manifest]
+    uses: ./.github/workflows/_test.yml
+    with:
+      skip_perf: false
+
+  # ── 3. Build all platforms ──────────────────────────────────────
+  build:
+    needs: [test]
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ inputs.version || github.ref_name }}
+
+  # ── 4. Smoke test every binary ──────────────────────────────────
+  smoke:
+    needs: [build]
+    uses: ./.github/workflows/_smoke.yml
+
+  # ── 5. Soak tests ──────────────────────────────────────────────
+  soak:
+    if: ${{ inputs.soak_level != 'none' }}
+    needs: [build]
+    uses: ./.github/workflows/_soak.yml
+    with:
+      duration_minutes: 10
+      run_asan: ${{ inputs.soak_level == 'full' }}
+      version: ${{ inputs.version || github.ref_name }}
+
+  # ── 6. Create DRAFT release ────────────────────────────────────
+  release-draft:
+    needs: [smoke, soak]
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la *.tar.gz *.zip
+
+      - name: Generate checksums
+        run: sha256sum *.tar.gz *.zip > checksums.txt
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: '*.tar.gz,*.zip,checksums.txt'
+
+      - name: Generate SBOM
+        run: |
+          python3 -c "
+          import json
+          sbom = {
+            'spdxVersion': 'SPDX-2.3',
+            'dataLicense': 'CC0-1.0',
+            'SPDXID': 'SPDXRef-DOCUMENT',
+            'name': 'code-cortex-mcp-${{ inputs.version || github.ref_name }}',
+            'documentNamespace': 'https://github.com/tigercosmos/code-cortex-mcp/releases/${{ inputs.version || github.ref_name }}',
+            'creationInfo': {
+              'created': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+              'creators': ['Tool: code-cortex-mcp-release-pipeline']
+            },
+            'packages': [
+              {'SPDXID': 'SPDXRef-Package-sqlite3', 'name': 'sqlite3', 'versionInfo': '3.51.3', 'downloadLocation': 'https://sqlite.org', 'filesAnalyzed': False},
+              {'SPDXID': 'SPDXRef-Package-yyjson', 'name': 'yyjson', 'versionInfo': '0.12.0', 'downloadLocation': 'https://github.com/ibireme/yyjson', 'filesAnalyzed': False},
+              {'SPDXID': 'SPDXRef-Package-mimalloc', 'name': 'mimalloc', 'versionInfo': '3.3.2', 'downloadLocation': 'https://github.com/microsoft/mimalloc', 'filesAnalyzed': False},
+              {'SPDXID': 'SPDXRef-Package-xxhash', 'name': 'xxhash', 'versionInfo': '0.8.3', 'downloadLocation': 'https://github.com/Cyan4973/xxHash', 'filesAnalyzed': False},
+              {'SPDXID': 'SPDXRef-Package-lz4', 'name': 'lz4', 'versionInfo': '1.10.0', 'downloadLocation': 'https://github.com/lz4/lz4', 'filesAnalyzed': False},
+              {'SPDXID': 'SPDXRef-Package-zstd', 'name': 'zstd', 'versionInfo': '1.5.7', 'downloadLocation': 'https://github.com/facebook/zstd', 'filesAnalyzed': False},
+              {'SPDXID': 'SPDXRef-Package-simplecpp', 'name': 'simplecpp', 'versionInfo': 'vendored', 'downloadLocation': 'https://github.com/danmar/simplecpp', 'filesAnalyzed': False},
+              {'SPDXID': 'SPDXRef-Package-tree-sitter', 'name': 'tree-sitter', 'versionInfo': 'language-abi-15', 'downloadLocation': 'https://github.com/tree-sitter/tree-sitter', 'filesAnalyzed': False}
+            ]
+          }
+          json.dump(sbom, open('sbom.json', 'w'), indent=2)
+          "
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: '*.tar.gz'
+          sbom-path: 'sbom.json'
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign artifacts
+        run: |
+          for f in *.tar.gz *.zip checksums.txt; do
+            cosign sign-blob --yes --bundle "${f}.bundle" "$f"
+          done
+
+      - name: Delete existing release
+        if: ${{ inputs.replace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: gh release delete "$VERSION" --yes --cleanup-tag || true
+
+      - name: Create tag
+        env:
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          git tag -f "$VERSION"
+          git push origin "$VERSION" --force
+
+      - uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v2
+        with:
+          tag_name: ${{ inputs.version || github.ref_name }}
+          draft: true
+          files: |
+            *.tar.gz
+            *.zip
+            checksums.txt
+            sbom.json
+            *.bundle
+          body: ${{ inputs.release_notes || '' }}
+          generate_release_notes: ${{ inputs.release_notes == '' }}
+
+  # ── 7. Verify + Publish (requires security gate) ───────────────
+  verify:
+    needs: [release-draft, security]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download and extract release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          mkdir -p assets binaries
+          gh release download "$VERSION" --dir assets --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip'
+          for f in assets/*.tar.gz; do
+            NAME=$(basename "$f" .tar.gz)
+            tar -xzf "$f" -C binaries/ 2>/dev/null || true
+            [ -f binaries/code-cortex-mcp ] && mv binaries/code-cortex-mcp "binaries/${NAME}"
+          done
+          for f in assets/*.zip; do
+            NAME=$(basename "$f" .zip)
+            unzip -o "$f" -d binaries/ 2>/dev/null || true
+            [ -f binaries/code-cortex-mcp.exe ] && mv binaries/code-cortex-mcp.exe "binaries/${NAME}.exe"
+          done
+          cp install.sh binaries/ 2>/dev/null || true
+          cp install.ps1 binaries/ 2>/dev/null || true
+          ls -la binaries/
+
+      - name: Security audits on all release files
+        run: |
+          # Audit every file that ships in the release archives — binaries,
+          # install scripts, LICENSE, and any future companion files.
+          # security-strings.sh detects file type and applies binary-only
+          # rules (URL allowlist, dangerous-command detection) only to real
+          # binaries; for shell scripts it still runs credential and base64
+          # pattern audits.
+          for f in binaries/*; do
+            [ -f "$f" ] || continue
+            echo "--- Auditing: $(basename "$f") ---"
+            scripts/security-strings.sh "$f"
+          done
+
+  # ── 8. Atomic un-draft (binary-only GitHub release) ───────────
+  # This fork ships GitHub release binaries only — no npm/PyPI/VirusTotal
+  # publishing (those require secrets the fork doesn't carry). The release
+  # stays in DRAFT until verify (binary security audits) passes, then is
+  # un-drafted here. On failure the draft can be deleted and the run
+  # re-tried with replace=true — no half-shipped state visible to users.
+  publish-final:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Un-draft GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: gh release edit "$VERSION" --draft=false --repo "$GITHUB_REPOSITORY"
