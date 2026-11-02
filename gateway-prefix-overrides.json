@@ -1,0 +1,24 @@
+{
+  "_doc": [
+    "Explicit gateway-prefix overrides for backend services whose spring.application.name cannot be read from source.",
+    "Used ONLY when the service's config has no literal name (placeholder like ${SPRING_APPLICATION_NAME}, missing, or empty).",
+    "A literal/env value in source always wins; a disagreeing override is reported as a CONFLICT warning.",
+    "Key = service name as indexed (BE/<folder>) or just the folder name. Value = {prefix, evidence}.",
+    "prefix: lowercase letters/digits/hyphen; unique across services. evidence: where the value was verified.",
+    "Never add a prefix you have not verified. Override file path can be changed with KG_GATEWAY_PREFIX_OVERRIDES; KG_GATEWAY_STRICT=1 turns unresolved/conflict/duplicate findings into errors."
+  ],
+  "overrides": {
+    "BE/core-service": {
+      "prefix": "core",
+      "evidence": "legacy KG index (Oct 2026) SERVICE gateway_prefix; 15 @FeignClient(\"core\") usages across BE services"
+    },
+    "BE/ipd-clinical-service": {
+      "prefix": "ipd-clinical",
+      "evidence": "legacy KG index (Oct 2026) SERVICE gateway_prefix; 9 @FeignClient(\"ipd-clinical\") usages across BE services"
+    },
+    "BE/user-management-service": {
+      "prefix": "ums",
+      "evidence": "legacy KG index (Oct 2026) SERVICE gateway_prefix; 3 @FeignClient(\"ums\") usages across BE services"
+    }
+  }
+}

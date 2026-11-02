@@ -237,7 +237,7 @@ command/args below are specific to this server:
 ```
 
 This exact shape (absolute paths throughout) is what's checked into
-this workspace's shared `D:\GitLab-Workspace\.mcp.json` — VS Code's
+this workspace's shared `<workspace>\.mcp.json` — VS Code's
 built-in MCP client reads that same file, which is how the cwd bug
 above was actually found: VS Code spawns from the workspace root, one
 directory above this repo.

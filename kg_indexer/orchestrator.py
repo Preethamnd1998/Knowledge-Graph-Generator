@@ -1,9 +1,11 @@
+import json
 import os
 import time
 
 from .config import Config
 from .db import GraphDB
 from . import incremental
+from .gateway_prefix import strict_mode as gateway_strict_mode
 from .parsers.common import NameRegistry, walk_source_files
 from .parsers import angular_parser, java_parser, react_parser, spring_flow_parser
 from .parsers.angular_parser import ROOT_APP_SENTINEL
@@ -17,6 +19,9 @@ _JAVA_EXTS, _JAVA_IGNORED = (".java",), ("Test.java", "Tests.java")
 _ANGULAR_EXTS, _ANGULAR_IGNORED = (".ts", ".html"), (".spec.ts", ".d.ts")
 _REACT_EXTS = (".jsx", ".tsx", ".js", ".ts")
 _REACT_IGNORED = (".spec.ts", ".spec.tsx", ".test.ts", ".test.tsx", ".d.ts")
+
+
+_PRIMARY_ANGULAR_PROJECT = "lifetrenz-core"
 
 
 def _print(msg):
@@ -68,6 +73,15 @@ def run(config: Config):
         mode_label = "incremental" if (config.incremental and not db.is_fresh) else "full"
         _print(f"Writing combined graph to: {db_path} ({mode_label} index)\n")
         summaries = _index_all(config, db, backend_services, angular_subprojects, react_enabled, shared=True)
+        pruned = db.prune_dangling_constant_usages()
+        if pruned:
+            _print(f"Removed {pruned} unresolved usages of non-API constant classes")
+        orphans = db.prune_orphan_edges()
+        if orphans:
+            _print(f"Removed {orphans} orphaned edges (target node was re-indexed away)")
+        removed = db.dedupe_edges()
+        if removed:
+            _print(f"Removed {removed} duplicate edges (re-emitted by incremental runs)")
         db.close()
         _print_summary("knowledge_graph.db", db_path, summaries)
     else:
@@ -79,6 +93,17 @@ def run(config: Config):
     _print("=" * 64)
     _print(f"Done in {elapsed:.1f}s")
     _print("=" * 64)
+
+
+def _seed_gateway_prefix_map(db, gateway_prefix_map):
+    """Add the gateway prefixes of backend services ALREADY in the graph (this
+    run's own discoveries win). Without this a UI-only run (a newly split UI
+    repo) has an empty map, so every UI constant it parses is marked
+    `unknown_gateway_prefix` and silently loses its link to the backend."""
+    for name, metadata in db.conn.execute("SELECT name, metadata FROM nodes WHERE node_type = 'SERVICE'"):
+        prefix = (json.loads(metadata or "{}").get("gateway_prefix") or "").lower()
+        if prefix and prefix not in gateway_prefix_map:
+            gateway_prefix_map[prefix] = name
 
 
 def _seeded_registry(db, project_type):
@@ -104,6 +129,8 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
     # java_parser._extract_gateway_prefix and db.py's resolve_* methods).
     # Read from each service's own config, never hand-mapped here.
     gateway_prefix_map = {}
+    gateway_notes = []     # informational (explicit override used)
+    gateway_findings = []  # unresolved / override / conflict / duplicate notes, printed + strict-checked below
 
     for service_name in backend_services:
         service_path = os.path.join(config.root_path, service_name)
@@ -128,8 +155,15 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         flow_stats = spring_flow_parser.parse_service(db, java_registry, service_name, service_path,
                                                        only_files=only_files)
         gateway_prefix = stats.get("gateway_prefix")
+        gateway_findings.extend(stats.get("gateway_prefix_warnings", []))
+        gateway_notes.extend(stats.get("gateway_prefix_notes", []))
         if gateway_prefix:
-            gateway_prefix_map[gateway_prefix] = service_name
+            if gateway_prefix in gateway_prefix_map and gateway_prefix_map[gateway_prefix] != service_name:
+                gateway_findings.append(
+                    f"DUPLICATE gateway prefix {gateway_prefix!r}: {gateway_prefix_map[gateway_prefix]} and "
+                    f"{service_name} — keeping the first; gateway calls to {service_name} will NOT resolve")
+            else:
+                gateway_prefix_map[gateway_prefix] = service_name
         if not shared:
             resolved = db.resolve_exact_import_edges("java")
             resolved += db.resolve_pending_edges(java_registry.as_dict(), project_type="java",
@@ -142,10 +176,20 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         err_suffix = f", {stats['errors']} errors" if stats["errors"] else ""
         flow_suffix = f", {flow_stats['flow_edges']} flow edges" if flow_stats.get("flow_edges") else ""
         feign_suffix = f", {stats['feign_calls']} feign calls" if stats.get("feign_calls") else ""
-        gw_suffix = f", gateway_prefix={gateway_prefix!r}" if gateway_prefix else ""
+        gw_suffix = (f", gateway_prefix={gateway_prefix!r} [{stats.get('gateway_prefix_source')}]" if gateway_prefix
+                     else ", gateway_prefix=UNRESOLVED")
         _print(f"    -> {stats['files']} files, {stats['classes']} classes, "
                f"{stats['methods']} methods, {stats['endpoints']} endpoints{feign_suffix}"
                f"{flow_suffix}{err_suffix}{gw_suffix}")
+
+    for note in gateway_notes:
+        _print(f"[gateway] {note}")
+    if gateway_findings:
+        _print("\n[gateway] findings:")
+        for note in gateway_findings:
+            _print(f"  [WARN] {note}")
+        if gateway_strict_mode():
+            raise RuntimeError(f"KG_GATEWAY_STRICT: {len(gateway_findings)} gateway-prefix finding(s) — see above")
 
     if angular_subprojects:
         project_node_id = None
@@ -156,7 +200,15 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
                 subproject_name = f"{config.angular_project}-root-app"
                 subproject_path = os.path.join(config.root_path, config.angular_project)
             else:
-                subproject_name = raw_name
+                # Incremental deletion + fingerprints are keyed by (file_path, service).
+                # A split-out UI repo embeds its own copies of shared libraries
+                # (clinical-casesheet, ...) at the same relative paths as the
+                # monolith's, so an unqualified service name made each project's
+                # run silently replace the previous one's nodes. Only the
+                # monolith keeps bare names (existing tools/queries key on them);
+                # every other root is qualified by its own directory name.
+                project_dir = os.path.basename(config.angular_project.rstrip("/\\"))
+                subproject_name = raw_name if project_dir == _PRIMARY_ANGULAR_PROJECT else f"{project_dir}/{raw_name}"
                 subproject_path = os.path.join(config.root_path, config.angular_project, "projects", raw_name)
             if not os.path.isdir(subproject_path):
                 _print(f"[skip] angular subproject not found on disk: {subproject_path}")
@@ -231,6 +283,7 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         resolved_react = shared_db.resolve_pending_edges(react_registry.as_dict(), project_type="react")
         _print(f"\nResolved cross-reference edges: java={resolved_java} angular={resolved_ng} react={resolved_react}")
 
+        _seed_gateway_prefix_map(shared_db, gateway_prefix_map)
         _print(f"Gateway prefixes discovered: {gateway_prefix_map}")
         resolved_calls = shared_db.resolve_service_call_edges(gateway_prefix_map)
         api_result = shared_db.resolve_api_constant_edges(gateway_prefix_map)

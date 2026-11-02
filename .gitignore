@@ -22,3 +22,7 @@ kg-config.env
 
 # Local-only Claude Code settings (machine-specific, not shared)
 .claude/settings.local.json
+
+# isolated index outputs / local Code Cortex cache
+output-*/
+.cache/

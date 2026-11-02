@@ -384,10 +384,30 @@ class GraphDB:
                 endpoint_cache[service_name] = parsed
             return endpoint_cache[service_name]
 
+        # Base-constant values for derived `BASE + '/suffix'` nodes (same value across the
+        # monolith copies, so the first indexed definition is as good as any).
+        base_segments = {}
+        for _id, _svc, _meta_json in constants:
+            _meta = json.loads(_meta_json) if _meta_json else {}
+            if _meta.get("segments") and not _meta.get("derived_from"):
+                cname = f"{_meta.get('class_name')}.{_meta.get('field_name')}"
+                base_segments.setdefault(cname, _meta["segments"])
+
         resolved = ambiguous = unresolved = 0
         for node_id, ui_service, metadata_json in constants:
             metadata = json.loads(metadata_json) if metadata_json else {}
             segments = metadata.get("segments") or []
+            if metadata.get("derived_from"):
+                base = base_segments.get(metadata["derived_from"])
+                if not base:
+                    metadata["resolution"] = "base_constant_not_found"
+                    self.conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?",
+                                       (json.dumps(metadata), node_id))
+                    unresolved += 1
+                    continue
+                segments = list(base) + list(metadata.get("suffix_segments") or [])
+                metadata["segments"] = segments
+                metadata["normalized_path"] = "/".join(segments)
             if not segments:
                 unresolved += 1
                 continue
@@ -416,8 +436,16 @@ class GraphDB:
                 if best == 0 and remaining:
                     matches = []
                 else:
-                    matches = [(eid, http_method) for eid, esegs, http_method in structural_matches
-                               if path_specificity(remaining, esegs) == best]
+                    tied = [(eid, esegs, http_method) for eid, esegs, http_method in structural_matches
+                            if path_specificity(remaining, esegs) == best]
+                    # Tie-break: a UI `{var}` segment (`${id}`) belongs to an endpoint `{var}`
+                    # before it belongs to a literal that merely happens to fit.
+                    def _var_pairs(esegs):
+                        return sum(1 for a, b in zip(remaining, esegs)
+                                   if a.startswith("{") and a.endswith("}") and b.startswith("{") and b.endswith("}"))
+                    best_vars = max(_var_pairs(esegs) for _, esegs, _ in tied)
+                    matches = [(eid, http_method) for eid, esegs, http_method in tied
+                               if _var_pairs(esegs) == best_vars]
             else:
                 matches = []
             if not matches:
@@ -460,6 +488,39 @@ class GraphDB:
             "total_nodes": sum(node_counts.values()),
             "total_edges": sum(edge_counts.values()),
         }
+
+    def prune_dangling_constant_usages(self):
+        """The UI usage pattern now matches any `SomeConstant(s).FIELD`, but only
+        URL-shaped constants become nodes. A usage that never resolved to one
+        (e.g. `AppConstants.MAX_ROWS`) is noise: drop it. Unresolved usages of
+        *ApiConstant classes are kept as before — those are meaningful (a real
+        API constant whose definition isn't indexed)."""
+        cur = self.conn.execute(
+            "DELETE FROM edges WHERE relation = 'USES_API_CONSTANT' AND target_id IS NULL "
+            "AND lower(COALESCE(target_name, '')) NOT LIKE '%apiconstant%'")
+        self.conn.commit()
+        return cur.rowcount
+
+    def prune_orphan_edges(self):
+        """Re-indexing a service deletes and recreates its nodes; edges FROM another project that
+        pointed at a deleted node (a UI CALLS_API -> a backend ENDPOINT) are left with no target id
+        and no target name. Nothing can ever resolve them, and the re-resolution pass has already
+        added a fresh, correct edge, so they only double the counts. Drop them."""
+        cur = self.conn.execute("DELETE FROM edges WHERE target_id IS NULL AND target_name IS NULL")
+        self.conn.commit()
+        return cur.rowcount
+
+    def dedupe_edges(self):
+        """Delete exact-duplicate edges (same relation, endpoints, target name,
+        service AND metadata), keeping the oldest. Repeated incremental runs
+        re-emit some edges (containment, resolved API-constant links, ...);
+        without this the graph grows ~10% per few runs and every count/degree
+        based on edges drifts. Edges that differ in metadata are never merged."""
+        cur = self.conn.execute(
+            "DELETE FROM edges WHERE id NOT IN (SELECT MIN(id) FROM edges GROUP BY relation, source_id, "
+            "COALESCE(target_id, -1), COALESCE(target_name, ''), COALESCE(service, ''), COALESCE(metadata, ''))")
+        self.conn.commit()
+        return cur.rowcount
 
     def commit(self):
         self.conn.commit()

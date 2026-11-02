@@ -10,7 +10,7 @@ import re
 
 from .common import (
     API_CONSTANT_USAGE_RE, NameRegistry, PLAIN_CLASS_RE, STATIC_STRING_FIELD_RE,
-    find_matching, is_api_constant_class_name, line_of, normalize_ui_path,
+    emit_suffix_constant_usages, find_matching, is_api_constant_class_name, is_constant_class_name, line_of, looks_like_api_path, normalize_ui_path,
     read_text, split_top_level, strip_type, walk_source_files,
 )
 
@@ -194,17 +194,20 @@ def _parse_file(db, registry, project_name, subproject_name, subproject_path,
             stats["errors"] += 1
 
     for pm in PLAIN_CLASS_RE.finditer(text):
-        if not is_api_constant_class_name(pm.group("name")):
+        strict = is_api_constant_class_name(pm.group("name"))
+        if not strict and not is_constant_class_name(pm.group("name")):
             continue
         try:
             _parse_api_constant_class(db, registry, project_name, subproject_name,
-                                       rel_file, text, pm, file_node_id, stats)
+                                       rel_file, text, pm, file_node_id, stats, only_url_like=not strict)
         except Exception:
             stats["errors"] += 1
 
     for um in API_CONSTANT_USAGE_RE.finditer(text):
         key = f"{um.group('cls')}.{um.group('field')}"
         db.add_edge(file_node_id, "USES_API_CONSTANT", target_name=key, service=subproject_name)
+    stats["API_CONSTANT"] = stats.get("API_CONSTANT", 0) + emit_suffix_constant_usages(
+        db, "angular", project_name, subproject_name, rel_file, text, file_node_id)
 
     try:
         _parse_routes_in_text(db, registry, project_name, subproject_name, rel_file,
@@ -276,7 +279,7 @@ def _parse_decorated_class(db, registry, subproject_name, project_name,
 
 
 def _parse_api_constant_class(db, registry, project_name, subproject_name, rel_file,
-                               text, pm, file_node_id, stats):
+                               text, pm, file_node_id, stats, only_url_like=False):
     """`export class FooApiConstant { public static X = "path/segments"; }`
     — one API_CONSTANT node per field, not one node per class: the field is
     the actual "API identity" a UI call site references (`FooApiConstant.X`),
@@ -293,6 +296,8 @@ def _parse_api_constant_class(db, registry, project_name, subproject_name, rel_f
     for fm in STATIC_STRING_FIELD_RE.finditer(body_text):
         field_name = fm.group("field")
         raw_value = fm.group("dq") if fm.group("dq") is not None else fm.group("sq")
+        if only_url_like and not looks_like_api_path(raw_value):
+            continue   # a generic *Constants class: keep only the fields that are endpoint paths
         normalized_path, segments = normalize_ui_path(raw_value)
         qname = f"ng:{project_name}:{subproject_name}:{rel_file}:{class_name}.{field_name}"
         field_line = line_of(text, body_start + fm.start())

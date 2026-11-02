@@ -4,8 +4,11 @@ endpoints (@*Mapping), and dependency edges (extends/implements/@Autowired).
 import os
 import re
 
+from ..gateway_prefix import (
+    SOURCE_LITERAL, load_overrides, resolve_gateway_prefix,
+)
 from .common import (
-    NameRegistry, is_api_constant_class_name, line_of, read_text, strip_type,
+    NameRegistry, is_api_constant_class_name, line_of, mask_java_comments, read_text, strip_type,
     walk_source_files,
 )
 
@@ -45,6 +48,23 @@ FIELD_DEP_RE = re.compile(
     r'(?P<name>\w+)\s*[;=]'
 )
 
+# Constructor injection: `private final Type name;` (+ a constructor or Lombok
+# @RequiredArgsConstructor). The @Autowired/@Inject regex above never sees these,
+# so classes written this way had NO DEPENDS_ON edges at all. `static final`
+# (loggers, constants) can't match because `static` sits between the modifiers.
+FINAL_FIELD_DEP_RE = re.compile(
+    r'(?m)^[ \t]*(?:@\w[\w.]*(?:\([^)]*\))?[ \t]*)*(?:private|protected)[ \t]+final[ \t]+'
+    r'(?P<type>[A-Z][\w.]*)(?:<[^;]*?>)?[ \t]+(?P<name>\w+)[ \t]*;'
+)
+_NOT_A_DEPENDENCY_TYPES = {
+    "String", "Integer", "Long", "Boolean", "Double", "Float", "Short", "Byte", "Character", "Object",
+    "BigDecimal", "BigInteger", "UUID", "Date", "LocalDate", "LocalDateTime", "LocalTime", "Instant",
+    "Duration", "Pattern", "Logger", "Map", "List", "Set", "Collection", "Optional", "Class", "Random",
+    "AtomicInteger", "AtomicLong", "AtomicBoolean", "Lock", "ReentrantLock", "Semaphore", "Charset",
+}
+_DATA_CLASS_ANNOTATIONS = {"Entity", "Document", "Embeddable", "MappedSuperclass", "Table", "Data", "Value"}
+_DATA_CLASS_NAME_RE = re.compile(r'(DTO|Dto|Request|Response|Row|Model|VO|Event|Payload|Key|Id)$')
+
 HTTP_MAPPING_ANNOTATIONS = {
     "GetMapping": "GET",
     "PostMapping": "POST",
@@ -81,29 +101,11 @@ _GATEWAY_CONFIG_CANDIDATES = (
 
 
 def _extract_gateway_prefix(service_path):
-    """Best-effort `spring.application.name` for one backend service, read
-    from its own src/main/resources config (never recursed beyond that one
-    directory — no bulk scan). Returns None (never a guess) if no config
-    file declares it, or the declared value is an unresolved `${...}`
-    placeholder (e.g. config-service's `${CONFIG_APP_NAME}`)."""
-    resources_dir = os.path.join(service_path, "src", "main", "resources")
-    if not os.path.isdir(resources_dir):
-        return None
-    for fname in _GATEWAY_CONFIG_CANDIDATES:
-        fpath = os.path.join(resources_dir, fname)
-        if not os.path.isfile(fpath):
-            continue
-        text = read_text(fpath)
-        if not text:
-            continue
-        m = _APP_NAME_YAML_RE.search(text) or _APP_NAME_PROPS_RE.search(text)
-        if not m:
-            continue
-        value = m.group(m.lastindex).strip().strip("'\"")
-        if not value or _PLACEHOLDER_VALUE_RE.match(value):
-            continue
-        return value.lower()
-    return None
+    """Literal `spring.application.name` only (placeholders -> None). Kept for
+    callers that want the pure source value; indexing uses
+    gateway_prefix.resolve_gateway_prefix (literal -> env -> default -> explicit override)."""
+    r = resolve_gateway_prefix("", service_path, overrides={}, env={})
+    return r.prefix if r.source == SOURCE_LITERAL else None
 
 
 # --- Feign clients (backend -> backend) -------------------------------------
@@ -194,7 +196,7 @@ def _collect_java_api_constants(service_path):
         text = read_text(file_path)
         if not text:
             continue
-        for cm in CLASS_DECL_RE.finditer(text):
+        for cm in CLASS_DECL_RE.finditer(mask_java_comments(text)):
             name = cm.group("name")
             if not is_api_constant_class_name(name):
                 continue
@@ -320,7 +322,7 @@ def _parse_file(db, registry, service_name, service_path, file_path, service_nod
             metadata={"import_path": imported},
         )
 
-    for cm in CLASS_DECL_RE.finditer(text):
+    for cm in CLASS_DECL_RE.finditer(mask_java_comments(text)):
         try:
             _parse_class(db, registry, service_name, rel_file, text, cm,
                          package, file_node_id, stats, java_api_constants)
@@ -364,14 +366,27 @@ def _parse_class(db, registry, service_name, rel_file, text, cm, package,
         if a["name"] == "RequestMapping":
             base_path = _annotation_path(a["args"], java_api_constants) or ""
 
+    injected_fields = set()
     for fm in FIELD_DEP_RE.finditer(body_text):
         dep_type = strip_type(fm.group("type"))
         if dep_type in ("String", "int", "long", "boolean", "double", "float", "Integer", "Long", "Boolean"):
             continue
+        injected_fields.add((dep_type, fm.group("name")))
         db.add_edge(
             class_node_id, "DEPENDS_ON", target_name=dep_type, service=service_name,
             metadata={"via": fm.group(1), "field_name": fm.group("name")},
         )
+
+    if cm.group("kind") == "class" and not (set(annotation_names) & _DATA_CLASS_ANNOTATIONS) \
+            and not _DATA_CLASS_NAME_RE.search(name):
+        for fm in FINAL_FIELD_DEP_RE.finditer(body_text):
+            dep_type = strip_type(fm.group("type"))
+            if dep_type in _NOT_A_DEPENDENCY_TYPES or (dep_type, fm.group("name")) in injected_fields:
+                continue
+            db.add_edge(
+                class_node_id, "DEPENDS_ON", target_name=dep_type, service=service_name,
+                metadata={"via": "ConstructorInjection", "field_name": fm.group("name")},
+            )
 
     for mm in METHOD_RE.finditer(body_text):
         _parse_method(db, service_name, rel_file, text, body_start, mm,
@@ -524,15 +539,20 @@ def _parse_feign_method(db, service_name, rel_file, full_text, body_start, mm,
     )
 
 
-def parse_service(db, registry: NameRegistry, service_name, service_path, progress=None, only_files=None):
+def parse_service(db, registry: NameRegistry, service_name, service_path, progress=None, only_files=None,
+                  gateway_overrides=None, gateway_env=None):
     stats = {"files": 0, "classes": 0, "methods": 0, "endpoints": 0, "errors": 0}
 
-    gateway_prefix = _extract_gateway_prefix(service_path)
+    if gateway_overrides is None:
+        gateway_overrides = load_overrides()
+    gw = resolve_gateway_prefix(service_name, service_path, gateway_overrides, gateway_env)
+    gateway_prefix = gw.prefix
     java_api_constants = _collect_java_api_constants(service_path)
     service_node_id = db.add_node(
         "SERVICE", service_name, qualified_name=f"java:{service_name}",
         service=service_name, project_type="java", file_path=service_path,
-        metadata={"gateway_prefix": gateway_prefix} if gateway_prefix else None,
+        metadata=({"gateway_prefix": gateway_prefix, "gateway_prefix_source": gw.source} if gateway_prefix
+                  else {"gateway_prefix_status": "unresolved"}),
     )
 
     for file_path in walk_source_files(service_path, (".java",), ignored_suffixes=("Test.java", "Tests.java")):
@@ -544,4 +564,7 @@ def parse_service(db, registry: NameRegistry, service_name, service_path, progre
             progress(service_name, file_path, stats)
 
     stats["gateway_prefix"] = gateway_prefix
+    stats["gateway_prefix_source"] = gw.source
+    stats["gateway_prefix_warnings"] = gw.warnings
+    stats["gateway_prefix_notes"] = gw.notes
     return stats
