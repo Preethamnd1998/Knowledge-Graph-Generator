@@ -385,3 +385,7 @@ Business flow tracer (`kg_indexer/flow_tracer.py`):
   table directly (`example_queries.py`'s other helpers, or `get_topic_flow`
   /`find_job_dependencies` for their specific relation types) for an
   exhaustive listing rather than a bounded trace.
+
+## Developer
+
+Developed and maintained by **Preetham.ND** — https://preethamnd1998.github.io/
