@@ -8,11 +8,13 @@
 #   bash sync-projects.sh --skip-kg       # Code Cortex only
 #   bash sync-projects.sh --dry-run       # show what would be indexed
 #
-# Discovery (no scan of source): BE = Projects/BE/*/pom.xml, UI = Projects/UI/*/angular.json.
+# Discovery (no scan of source), under ROOT_PATH: BE roots (default BE) = */pom.xml;
+# UI roots (default UI and WAPP) = */angular.json (monolith, split repo with shell +
+# projects/*, or standalone app) or */package.json depending on react. Override the roots
+# with KG_BE_ROOTS / KG_UI_ROOTS. Python backends (requirements.txt) go to Code Cortex only.
 # Safe to re-run: both indexers skip unchanged files, so an up-to-date workspace
 # takes seconds-to-minutes, not a full rebuild. kg-config.env is never modified —
-# the Knowledge Graph runs from throwaway configs via KG_CONFIG_PATH, which is what
-# keeps each UI repo's data separate (see the UI-project note in kg-config.env).
+# the Knowledge Graph runs from a throwaway config via KG_CONFIG_PATH.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -41,26 +43,35 @@ done
 log() { echo "[sync] $*"; }
 PY="$HERE/.venv-mcp/bin/python"; [[ -x "$PY" ]] || PY="python3"
 
-BE=(); for d in "$ROOT_PATH"/BE/*/; do [[ -f "${d}pom.xml" ]] && BE+=("BE/$(basename "$d")"); done
-UI=(); for d in "$ROOT_PATH"/UI/*/; do [[ -f "${d}angular.json" ]] && UI+=("UI/$(basename "$d")"); done
-log "found ${#BE[@]} backend service(s), ${#UI[@]} UI project(s) under $ROOT_PATH"
-printf '  %s\n' "${BE[@]}" "${UI[@]}"
+# Roots to scan, relative to ROOT_PATH. Default "BE" and "UI WAPP" (whichever exist);
+# override with KG_BE_ROOTS / KG_UI_ROOTS, e.g.  KG_UI_ROOTS="WAPP" bash sync-projects.sh
+BE_ROOTS=(); for r in ${KG_BE_ROOTS:-BE}; do [[ -d "$ROOT_PATH/$r" ]] && BE_ROOTS+=("$r"); done
+UI_ROOTS=(); for r in ${KG_UI_ROOTS:-UI WAPP}; do [[ -d "$ROOT_PATH/$r" ]] && UI_ROOTS+=("$r"); done
+# BE = Java (pom.xml); PYBE = Python (Code Cortex only: the Knowledge Graph has no Python parser);
+# UI = Angular (angular.json) or React (package.json with react) — monolith, split repo or standalone.
+BE=(); PYBE=(); UI=()
+for r in ${BE_ROOTS[@]+"${BE_ROOTS[@]}"}; do for d in "$ROOT_PATH/$r"/*/; do
+  if [[ -f "${d}pom.xml" ]]; then BE+=("$r/$(basename "$d")")
+  elif [[ -f "${d}requirements.txt" || -f "${d}pyproject.toml" ]]; then PYBE+=("$r/$(basename "$d")"); fi
+done; done
+for r in ${UI_ROOTS[@]+"${UI_ROOTS[@]}"}; do for d in "$ROOT_PATH/$r"/*/; do
+  if [[ -f "${d}angular.json" ]] || { [[ -f "${d}package.json" ]] && grep -q '"react"' "${d}package.json"; }; then
+    UI+=("$r/$(basename "$d")"); fi
+done; done
+log "found ${#BE[@]} Java service(s), ${#PYBE[@]} Python service(s), ${#UI[@]} UI project(s) under $ROOT_PATH"
+printf '  %s\n' ${BE[@]+"${BE[@]}"} ${PYBE[@]+"${PYBE[@]}"} ${UI[@]+"${UI[@]}"}
 [[ $DRY -eq 1 ]] && exit 0
 
 # ---- Knowledge Graph ---------------------------------------------------------
-write_config() {   # $1 = file, $2 = index mode, $3 = angular project ("" for none)
+# One run: the indexer discovers every project under the roots itself (kg_indexer/discovery.py),
+# qualifies each split repo's sub-projects by repo name so they never overwrite each other, and
+# resolves UI constants -> backend endpoints across all of them together.
+write_config() {   # $1 = file
   {
     echo "ROOT_PATH=$ROOT_PATH"
-    echo "BACKEND_SERVICES_START"; printf '%s\n' "${BE[@]}"; echo "BACKEND_SERVICES_END"
-    echo "ANGULAR_PROJECT=$3"
-    echo "ANGULAR_SUBPROJECTS_START"
-    if [[ -n "$3" ]]; then
-      echo "ROOT_APP"
-      for p in "$ROOT_PATH/$3"/projects/*/; do [[ -d "$p" ]] && basename "$p"; done
-    fi
-    echo "ANGULAR_SUBPROJECTS_END"
-    echo "REACT_PROJECT_PATH="
-    echo "INDEX_MODE=$2"
+    echo "BACKEND_ROOT=$(IFS=,; echo "${BE_ROOTS[*]-}")"
+    echo "UI_ROOT=$(IFS=,; echo "${UI_ROOTS[*]-}")"
+    echo "INDEX_MODE=all"
     echo "OUTPUT_DIR=$OUTPUT_DIR"
     echo "SINGLE_DATABASE=true"
   } > "$1"
@@ -68,21 +79,11 @@ write_config() {   # $1 = file, $2 = index mode, $3 = angular project ("" for no
 
 if [[ $DO_KG -eq 1 ]]; then
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-  first=1
-  for ui in "${UI[@]}"; do
-    # First run also (re)indexes the backend so gateway prefixes exist for
-    # constant->endpoint resolution; later UI runs are frontend-only.
-    write_config "$TMP/kg.env" "$([[ $first -eq 1 ]] && echo selective || echo frontend_only)" "$ui"
-    first=0
-    log "Knowledge Graph: $ui"
-    (cd "$HERE" && KG_CONFIG_PATH="$TMP/kg.env" "$PY" indexer.py > "$TMP/$(basename "$ui").log" 2>&1) \
-      && log "  ok — $(grep -E 'Targets indexed' "$TMP/$(basename "$ui").log" | tr -s ' ')" \
-      || { log "  FAILED — see $TMP/$(basename "$ui").log"; tail -5 "$TMP/$(basename "$ui").log"; }
-  done
-  if [[ ${#UI[@]} -eq 0 && ${#BE[@]} -gt 0 ]]; then
-    write_config "$TMP/kg.env" backend_only ""
-    (cd "$HERE" && KG_CONFIG_PATH="$TMP/kg.env" "$PY" indexer.py > "$TMP/be.log" 2>&1) && log "Knowledge Graph: backend ok" || log "Knowledge Graph: backend FAILED ($TMP/be.log)"
-  fi
+  write_config "$TMP/kg.env"
+  log "Knowledge Graph: ${#BE[@]} backend(s) + ${#UI[@]} UI project(s), one run"
+  (cd "$HERE" && KG_CONFIG_PATH="$TMP/kg.env" "$PY" indexer.py > "$TMP/kg.log" 2>&1) \
+    && { log "  ok — $(grep -E 'Targets indexed' "$TMP/kg.log" | tr -s ' ')"; grep -E '^\[discovery\]' "$TMP/kg.log" | sed 's/^/  /'; } \
+    || { log "  FAILED — see $TMP/kg.log"; tail -5 "$TMP/kg.log"; }
 fi
 
 # ---- Code Cortex (one project per repo; unified-trace auto-discovers them) ----
@@ -92,7 +93,7 @@ if [[ $DO_CORTEX -eq 1 ]]; then
   if [[ -z "$CORTEX_BIN" ]]; then
     log "code-cortex-mcp not installed — skipping (run: npm run platform:install -- --apply --with-cortex)"
   else
-    for p in "${BE[@]}" "${UI[@]}"; do
+    for p in ${BE[@]+"${BE[@]}"} ${PYBE[@]+"${PYBE[@]}"} ${UI[@]+"${UI[@]}"}; do
       log "Code Cortex: $p"
       out="$("$CORTEX_BIN" cli index_repository "{\"repo_path\":\"$ROOT_PATH/$p\",\"mode\":\"fast\"}" 2>/dev/null)"
       echo "$out" | "$PY" -c 'import sys,json

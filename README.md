@@ -104,7 +104,10 @@ duplicated or appended to.
 | `BACKEND_SERVICES_START` / `_END` block | One Java service folder name per line; `#` a line to skip it |
 | `ANGULAR_PROJECT` | Name of the Angular monorepo folder (contains `projects/`) |
 | `ANGULAR_SUBPROJECTS_START` / `_END` block | One sub-project folder name per line; `#` a line to skip it. The special entry `ROOT_APP` (not a real folder) indexes `ANGULAR_PROJECT`'s own root `src/` — the main app shell that lives outside `projects/` and would otherwise never get indexed |
-| `REACT_PROJECT_PATH` | Absolute path to a React app, or blank to skip React entirely |
+| `REACT_PROJECT_PATH` | Absolute path to a React app (several: comma-separated), or blank to skip React entirely |
+| `BACKEND_ROOT` | Auto-discovery: folder(s) under `ROOT_PATH` (comma-separated) whose child folders with a `pom.xml` are all indexed as Java services |
+| `UI_ROOT` | Auto-discovery: folder(s) under `ROOT_PATH` whose child folders are all indexed as Angular or React projects (see below) |
+| `DISCOVER_EXCLUDE` | Comma-separated project folder names that discovery should skip |
 | `INDEX_MODE` | `all`, `backend_only`, `frontend_only`, or `selective` |
 | `OUTPUT_DIR` | Where the `.db` file(s) are written |
 | `SINGLE_DATABASE` | `true` = one combined `knowledge_graph.db`; `false` = one `.db` per service/sub-project |
@@ -113,6 +116,37 @@ duplicated or appended to.
 environment variables of the same name — an env var wins over the file.
 This is how `docker-compose.yml` points the indexer at a mounted volume
 without editing the config file.
+
+### Auto-discovery: `BACKEND_ROOT` and `UI_ROOT`
+
+Instead of listing projects, point the indexer at the folders that hold them:
+
+```
+ROOT_PATH=/path/to/lths-mgmt
+BACKEND_ROOT=BE
+UI_ROOT=WAPP            # or several: UI,WAPP
+```
+
+Every project inside is found from marker files alone (nothing is parsed to decide):
+
+| Found in `UI_ROOT` | Indexed as |
+|---|---|
+| `angular.json` + `src/` + `projects/*` (a **split repo**: shell and its sub-projects) | the shell (`<root>/<repo>-root-app`) plus each sub-project as `<repo>/<sub-project>` |
+| `angular.json` + `src/`, no `projects/` | the shell only |
+| `angular.json` + `projects/*`, no `src/` | the sub-projects only |
+| `lifetrenz-core` (the **monolith**: one repo, many `projects/*`) | same rule; its sub-projects keep bare names (`masters`, `settings`, ...) |
+| `package.json` depending on `react`, no `angular.json` | one React app |
+
+Sub-projects are the **folders actually on disk**: a split repo's `angular.json` still lists the
+monolith's ~53 projects, so it is not used. A sub-project folder that is empty (an unpopulated git
+submodule) is skipped. Backends without a `pom.xml` (Python, Node) and anything else that matches
+nothing are printed as `[discovery] not indexed: <path> — <reason>`; nothing is dropped silently.
+Python services are indexed by Code Cortex (`sync-projects.sh`), not by the Knowledge Graph.
+A project nested deeper than one level (e.g. `oncology-v2/frontend/oncology-ui-react`) is not
+discovered: add it explicitly, a React app via `REACT_PROJECT_PATH`, a Java one in `BACKEND_SERVICES`.
+
+Discovery adds to the explicit lists, so the old config style keeps working unchanged and the two can be mixed.
+`bash sync-projects.sh` uses discovery for everything under `BE` and `UI`/`WAPP` (`KG_BE_ROOTS` / `KG_UI_ROOTS` override).
 
 ### Adding a new service or sub-project later
 

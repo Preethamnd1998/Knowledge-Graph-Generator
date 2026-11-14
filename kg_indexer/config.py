@@ -5,6 +5,8 @@ disable a service/subproject by adding or removing a leading '#'.
 import os
 from dataclasses import dataclass, field
 
+from .discovery import split_list
+
 VALID_MODES = ("all", "backend_only", "frontend_only", "selective")
 
 # These three keys may be overridden by an environment variable of the same
@@ -39,6 +41,11 @@ class Config:
     backend_services: ListSetting
     angular_subprojects: ListSetting
     source_path: str
+    # Auto-discovery (kg_indexer/discovery.py): comma-separated roots, relative
+    # to root_path or absolute. Added on top of the explicit lists above.
+    backend_roots: list = field(default_factory=list)
+    ui_roots: list = field(default_factory=list)
+    discover_exclude: list = field(default_factory=list)
 
 
 def _strip_inline_comment(value):
@@ -144,4 +151,7 @@ def load_config(path):
         backend_services=lists.get("BACKEND_SERVICES", ListSetting()),
         angular_subprojects=lists.get("ANGULAR_SUBPROJECTS", ListSetting()),
         source_path=os.path.abspath(path),
+        backend_roots=split_list(scalars.get("BACKEND_ROOT", "")),
+        ui_roots=split_list(scalars.get("UI_ROOT", "")),
+        discover_exclude=split_list(scalars.get("DISCOVER_EXCLUDE", "")),
     )

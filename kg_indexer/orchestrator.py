@@ -4,7 +4,7 @@ import time
 
 from .config import Config
 from .db import GraphDB
-from . import incremental
+from . import discovery, incremental
 from .gateway_prefix import strict_mode as gateway_strict_mode
 from .parsers.common import NameRegistry, walk_source_files
 from .parsers import angular_parser, java_parser, react_parser, spring_flow_parser
@@ -47,9 +47,10 @@ def run(config: Config):
     only_backend_category = config.index_mode == "backend_only"
     only_frontend_category = config.index_mode == "frontend_only"
 
-    backend_services = config.backend_services.enabled if include_backend and not only_frontend_category else []
-    angular_subprojects = config.angular_subprojects.enabled if include_frontend and not only_backend_category else []
-    react_enabled = include_frontend and not only_backend_category and bool(config.react_project_path.strip())
+    plan = build_plan(config)
+    backend_services = plan.backend if include_backend and not only_frontend_category else []
+    angular_targets = plan.angular if include_frontend and not only_backend_category else []
+    react_paths = plan.react if include_frontend and not only_backend_category else []
 
     _print("=" * 64)
     _print("Knowledge Graph Indexer")
@@ -62,9 +63,11 @@ def run(config: Config):
     _print("")
     _print(f"Backend services enabled  : {len(backend_services)} "
             f"(disabled: {len(config.backend_services.disabled)})")
-    _print(f"Angular subprojects enabled: {len(angular_subprojects)} "
-            f"(disabled: {len(config.angular_subprojects.disabled)})")
-    _print(f"React project             : {'enabled' if react_enabled else 'skipped'}")
+    _print(f"Angular projects          : {len(angular_targets)} "
+            f"({sum(len(t.subprojects) for t in angular_targets)} parts: root apps + sub-projects)")
+    _print(f"React projects            : {len(react_paths)}")
+    for rel_path, reason in plan.skipped:
+        _print(f"[discovery] not indexed: {rel_path} — {reason}")
     _print("")
 
     if config.single_database:
@@ -72,7 +75,7 @@ def run(config: Config):
         db = GraphDB(db_path, incremental=config.incremental)
         mode_label = "incremental" if (config.incremental and not db.is_fresh) else "full"
         _print(f"Writing combined graph to: {db_path} ({mode_label} index)\n")
-        summaries = _index_all(config, db, backend_services, angular_subprojects, react_enabled, shared=True)
+        summaries = _index_all(config, db, backend_services, angular_targets, react_paths, shared=True)
         pruned = db.prune_dangling_constant_usages()
         if pruned:
             _print(f"Removed {pruned} unresolved usages of non-API constant classes")
@@ -85,8 +88,8 @@ def run(config: Config):
         db.close()
         _print_summary("knowledge_graph.db", db_path, summaries)
     else:
-        summaries = _index_all(config, None, backend_services, angular_subprojects,
-                                react_enabled, shared=False)
+        summaries = _index_all(config, None, backend_services, angular_targets,
+                                react_paths, shared=False)
 
     elapsed = time.time() - started
     _print("")
@@ -117,7 +120,19 @@ def _seeded_registry(db, project_type):
     return registry
 
 
-def _index_all(config, shared_db, backend_services, angular_subprojects, react_enabled, shared):
+def build_plan(config):
+    """What to index: the explicit lists in the config first (unchanged
+    behaviour), then whatever BACKEND_ROOT / UI_ROOT discovery adds."""
+    plan = discovery.Plan(backend=list(config.backend_services.enabled))
+    if config.angular_project and config.angular_subprojects.enabled:
+        plan.angular.append(discovery.AngularTarget(config.angular_project,
+                                                    list(config.angular_subprojects.enabled)))
+    plan.react = discovery.split_list(config.react_project_path)
+    return discovery.discover(config.root_path, config.backend_roots, config.ui_roots,
+                              config.discover_exclude, plan)
+
+
+def _index_all(config, shared_db, backend_services, angular_targets, react_paths, shared):
     seed_db = shared_db if (shared and config.incremental and not shared_db.is_fresh) else None
     java_registry = _seeded_registry(seed_db, "java")
     ng_registry = _seeded_registry(seed_db, "angular")
@@ -191,14 +206,15 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         if gateway_strict_mode():
             raise RuntimeError(f"KG_GATEWAY_STRICT: {len(gateway_findings)} gateway-prefix finding(s) — see above")
 
-    if angular_subprojects:
+    for target in angular_targets:
+        angular_project = target.project
         project_node_id = None
         if shared:
-            project_node_id = angular_parser.parse_project(shared_db, config.angular_project, config.root_path)
-        for raw_name in angular_subprojects:
+            project_node_id = angular_parser.parse_project(shared_db, angular_project, config.root_path)
+        for raw_name in target.subprojects:
             if raw_name == ROOT_APP_SENTINEL:
-                subproject_name = f"{config.angular_project}-root-app"
-                subproject_path = os.path.join(config.root_path, config.angular_project)
+                subproject_name = f"{angular_project}-root-app"
+                subproject_path = os.path.join(config.root_path, angular_project)
             else:
                 # Incremental deletion + fingerprints are keyed by (file_path, service).
                 # A split-out UI repo embeds its own copies of shared libraries
@@ -207,15 +223,15 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
                 # run silently replace the previous one's nodes. Only the
                 # monolith keeps bare names (existing tools/queries key on them);
                 # every other root is qualified by its own directory name.
-                project_dir = os.path.basename(config.angular_project.rstrip("/\\"))
+                project_dir = os.path.basename(angular_project.rstrip("/\\"))
                 subproject_name = raw_name if project_dir == _PRIMARY_ANGULAR_PROJECT else f"{project_dir}/{raw_name}"
-                subproject_path = os.path.join(config.root_path, config.angular_project, "projects", raw_name)
+                subproject_path = os.path.join(config.root_path, angular_project, "projects", raw_name)
             if not os.path.isdir(subproject_path):
                 _print(f"[skip] angular subproject not found on disk: {subproject_path}")
                 continue
-            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, f"{config.angular_project}_{subproject_name}"), incremental=config.incremental)
+            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, f"{angular_project}_{subproject_name}"), incremental=config.incremental)
             if not shared:
-                project_node_id = angular_parser.parse_project(db, config.angular_project, config.root_path)
+                project_node_id = angular_parser.parse_project(db, angular_project, config.root_path)
 
             only_files = None
             if config.incremental and not db.is_fresh:
@@ -231,14 +247,14 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
                 _print(f"[angular] indexing {subproject_name} (full) ...")
 
             stats = angular_parser.parse_subproject(
-                db, ng_registry, config.angular_project, project_node_id,
+                db, ng_registry, angular_project, project_node_id,
                 subproject_name, subproject_path, progress=_progress, only_files=only_files,
             )
             if not shared:
                 resolved = db.resolve_pending_edges(ng_registry.as_dict(), project_type="angular")
                 db.close()
                 per_target_summaries.append((subproject_name,
-                                              _db_path_for(config.output_dir, f"{config.angular_project}_{subproject_name}"),
+                                              _db_path_for(config.output_dir, f"{angular_project}_{subproject_name}"),
                                               {**stats, "resolved_edges": resolved}))
             else:
                 per_target_summaries.append((subproject_name, None, stats))
@@ -246,17 +262,23 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
             api_const_suffix = f", {stats['API_CONSTANT']} API constants" if stats.get("API_CONSTANT") else ""
             _print(f"    -> {stats['files']} files, {stats['classes']} classes{api_const_suffix}{err_suffix}")
 
-    if react_enabled:
-        react_path = config.react_project_path
+    for react_path in react_paths:
+        # Same name react_parser stores as `service`. It is also the incremental
+        # key (fingerprints are per (relative file, service)): under the literal
+        # "react", an app added to an existing graph had any file byte-identical
+        # to another app's file at the same relative path (a Vite src/main.tsx)
+        # treated as unchanged, so it was never parsed.
+        react_name = os.path.basename(react_path.rstrip("/\\")) or "react-app"
+        react_db_name = "react" if len(react_paths) == 1 else f"react_{react_name}"
         if not os.path.isdir(react_path):
             _print(f"[skip] React project not found on disk: {react_path}")
         else:
-            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, "react"), incremental=config.incremental)
+            db = shared_db if shared else GraphDB(_db_path_for(config.output_dir, react_db_name), incremental=config.incremental)
             only_files = None
             if config.incremental and not db.is_fresh:
                 all_react = list(walk_source_files(react_path, _REACT_EXTS, ignored_suffixes=_REACT_IGNORED))
-                changed, unchanged = incremental.classify_files(db, "react", react_path, all_react)
-                removed = incremental.sweep_deleted(db, "react", react_path, all_react)
+                changed, unchanged = incremental.classify_files(db, react_name, react_path, all_react)
+                removed = incremental.sweep_deleted(db, react_name, react_path, all_react)
                 only_files = set(changed)
                 _print(f"[react] indexing {react_path} (incremental: {len(changed)} changed, "
                        f"{len(unchanged)} unchanged, {removed} removed) ...")
@@ -267,7 +289,7 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
             if not shared:
                 resolved = db.resolve_pending_edges(react_registry.as_dict(), project_type="react")
                 db.close()
-                per_target_summaries.append((project_name, _db_path_for(config.output_dir, "react"),
+                per_target_summaries.append((project_name, _db_path_for(config.output_dir, react_db_name),
                                               {**stats, "resolved_edges": resolved}))
             else:
                 per_target_summaries.append((project_name, None, stats))
@@ -290,7 +312,7 @@ def _index_all(config, shared_db, backend_services, angular_subprojects, react_e
         _print(f"Resolved backend->backend calls (Feign/WebClient/RestTemplate): {resolved_calls}")
         _print(f"Resolved UI API constants -> backend endpoints: {api_result['resolved']} "
                f"({api_result['ambiguous']} ambiguous, {api_result['unresolved']} unresolved)")
-    elif backend_services and (angular_subprojects or react_enabled):
+    elif backend_services and (angular_targets or react_paths):
         _print("\n[note] SINGLE_DATABASE=false — UI API constant -> backend endpoint and "
                "backend->backend (Feign/WebClient/RestTemplate) resolution are skipped: "
                "they require a shared graph to see nodes across service/subproject "
